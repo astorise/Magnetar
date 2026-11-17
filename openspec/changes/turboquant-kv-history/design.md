@@ -153,6 +153,50 @@ model's stores resolve to then, and refuses a mismatch as incompatible
 (`kv cache dtype mismatch`). The KV pool keeps each set's precisions and
 reuses a set only for requests in the same precisions.
 
+## Evidence
+
+GPU smoke run 44183609847 (`kv` group, one RTX 3060, greedy, 64 tokens
+after a repeated English paragraph; `turboquant_kv_gains_on_cuda`):
+
+| Qwen2.5-0.5B Q8_0 | KV bytes/token | Tokens of KV in the free VRAM |
+|---|---|---|
+| f32 | 24,576 | 473,208 |
+| tq4 | 3,456 (7.11× smaller) | 3,363,821 |
+| tq3 | 2,688 (9.14× smaller) | 4,324,912 |
+
+| Context | TPOT f32 | TPOT tq4 | TPOT tq3 | Leading tokens = f32 (tq4 / tq3) |
+|---|---|---|---|---|
+| 512 | 3.67 ms | 4.78 ms | 4.84 ms | 64 / 64 |
+| 4,096 | 4.31 ms | 5.82 ms | 5.86 ms | 36 / 64 |
+| 16,384 | 6.50 ms | 11.11 ms | 10.80 ms | 16 / 32 |
+| 32,768 | 9.43 ms | 21.84 ms | 22.44 ms | 64 / 1 |
+
+TTFT is unchanged within 2% (prefill dequantizes the stores once per
+step). The first generated token equals f32's at every context.
+
+| Mistral 7B Q4_K_M | KV bytes/token | Tokens of KV in the free VRAM |
+|---|---|---|
+| f32 | 262,144 | 30,411 |
+| tq4 | 34,816 (7.53× smaller) | 228,798 |
+| tq3 | 26,624 (9.85× smaller) | 299,197 |
+
+At 4,096 tokens: TPOT 23.34 ms (f32), 26.74 ms (tq4), 26.40 ms (tq3); 64/64
+leading tokens agree in both. At 16,384 tokens every precision ran out of
+device memory in the prefill's MLP (`gate_proj`), before the history's
+size matters: the KV savings need a chunked prefill to turn into longer
+contexts on this GPU.
+
+Findings:
+- The history shrinks as designed (7.1-7.5× in `tq4`, 9.1-9.9× in `tq3`).
+- Decode on codes is slower than the f32 split-KV kernel, increasingly
+  with the context (0.43× at 32,768 tokens on Qwen2.5-0.5B): its blocks
+  serve one query head each, so a KV head's codes are decoded once per
+  grouped query head (7 for Qwen2.5-0.5B, 4 for Mistral 7B), each code
+  extracted bit by bit. Task 5.4 addresses it; until then `f32` stays
+  the default.
+- Greedy agreement counts stop at the first near-tie and vary between
+  contexts (Qwen2.5-0.5B `tq4`: 64, 36, 16, 64).
+
 ## Risks
 
 - **Quality on keys at 3 bits.** If `tq3` keys lose greedy agreement, keep

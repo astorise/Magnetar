@@ -26,6 +26,7 @@
 
 ## 5. Qualification
 
-- [ ] 5.1 Gains on Qwen2.5-0.5B, Gemma 4 E2B and Mistral 7B (`turboquant-kv-gains.yml`, test `turboquant_kv_gains_on_cuda`): `f32`, `tq4`, `tq3` at 512 to 32,768 tokens; KV bytes per token and tokens held by the free VRAM, which contexts run, TTFT, TPOT, leading tokens and first-step logits against `f32`.
+- [x] 5.1 Gains on Qwen2.5-0.5B, Gemma 4 E2B and Mistral 7B (`turboquant-kv-gains.yml`, test `turboquant_kv_gains_on_cuda`): `f32`, `tq4`, `tq3` at 512 to 32,768 tokens; KV bytes per token and tokens held by the free VRAM, which contexts run, TTFT, TPOT, leading tokens and first-step logits against `f32`. Measured (run 44183609847) on Qwen2.5-0.5B (512 to 32,768) and Mistral 7B Q4_K_M (4,096 to 32,768); Gemma 4 E2B measured at 512 and 4,096 only (its prefill does not finish 16,384 within the hour). See design.md, Evidence.
 - [x] 5.2 The smoke workflow's `kv` group keeps `tq4` answering "Paris" where `f32` does: it failed for Qwen2.5-0.5B before the offsets (run 44128259285) and passes with them (run 44138881338), with `tq3` too.
-- [ ] 5.3 Evidence recorded here; default unchanged unless every profile passes.
+- [x] 5.3 Evidence recorded in design.md. The default stays f32: TPOT with TurboQuant stores is slower than with f32 ones (decode on codes, see Evidence).
+- [ ] 5.4 Decode attention on codes at least as fast as f32's: one block per KV head serving its grouped query heads (codes decoded once per group), 4-bit codes read without bit straddling.

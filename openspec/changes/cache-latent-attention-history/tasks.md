@@ -21,12 +21,14 @@
 
 ## 5. Acceptance
 
-- [ ] 5.1 The tiny DeepSeek-V2 checkpoints (Hugging Face and GGUF) against `transformers`: they match on the Reference CPU, both CPU Providers and with every value device-resident (largest logit difference 1.2e-5); CUDA on the GPU runner.
-- [ ] 5.2 DeepSeek-V2-Lite-Chat on CUDA continues "The capital of France is" with "Paris"; bytes per token and TPOT against the expanded history.
+- [x] 5.1 The tiny DeepSeek-V2 checkpoints (Hugging Face and GGUF) against `transformers`: they match on the Reference CPU, both CPU Providers and with every value device-resident (largest logit difference 1.2e-5); on CUDA too, largest logit difference 1.3e-5 (run 44183609847).
+- [x] 5.2 DeepSeek-V2-Lite-Chat Q8_0 on two GPUs continues "The capital of France is" with " Paris." (run 44183609847). Its history is 576 values per token and layer against 5,120. TPOT after a short prompt: 20.30 ms against 12.25 ms with the expanded history (run of 11:12 UTC the same day): slower, see 5.3.
+
+- [ ] 5.3 The absorbed decode's TPOT at least the expanded form's after a short prompt: find where the 8 ms per token go (decode phase attribution in the real-checkpoint test) and remove it.
 
 ## 6. TurboQuant on the latent history (`turboquant-kv-history`, second step)
 
 - [x] 6.1 A latent history is quantized in groups of gcd(`kv_lora_rank`, `qk_rope_head_dim`) values (64 in DeepSeek-V2 and V3: nine groups per 576-value row, 324 bytes per row and layer in `tq4` against 2,304 in f32); narrower groups keep f32 with the reason recorded.
 - [x] 6.2 CUDA: strided attention values read from a TurboQuant store through dequantized scratch, the store read once for K and V; conformance on a tq4 store of 576-value rows.
 - [x] 6.3 The tiny GGUF checkpoints (the `wide` bundle) run with `tq4` and `tq3` latent histories on the Reference CPU, and both CPU Providers match it exactly; the Hugging Face ones keep f32 (groups of 4).
-- [ ] 6.4 DeepSeek-V2-Lite-Chat with a `tq4` latent history on CUDA continues with "Paris" (GPU workflow, `moe` group); agreement with f32 recorded.
+- [x] 6.4 DeepSeek-V2-Lite-Chat with a `tq4` latent history continues with " Paris.": its 64 greedy tokens equal the f32 run's, TPOT 20.49 ms (run 44183609847).
