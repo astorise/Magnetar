@@ -33,7 +33,7 @@ pub(crate) fn register_real_qwen_component() {
 /// way an embedder registers its own: each under the digest of its bytes,
 /// trusted because the embedder (here, this test crate) trusts the bytes
 /// it ships.
-const REAL_COMPONENTS: [&str; 3] = ["qwen-real", "llama-real", "gemma-real"];
+const REAL_COMPONENTS: [&str; 4] = ["qwen-real", "llama-real", "gemma-real", "deepseek-real"];
 
 /// Registers [`REAL_COMPONENTS`] and returns the digest of the one whose
 /// manifest declares `family` (`compatibility.architecture_families`) --
