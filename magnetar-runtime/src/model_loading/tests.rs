@@ -454,14 +454,24 @@ fn transposed_q6_k_projections_stay_packed() {
     for (index, (value, bits)) in stored.iter().zip(Q6_K_GOLDEN_BITS).enumerate() {
         assert_eq!(value.to_bits(), bits, "Q6_K value {index}: {value}");
     }
+    // An untransposed table stays packed too, its rows the stored rows
+    // (`keep-quantized-embedding-tables-packed`).
     let untransposed = ModelTensorMetadata {
         shape: vec![2, 256],
         ..metadata(None)
     };
-    assert!(
-        packed_weight_from_raw_bytes(&untransposed, &Q6_K_GOLDEN_BYTES)
-            .expect("valid bytes")
-            .is_none()
+    let table = packed_weight_from_raw_bytes(&untransposed, &Q6_K_GOLDEN_BYTES)
+        .expect("valid bytes")
+        .expect("an untransposed Q6_K table is packed");
+    assert!(!table.transposed());
+    assert_eq!(table.logical_shape(), [2, 256]);
+    assert_eq!(
+        table
+            .dequantize_stored()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        Q6_K_GOLDEN_BITS.to_vec()
     );
 }
 
@@ -498,13 +508,21 @@ fn resident_weight_bytes_count_what_the_provider_holds() {
         ..f16_tensor_metadata("weight.q", vec![4, 64], 0)
     };
     assert_eq!(resident_weight_bytes(&q8), 4 * 2 * 34);
-    // An untransposed k-quant table is dequantized at load.
+    // An untransposed k-quant table stays packed
+    // (`keep-quantized-embedding-tables-packed`); one whose rows are not
+    // whole blocks is dequantized at load.
     let q4k_table = ModelTensorMetadata {
         storage_dtype: ModelDType::Q4K,
         size_bytes: Some(4 * 144),
         ..f16_tensor_metadata("weight.e", vec![4, 256], 0)
     };
-    assert_eq!(resident_weight_bytes(&q4k_table), 4 * 256 * 4);
+    assert_eq!(resident_weight_bytes(&q4k_table), 4 * 144);
+    let ragged = ModelTensorMetadata {
+        storage_dtype: ModelDType::Q4K,
+        size_bytes: Some(144),
+        ..f16_tensor_metadata("weight.r", vec![2, 128], 0)
+    };
+    assert_eq!(resident_weight_bytes(&ragged), 2 * 128 * 4);
 }
 
 #[test]

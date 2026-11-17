@@ -11,7 +11,7 @@
 //! loader's reading of the metadata and of both forms of the latent
 //! up-projection, not the quantization error.
 
-use crate::logit_comparison::{Format, compare_on, compare_with_reference};
+use crate::logit_comparison::{Format, compare_on, compare_with_reference, cpu_providers};
 use magnetar_integration_resident_provider::ResidentReferenceCpuProvider;
 
 fn compare(variant: &str) -> f32 {
@@ -136,5 +136,26 @@ fn the_tiny_deepseek_v2_checkpoints_match_transformers_on_cuda() {
             family,
         );
         eprintln!("cuda {variant}: max |logit difference| {difference:.3e}");
+    }
+}
+
+/// Every checkpoint above on the CPU Providers of `providers/cpu` (see
+/// [`cpu_providers`]): their Kernels for the latent attention's forms,
+/// YaRN and the routed experts, the optimized one reading the GGUF files'
+/// packed weights directly.
+#[test]
+fn the_tiny_deepseek_v2_checkpoints_match_transformers_on_the_cpu_providers() {
+    for (provider, label) in cpu_providers() {
+        for (variant, format, family) in VARIANTS {
+            let difference = compare_on(
+                provider.clone(),
+                label,
+                "deepseek_v2",
+                variant,
+                format,
+                family,
+            );
+            eprintln!("{label} {variant}: max |logit difference| {difference:.3e}");
+        }
     }
 }
