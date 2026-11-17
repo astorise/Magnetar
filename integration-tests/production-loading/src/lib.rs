@@ -21,7 +21,11 @@
 //! of its own.
 
 #[cfg(test)]
+mod logit_comparison;
+#[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod tests_deepseek_v2_logits;
 #[cfg(test)]
 mod tests_gemma4_logits;
 #[cfg(test)]

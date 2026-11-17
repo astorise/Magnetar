@@ -152,7 +152,7 @@ fn model_component_rejects_untrusted_invalid_or_unsupported_identity() {
 #[test]
 fn architecture_metadata_rejects_invalid_shapes_and_unsupported_family() {
     let mut metadata = architecture();
-    metadata.hidden_size = 15;
+    metadata.head_dimension = 0;
     assert!(matches!(
         metadata.validate(&identity()),
         Err(ModelComponentError::ArchitectureMetadataInvalid {
@@ -160,6 +160,23 @@ fn architecture_metadata_rejects_invalid_shapes_and_unsupported_family() {
             ..
         })
     ));
+
+    let mut metadata = architecture();
+    metadata.kv_head_count = metadata.attention_head_count + 1;
+    assert!(matches!(
+        metadata.validate(&identity()),
+        Err(ModelComponentError::ArchitectureMetadataInvalid {
+            field: "KV head count",
+            ..
+        })
+    ));
+
+    // A declared head width need not tile the hidden size
+    // (`register-deepseek-model-component`): latent attention, Gemma 4 and
+    // Qwen3 project the hidden state to wider or narrower heads.
+    let mut metadata = architecture();
+    metadata.hidden_size = 15;
+    assert_eq!(metadata.validate(&identity()), Ok(()));
 
     let mut metadata = architecture();
     metadata.family = "llama".into();

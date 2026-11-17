@@ -708,10 +708,17 @@ fn invalid_architecture_family_is_rejected() {
     );
 }
 
+/// A declared head width need not tile the hidden size: the query and
+/// output projections map between the two (`register-deepseek-model-
+/// component`). Zero and indivisible head counts are still refused.
 #[test]
-fn invalid_hidden_head_configuration_is_rejected() {
+fn a_hidden_size_apart_from_the_head_widths_is_accepted() {
     let mut architecture = small_architecture();
     architecture.hidden_size = 9; // not attention_head_count * head_dimension
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(4));
+    assert_eq!(config.validate(&small_identity()), Ok(()));
+    let mut architecture = small_architecture();
+    architecture.head_dimension = 0;
     let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(4));
     assert!(matches!(
         config.validate(&small_identity()),

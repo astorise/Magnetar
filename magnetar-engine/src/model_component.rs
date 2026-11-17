@@ -284,12 +284,11 @@ impl ModelComponentArchitectureMetadata {
                 reason: "must divide attention head count".into(),
             });
         }
-        if self.hidden_size != self.attention_head_count * self.head_dimension {
-            return Err(ModelComponentError::ArchitectureMetadataInvalid {
-                field: "head dimension",
-                reason: "hidden size must equal attention heads times head dimension".into(),
-            });
-        }
+        // The hidden size need not equal `attention_head_count *
+        // head_dimension`: a checkpoint that declares its head width
+        // (Qwen3, Gemma 4, DeepSeek-V2's latent attention) projects the
+        // hidden state to its heads and back, and the query and output
+        // projections' expected shapes carry both widths.
         Ok(())
     }
 }
