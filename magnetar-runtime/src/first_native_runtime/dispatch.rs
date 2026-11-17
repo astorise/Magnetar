@@ -1721,7 +1721,7 @@ pub(super) fn dispatch_rope_node(
 /// sets them (`per-layer-kv-geometry`): a layer's own head geometry, its
 /// sliding window and its score scale. Absent geometry falls back to the
 /// architecture's.
-const ATTENTION_NODE_ATTRIBUTES: [&str; 6] = [
+const ATTENTION_NODE_ATTRIBUTES: [&str; 7] = [
     "head_count",
     "kv_head_count",
     "head_dimension",
@@ -1730,6 +1730,8 @@ const ATTENTION_NODE_ATTRIBUTES: [&str; 6] = [
     // `express-latent-attention-forms`: V rows and the output narrower or
     // wider than Q/K rows.
     "value_head_dimension",
+    // `cache-latent-attention-history`: V heads wider than the value.
+    "value_head_stride",
 ];
 
 #[allow(clippy::too_many_arguments)]

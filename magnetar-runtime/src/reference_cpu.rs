@@ -150,7 +150,8 @@ use crate::operator::{
 };
 pub use crate::operator_semantics::{
     MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE, MoeRouting, NATIVE_CPU_PROVIDER_NAME,
-    moe_experts, moe_experts_local, moe_local_experts, moe_route, row_scale, sigmoid,
+    batched_matmul, moe_experts, moe_experts_local, moe_local_experts, moe_route, row_scale,
+    sigmoid, value_heads,
 };
 use crate::provider::{
     PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
@@ -1457,6 +1458,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         .id
         .features
         .insert(ATTENTION_VALUE_HEAD_DIMENSION_FEATURE.to_string());
+    // Honours `value_head_stride` (`cache-latent-attention-history`).
+    attention
+        .id
+        .features
+        .insert(crate::operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE.to_string());
     // Reads TurboQuant stores: they hold f32 values (`turboquant-kv-history`).
     attention
         .id
@@ -1505,6 +1511,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
         baseline_advertisement("gated-matmul", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("batched-matmul", OperatorFamily::LinearAlgebra),
         moe_experts,
         baseline_advertisement("row-scale", OperatorFamily::Tensor),
         embedding,
@@ -2561,6 +2568,16 @@ impl ReferenceCpuExecutor {
                 let up = matmul(&a, &up, transpose_a, transpose_b).map_err(KernelError::from)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
+            "batched-matmul" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let groups = Self::attribute_integer(&invocation.attributes, "group_count")
+                    .filter(|groups| *groups > 0)
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "group_count".into(),
+                    })?;
+                batched_matmul(&a, &b, groups).map_err(KernelError::from)?
+            }
             "moe-experts" => {
                 let h = self.input_tensor(invocation, 0)?;
                 let logits = self.input_tensor(invocation, 1)?;
@@ -2847,6 +2864,23 @@ impl ReferenceCpuExecutor {
                     Some(_) => {
                         return Err(KernelError::KernelAttributeUnsupported {
                             attribute: "value_head_dimension must be a positive integer".into(),
+                        });
+                    }
+                };
+                // `cache-latent-attention-history`: V's heads may be wider
+                // than the value, which is their leading values.
+                let v = match invocation.attributes.get("value_head_stride") {
+                    None => v,
+                    Some(OperatorAttributeValue::Integer(stride)) if *stride > 0 => value_heads(
+                        &v,
+                        kv_head_count.unwrap_or(head_count),
+                        *stride as u64,
+                        value_head_dimension,
+                    )
+                    .map_err(KernelError::from)?,
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "value_head_stride must be a positive integer".into(),
                         });
                     }
                 };

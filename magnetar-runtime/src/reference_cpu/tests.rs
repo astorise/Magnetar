@@ -3120,6 +3120,122 @@ fn moe_experts_gelu_activation_and_per_expert_scale() {
     );
 }
 
+// `cache-latent-attention-history`: absorbed decode attention over a
+// latent history equals the expanded form's attention.
+
+/// One query row of expanded multi-head latent attention (each head's key
+/// `[c_kv W_UK_h | k_pe]`, value `c_kv W_UV_h`) equals the absorbed form:
+/// queries `[q_nope_h W_UK_h^T | q_pe_h]` (`batched-matmul`), one shared key
+/// head `[c_kv | k_pe]` read as V too (`value_head_stride`), and each head's
+/// latent output times `W_UV_h` (`batched-matmul`).
+#[test]
+fn absorbed_latent_attention_matches_the_expanded_form() {
+    let (heads, nope, rope, latent, value, keys) = (3usize, 4usize, 2usize, 5usize, 3usize, 4usize);
+    let values = |count: usize, seed: f32| -> Vec<f32> {
+        (0..count).map(|i| (i as f32 * 0.37 + seed).sin()).collect()
+    };
+    let tensor = |rows: usize, cols: usize, seed: f32| {
+        reference_cpu_host_tensor([rows as u64, cols as u64], values(rows * cols, seed))
+    };
+    let c_kv = tensor(keys, latent, 0.2);
+    let k_pe = tensor(keys, rope, 0.9);
+    let q_nope = tensor(1, heads * nope, 1.4);
+    let q_pe = tensor(1, heads * rope, 2.1);
+    // `[in, out]` up-projections: `k_nope_proj [L, H*n]`, `v_proj [L, H*v]`.
+    let k_nope_proj = tensor(latent, heads * nope, 2.6);
+    let v_proj = tensor(latent, heads * value, 3.3);
+    let scale = 0.35_f32;
+    let integer = |value: usize| OperatorAttributeValue::Integer(value as i64);
+    let concat = |first: &HostTensor,
+                  second: &HostTensor,
+                  head_count: usize,
+                  second_heads: usize,
+                  width: usize| {
+        invoke_extended(
+            "concat",
+            &[first.clone(), second.clone()],
+            &[first.shape[0], (head_count * width) as u64],
+            &[
+                ("axis", OperatorAttributeValue::String("heads".into())),
+                ("head_count", integer(head_count)),
+                ("second_head_count", integer(second_heads)),
+            ],
+        )
+    };
+
+    // Expanded: every head's key and value from the latent.
+    let k_nope = matmul(&c_kv, &k_nope_proj, false, false).unwrap();
+    let v = matmul(&c_kv, &v_proj, false, false).unwrap();
+    let k = concat(&k_nope, &k_pe, heads, 1, nope + rope).expect("expanded keys");
+    let q = concat(&q_nope, &q_pe, heads, heads, nope + rope).expect("expanded queries");
+    let expanded = invoke_extended(
+        "attention",
+        &[q, k, v],
+        &[1, (heads * value) as u64],
+        &[
+            ("head_count", integer(heads)),
+            ("head_dimension", integer(nope + rope)),
+            ("value_head_dimension", integer(value)),
+            ("causal", OperatorAttributeValue::Boolean(true)),
+            ("scale", float(scale as f64)),
+        ],
+    )
+    .expect("expanded attention");
+
+    // Absorbed: `k_absorb`'s group h is `W_UK_h^T` (`[n, L]`), `v_absorb`'s
+    // `W_UV_h` (`[L, v]`).
+    let mut k_absorb = Vec::with_capacity(heads * nope * latent);
+    let mut v_absorb = Vec::with_capacity(heads * latent * value);
+    for head in 0..heads {
+        for i in 0..nope {
+            for l in 0..latent {
+                k_absorb.push(k_nope_proj.data[l * heads * nope + head * nope + i]);
+            }
+        }
+        for l in 0..latent {
+            for j in 0..value {
+                v_absorb.push(v_proj.data[l * heads * value + head * value + j]);
+            }
+        }
+    }
+    let k_absorb = reference_cpu_host_tensor([(heads * nope) as u64, latent as u64], k_absorb);
+    let v_absorb = reference_cpu_host_tensor([(heads * latent) as u64, value as u64], v_absorb);
+    let group_count = [("group_count", integer(heads))];
+    let q_latent = invoke_extended(
+        "batched-matmul",
+        &[q_nope.clone(), k_absorb],
+        &[1, (heads * latent) as u64],
+        &group_count,
+    )
+    .expect("absorbed queries");
+    let q = concat(&q_latent, &q_pe, heads, heads, latent + rope).expect("absorbed query heads");
+    let history = concat(&c_kv, &k_pe, 1, 1, latent + rope).expect("latent rows");
+    assert_eq!(history.shape, vec![keys as u64, (latent + rope) as u64]);
+    let latent_out = invoke_extended(
+        "attention",
+        &[q, history.clone(), history],
+        &[1, (heads * latent) as u64],
+        &[
+            ("head_count", integer(heads)),
+            ("kv_head_count", integer(1)),
+            ("head_dimension", integer(latent + rope)),
+            ("value_head_dimension", integer(latent)),
+            ("value_head_stride", integer(latent + rope)),
+            ("causal", OperatorAttributeValue::Boolean(true)),
+            ("scale", float(scale as f64)),
+        ],
+    )
+    .expect("attention over the latent history");
+    let absorbed = invoke_extended(
+        "batched-matmul",
+        &[latent_out, v_absorb],
+        &[1, (heads * value) as u64],
+        &group_count,
+    )
+    .expect("absorbed outputs");
+    assert_all_close(&absorbed.data, &expanded.data);
+}
+
 // `express-latent-attention-forms`: the forms multi-head latent attention
 // needs, run as Kernel invocations and compared with independent
 // computations or with transformers' own values.

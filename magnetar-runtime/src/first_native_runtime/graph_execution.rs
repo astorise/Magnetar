@@ -633,6 +633,43 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        // `cache-latent-attention-history`: per-group products, the
+        // weight's row groups matching the input's column groups.
+        "batched-matmul" => {
+            if inputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 2 batched-matmul inputs"),
+                });
+            }
+            let groups = match node.attributes.get("group_count") {
+                Some(OperatorAttributeValue::Integer(groups)) if *groups > 0 => *groups as u64,
+                _ => {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' needs a positive batched-matmul group_count"
+                        ),
+                    });
+                }
+            };
+            let (rows, _) = inputs[0].rows_cols()?;
+            let (_, n) = inputs[1].rows_cols()?;
+            let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, groups * n]);
+            let resources = ["a", "b"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("batched-matmul", OperatorFamily::LinearAlgebra),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "row-scale" => {
             if inputs.len() != 2 {
                 return Err(InferenceApiError::GraphPlanningFailed {

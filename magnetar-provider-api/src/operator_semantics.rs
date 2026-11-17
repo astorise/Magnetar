@@ -410,6 +410,80 @@ pub fn rmsnorm_blocks(
     })
 }
 
+/// `batched-matmul` (`cache-latent-attention-history`): `a [T, G*K]` times
+/// `b [G*K, N]` group by group (`group_count = G`), giving `[T, G*N]`:
+/// output group `g` is `a`'s column group `g` times `b`'s row group `g`.
+/// Each product sums in index order, as `matmul` does.
+pub fn batched_matmul(
+    a: &HostTensor,
+    b: &HostTensor,
+    group_count: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let invalid =
+        |reason: String| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
+    let (rows, a_cols) = rows_cols_of(a, "batched-matmul's input")?;
+    let (b_rows, n) = rows_cols_of(b, "batched-matmul's weight")?;
+    if group_count == 0 || !a_cols.is_multiple_of(group_count) || a_cols != b_rows {
+        return Err(invalid(format!(
+            "batched-matmul of {group_count} groups needs [T, G*K] and [G*K, N], got {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let k = (a_cols / group_count) as usize;
+    let (groups, n, a_cols) = (group_count as usize, n as usize, a_cols as usize);
+    let mut data = vec![0.0f32; rows as usize * groups * n];
+    for row in 0..rows as usize {
+        for group in 0..groups {
+            let input = &a.data[row * a_cols + group * k..row * a_cols + (group + 1) * k];
+            let out = &mut data[(row * groups + group) * n..(row * groups + group + 1) * n];
+            for (column, out) in out.iter_mut().enumerate() {
+                let mut sum = 0.0f32;
+                for (i, value) in input.iter().enumerate() {
+                    sum += value * b.data[(group * k + i) * n + column];
+                }
+                *out = sum;
+            }
+        }
+    }
+    Ok(HostTensor {
+        shape: vec![rows, (groups * n) as u64],
+        data,
+    })
+}
+
+/// The values `attention` reads from `v` under `value_head_stride`
+/// (`cache-latent-attention-history`): `v`'s rows hold `kv_head_count`
+/// heads of `stride` values, and each head's value is its leading
+/// `value_head_dimension`. Returns `[rows, kv_head_count *
+/// value_head_dimension]`.
+pub fn value_heads(
+    v: &HostTensor,
+    kv_head_count: u64,
+    stride: u64,
+    value_head_dimension: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = rows_cols_of(v, "attention's V")?;
+    if kv_head_count == 0 || value_head_dimension > stride || cols != kv_head_count * stride {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "V rows of {cols} values cannot hold {kv_head_count} heads of {stride} values \
+                 with {value_head_dimension}-value values"
+            ),
+        ));
+    }
+    let (stride, width) = (stride as usize, value_head_dimension as usize);
+    let data = v
+        .data
+        .chunks_exact(stride)
+        .flat_map(|head| head[..width].iter().copied())
+        .collect();
+    Ok(HostTensor {
+        shape: vec![rows, kv_head_count * value_head_dimension],
+        data,
+    })
+}
+
 /// `concat` with `axis = "heads"` (`express-latent-attention-forms`): joins
 /// `[T, head_count * a]` and `[T, second_head_count * b]` rows head by head
 /// into `[T, head_count * (a + b)]`, output head `h` being the first input's
@@ -454,4 +528,56 @@ pub fn concat_heads(
         shape: vec![rows, head_count * (a + b) as u64],
         data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tensor(rows: u64, cols: u64, seed: u64) -> HostTensor {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 37 + seed * 101) % 23) as f32 / 23.0 - 0.5)
+            .collect();
+        HostTensor::new([rows, cols], data).unwrap()
+    }
+
+    /// Each output group is its input group times its weight group.
+    #[test]
+    fn batched_matmul_multiplies_group_by_group() {
+        let (rows, groups, k, n) = (3u64, 4u64, 5u64, 6u64);
+        let a = tensor(rows, groups * k, 1);
+        let b = tensor(groups * k, n, 2);
+        let out = batched_matmul(&a, &b, groups).unwrap();
+        assert_eq!(out.shape, vec![rows, groups * n]);
+        for group in 0..groups as usize {
+            for row in 0..rows as usize {
+                for column in 0..n as usize {
+                    let expected: f32 = (0..k as usize)
+                        .map(|i| {
+                            a.data[row * (groups * k) as usize + group * k as usize + i]
+                                * b.data[(group * k as usize + i) * n as usize + column]
+                        })
+                        .sum();
+                    let actual =
+                        out.data[row * (groups * n) as usize + group * n as usize + column];
+                    assert!((actual - expected).abs() < 1e-6);
+                }
+            }
+        }
+        assert!(batched_matmul(&a, &tensor(groups * k + 1, n, 2), groups).is_err());
+        assert!(batched_matmul(&a, &b, 3).is_err());
+    }
+
+    /// The values under a stride are each head's leading values.
+    #[test]
+    fn value_heads_take_each_heads_leading_values() {
+        let v = tensor(2, 2 * 5, 3);
+        let values = value_heads(&v, 2, 5, 3).unwrap();
+        assert_eq!(values.shape, vec![2, 6]);
+        assert_eq!(&values.data[..3], &v.data[..3]);
+        assert_eq!(&values.data[3..6], &v.data[5..8]);
+        assert_eq!(&values.data[6..9], &v.data[10..13]);
+        assert!(value_heads(&v, 2, 4, 3).is_err());
+        assert!(value_heads(&v, 2, 5, 6).is_err());
+    }
 }
