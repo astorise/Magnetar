@@ -21,8 +21,8 @@
 
 - [x] 4.1 Store, quantizing `kv-write`, download/expansion/copy.
 - [x] 4.2 Decode attention on codes (split-KV, grouped-query); prefill through dequantized scratch.
-- [ ] 4.4 Offsets: set by the write at row 0 (`tq_offsets_kernel`, padding rows of a replayed prefill excluded), subtracted before quantizing, added back on read; `q · μ_k` in decode scores, `μ_v` after the inverse rotation (written; conformance runs on the GPU runner).
-- [ ] 4.3 Conformance against the Reference CPU on the same rounded stores (written; runs on the GPU runner); step capture.
+- [x] 4.4 Offsets: set by the write at row 0 (`tq_offsets_kernel`, padding rows of a replayed prefill excluded), subtracted before quantizing, added back on read; `q · μ_k` in decode scores, `μ_v` after the inverse rotation (conformance passes on the GPU runner, run 44183609847).
+- [x] 4.3 Conformance against the Reference CPU on the same rounded stores, with offsets, 64- to 512-wide heads and a sliding window: passes on the GPU runner (runs 44145395903 and 44183609847) once the test rows are hashed; the smoke `kv` group's generations run with step capture.
 
 ## 5. Qualification
 

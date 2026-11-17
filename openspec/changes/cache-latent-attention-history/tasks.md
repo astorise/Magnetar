@@ -3,7 +3,7 @@
 - [x] 1.1 `magnetar-core` / `magnetar-provider-api`: `batched-matmul` semantics (`group_count`, `batched_matmul`) and `attention.value_head_stride` (`value_heads`, feature `attention-value-head-stride`).
 - [x] 1.2 Reference CPU (runtime): both, with tests (groups against per-group matmuls; strided values; `absorbed_latent_attention_matches_the_expanded_form`: the absorbed decode equals the expanded attention).
 - [x] 1.3 `providers/cpu`: both, both CPU Providers (the optimized one leaves strided values to the Reference CPU kernel), advertised.
-- [ ] 1.4 `providers/cuda`: both (values gathered into a per-shape scratch buffer, then the existing attention), conformance against the CPU written (`batched_matmul_and_strided_values_match_the_cpu`); runs on the GPU runner.
+- [x] 1.4 `providers/cuda`: both (values gathered into a per-shape scratch buffer, then the existing attention), conformance against the CPU (`batched_matmul_and_strided_values_match_the_cpu`, both `batched-matmul` forms, strided values over f32 and tq4 latent stores) passes on the GPU runner (run 44183609847).
 
 ## 2. Weights
 
