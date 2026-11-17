@@ -40,7 +40,13 @@ Q8_0 on the CPU (prompt "The capital of France is", 64 greedy tokens)
 continues " Paris." in f32, in `tq4` V with f32 K, but not in `tq4` K
 without offsets (" the, the, the, …"; `tq4` K and V gives
 "\n\n10.\n\n10.0.10…"). With the offsets, `tq4` and `tq3` K and V
-continue " Paris.". Attention is exact under any fixed offsets: a key's
+continue " Paris.". The GPU runner found the same before the offsets (run
+44128259285, CUDA, 64 greedy tokens against f32): Qwen2.5-0.5B lost
+" Paris." in `tq4` (0/64 leading tokens agree) and `tq3` (0/64), Gemma 4
+E2B kept it (4/64 each: f32 itself ends after " Paris.\n\n"), and
+Mistral 7B Q4_K_M agreed on 48/64 tokens in `tq4` and opened with
+"a city that is full of history" in `tq3`. Attention is exact under any
+fixed offsets: a key's
 offset adds `q · μ` to every score of a query, which the softmax ignores,
 and values read back with their offset added. Only the quantization error
 changes.

@@ -125,13 +125,20 @@ jobs:
             MAGNETAR_KV_GAINS_LABEL="$label" \
             MAGNETAR_KV_GAINS_REPORT="$reports/$label.md" \
               cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$reports/$label.log" || { echo "::error::$label: the gains test failed"; status=1; }
-            if [ -f "$reports/$label.md" ]; then
-              cat "$reports/$label.md" >> "$GITHUB_STEP_SUMMARY"
-              echo >> "$GITHUB_STEP_SUMMARY"
-            fi
             rm -rf "$dir"
           done
           exit "$status"
+      - name: Summarize the gains reports
+        # The reports the gains test rewrites after each precision, also
+        # when the step above ran out of time.
+        if: always()
+        shell: bash
+        run: |
+          for report in "$RUNNER_TEMP"/qualification-reports/turboquant-kv-gains/*.md; do
+            [ -f "$report" ] || continue
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          done
       - name: Upload the gains reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

@@ -8,14 +8,18 @@
 //!   left free after loading holds;
 //! - whether the context ran (a run that fails, out of memory for example,
 //!   is reported and the precision's longer contexts are skipped);
-//! - warm TTFT and TPOT;
+//! - TTFT and TPOT, warm up to [`MAX_WARMED_CONTEXT`] tokens (a longer
+//!   context's prefill dwarfs a first run's one-time costs, and warming it
+//!   would double the run);
 //! - against f32 at the same context: how many leading generated tokens
 //!   agree, whether the first token is the same, and the largest difference
 //!   of the first step's logits.
 //!
 //! The prompt is a fixed English paragraph's tokens repeated to the context
 //! length. The checkpoint is read as given: the workflow pins it by
-//! revision and checks its sha256.
+//! revision and checks its sha256. Each measure is printed as it ends and
+//! the report is rewritten after each precision, so a run stopped by its
+//! time limit keeps what it measured.
 
 use magnetar_loader_gguf::GgufIngestor;
 use magnetar_runtime::model::ModelTrustStore;
@@ -35,6 +39,9 @@ const PARAGRAPH: &str = "The history of the city stretches back more than two th
     behind: a bridge, a library, a market square that still fills every morning. \
     Visitors walk the old streets, read the inscriptions on the walls, and ask how \
     so many generations managed to keep the place alive through floods, fires and wars.";
+
+/// The longest context measured after a warmup at the same length.
+const MAX_WARMED_CONTEXT: u64 = 4096;
 
 /// One precision at one context.
 struct Measure {
@@ -186,7 +193,12 @@ fn turboquant_kv_gains_on_cuda() {
                 max_generation_millis: None,
             };
             // A warmup at the same length, so the measured run is warm.
-            let warm = model.generate(request(2), None);
+            let context_started = Instant::now();
+            let warm = if context <= MAX_WARMED_CONTEXT {
+                model.generate(request(2), None).map(|_| ())
+            } else {
+                Ok(())
+            };
             let mut token_times = Vec::new();
             let mut first_logits: Vec<f32> = Vec::new();
             let started = Instant::now();
@@ -207,6 +219,20 @@ fn turboquant_kv_gains_on_cuda() {
                     },
                 )
             });
+            match &outcome {
+                Ok(_) => eprintln!(
+                    "[kv gains] {label} {} context {context}: ran, TTFT {:.1} ms, {} tokens, {:.0} s",
+                    precision.as_str(),
+                    token_times.first().copied().unwrap_or(0.0),
+                    token_times.len(),
+                    context_started.elapsed().as_secs_f64()
+                ),
+                Err(error) => eprintln!(
+                    "[kv gains] {label} {} context {context}: failed after {:.0} s: {error}",
+                    precision.as_str(),
+                    context_started.elapsed().as_secs_f64()
+                ),
+            }
             match outcome {
                 Ok(outcome) => {
                     let ttft = token_times.first().copied().unwrap_or(0.0);
@@ -254,13 +280,15 @@ fn turboquant_kv_gains_on_cuda() {
             free_bytes_after_load,
             measures,
         });
+        // The report so far, so a run stopped by its time limit keeps it.
+        if let Ok(path) = std::env::var("MAGNETAR_KV_GAINS_REPORT") {
+            std::fs::write(&path, gains_report(&label, new_tokens, &runs))
+                .expect("the report is writable");
+        }
     }
 
     let report = gains_report(&label, new_tokens, &runs);
     eprintln!("{report}");
-    if let Ok(path) = std::env::var("MAGNETAR_KV_GAINS_REPORT") {
-        std::fs::write(&path, &report).expect("the report is writable");
-    }
     let baseline = &runs[0];
     assert!(
         baseline.measures.first().is_some_and(|m| m.error.is_none()),
@@ -274,7 +302,8 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
     let baseline = &runs[0];
     let mut report = format!(
         "### TurboQuant KV gains: {label}\n\n\
-         Greedy decoding of {new_tokens} tokens after a prompt of each context length, one RTX 3060.\n\n\
+         Greedy decoding of {new_tokens} tokens after a prompt of each context length, one RTX 3060; \
+         TTFT warm up to {MAX_WARMED_CONTEXT} tokens.\n\n\
          | KV precision | KV bytes/token | vs f32 | Tokens of KV in the free VRAM after load |\n\
          |---|---|---|---|\n"
     );
@@ -288,7 +317,7 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
         ));
     }
     report.push_str(
-        "\n| KV precision | Context | Ran | Warm TTFT (ms) | TPOT (ms) | TPOT vs f32 | \
+        "\n| KV precision | Context | Ran | TTFT (ms) | TPOT (ms) | TPOT vs f32 | \
          Leading tokens = f32 | First token = f32 | Max \\|Δ logit\\| step 1 |\n\
          |---|---|---|---|---|---|---|---|---|\n",
     );

@@ -1619,14 +1619,16 @@ jobs:
         # turboquant-kv-history: the gains test of turboquant-kv-gains.yml on
         # one checkpoint, so the kv group reports them too: KV bytes per
         # token, the tokens the free VRAM holds, which contexts run, TTFT,
-        # TPOT and the agreement with f32, in the run summary.
+        # TPOT and the agreement with f32, in the run summary (next step).
+        # Up to 16,384 tokens: 32,768 did not finish within the hour (run
+        # 44128259285); turboquant-kv-gains.yml measures it.
         if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
         timeout-minutes: 60
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_KV_POOL_BYTES: "0"
           MAGNETAR_KV_GAINS_LABEL: gemma-4-e2b-qat-q4_0
-          MAGNETAR_KV_GAINS_CONTEXTS: "512,4096,16384,32768"
+          MAGNETAR_KV_GAINS_CONTEXTS: "512,4096,16384"
           REVISION: 675cff42a74c774d6cb76f76d8eacb49b48c9b93
         shell: bash
         run: |
@@ -1640,9 +1642,16 @@ jobs:
           MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$dir" MAGNETAR_KV_GAINS_REPORT="$report/gains-e2b.md" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains-e2b.log"
           status=$?
-          [ -f "$report/gains-e2b.md" ] && cat "$report/gains-e2b.md" >> "$GITHUB_STEP_SUMMARY"
           rm -rf "$dir"
           exit "$status"
+      - name: TurboQuant KV gains summary
+        # The report the gains test rewrites after each precision, also
+        # when the step above ran out of time.
+        if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/qualification-reports/turboquant-kv/gains-e2b.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; else echo "no gains report"; fi
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
