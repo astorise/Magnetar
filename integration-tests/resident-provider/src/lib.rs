@@ -196,6 +196,16 @@ impl ProviderExecutionApi for ResidentExecutor {
     ) -> Result<bool, ProviderExecutionError> {
         self.inner.write_zeroed_tensor(id, shape)
     }
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: magnetar_runtime::KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        self.inner
+            .write_zeroed_kv_store(id, shape, precision, head_dimension)
+    }
     fn write_tensor_value_admitted(
         &self,
         memory: &mut MemoryManager,

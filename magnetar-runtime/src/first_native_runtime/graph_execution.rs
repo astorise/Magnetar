@@ -1498,29 +1498,91 @@ pub(super) fn execute_first_native_graph_nodes(
                             Some(_) => MemoryAllocationOwner::Session(KV_STORE_POOL_OWNER.into()),
                             None => MemoryAllocationOwner::Session(kv_cache_id.to_string()),
                         };
-                        let target: OutputTarget = (
-                            store.clone(),
-                            resolved_output_placement(
-                                dispatch_ctx.prepared_plan.as_deref(),
-                                node_id,
-                            ),
-                            owner,
+                        let placement = resolved_output_placement(
+                            dispatch_ctx.prepared_plan.as_deref(),
+                            node_id,
                         );
-                        let (store_id, _) = resolve_output_target(
-                            &mut dispatch_ctx,
-                            &format!("{node_id}.kv-store"),
-                            store_descriptor.clone(),
-                            Some(target),
-                        )?;
-                        // Zeroed where the store lives when the Provider can,
-                        // instead of building and uploading host zeros: at
-                        // prefill, one store per layer and role.
-                        let zeroed = dispatch_ctx
-                            .provider
-                            .write_zeroed_tensor(&store_id, &[capacity, width])
-                            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
-                                reason: error.to_string(),
+                        // A store in a TurboQuant precision is admitted at
+                        // its stored size and created by the Provider in
+                        // that precision (`turboquant-kv-history`).
+                        let precision = spec.precisions.for_role(role);
+                        let head_dimension = fixture
+                            .config
+                            .kv_head_dimensions()
+                            .get(layer)
+                            .copied()
+                            .flatten()
+                            .map(|(key, value)| match role {
+                                KvRole::K => key,
+                                KvRole::V => value,
+                            });
+                        let compact = match head_dimension {
+                            Some(head) if precision != KvStorePrecision::F32 => {
+                                Some((head, precision.stored_bytes(capacity, width, head)))
+                            }
+                            _ => None,
+                        };
+                        let zeroed = if let Some((head, stored_bytes)) = compact {
+                            let stored_bytes = stored_bytes.ok_or_else(|| {
+                                InferenceApiError::KvCacheUnavailable {
+                                    reason: format!(
+                                        "layer {layer}: a {} store of {width}-wide rows cannot \
+                                         hold {head}-wide heads",
+                                        precision.as_str()
+                                    ),
+                                }
                             })?;
+                            dispatch_ctx
+                                .runtime
+                                .memory_mut()
+                                .admit_kernel_output_bytes(
+                                    store.clone(),
+                                    stored_bytes,
+                                    placement,
+                                    owner,
+                                    ResourceAffinity::new(FallbackClass::Transparent),
+                                )
+                                .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
+                                    reason: format!(
+                                        "cannot admit the {} KV store {store}: {error:?}",
+                                        precision.as_str()
+                                    ),
+                                })?;
+                            let created = dispatch_ctx
+                                .provider
+                                .write_zeroed_kv_store(&store, &[capacity, width], precision, head)
+                                .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                                    reason: error.to_string(),
+                                })?;
+                            if !created {
+                                return Err(InferenceApiError::KvCacheUnavailable {
+                                    reason: format!(
+                                        "layer {layer}: the Provider advertises TurboQuant KV \
+                                         stores but declined a {} store",
+                                        precision.as_str()
+                                    ),
+                                });
+                            }
+                            true
+                        } else {
+                            let target: OutputTarget = (store.clone(), placement, owner);
+                            let (store_id, _) = resolve_output_target(
+                                &mut dispatch_ctx,
+                                &format!("{node_id}.kv-store"),
+                                store_descriptor.clone(),
+                                Some(target),
+                            )?;
+                            // Zeroed where the store lives when the Provider
+                            // can, instead of building and uploading host
+                            // zeros: at prefill, one store per layer and role.
+                            dispatch_ctx
+                                .provider
+                                .write_zeroed_tensor(&store_id, &[capacity, width])
+                                .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                                    reason: error.to_string(),
+                                })?
+                        };
+                        let store_id = store.clone();
                         if !zeroed {
                             let zeros = HostTensor::new(
                                 [capacity, width],

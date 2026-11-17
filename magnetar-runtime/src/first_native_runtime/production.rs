@@ -1529,6 +1529,32 @@ impl ProductionLoadedModel {
         self.step_replay.set_enabled(enabled);
     }
 
+    /// Asks for KV stores in `precisions` instead of what
+    /// `MAGNETAR_KV_PRECISION` names (`turboquant-kv-history`). Takes
+    /// effect at the next prefill that creates stores, before any
+    /// resolution.
+    pub fn request_kv_precisions(&mut self, precisions: KvPrecisions) {
+        self.kv_pool.request_precisions(precisions);
+    }
+
+    /// The bytes one token of KV history takes on this model, in the
+    /// precisions its stores use (f32 until a prefill resolved them;
+    /// `turboquant-kv-history`).
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        let precisions = self
+            .kv_pool
+            .precision_resolution()
+            .map(|resolution| resolution.resolved)
+            .unwrap_or_default();
+        kv_bytes_per_token(&self.fixture.config, precisions)
+    }
+
+    /// The precisions this model's KV stores use and why a requested one
+    /// was not used, once a prefill resolved them.
+    pub fn kv_precision_resolution(&self) -> Option<KvPrecisionResolution> {
+        self.kv_pool.precision_resolution()
+    }
+
     /// Starts attributing every later generation step's host time to its
     /// phases (A06). Off by default.
     pub fn enable_phase_attribution(&mut self) {

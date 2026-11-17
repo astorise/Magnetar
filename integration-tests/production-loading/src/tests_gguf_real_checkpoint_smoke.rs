@@ -566,6 +566,18 @@ fn generate_gguf_with(
             phases.join(", ")
         );
     }
+    if let Some(resolution) = model.kv_precision_resolution() {
+        eprintln!(
+            "[{label}] kv precisions K {} V {}{}",
+            resolution.resolved.k.as_str(),
+            resolution.resolved.v.as_str(),
+            if resolution.fallbacks.is_empty() {
+                String::new()
+            } else {
+                format!(" (fallbacks: {})", resolution.fallbacks.join("; "))
+            }
+        );
+    }
     eprintln!("[{label}] generated token ids {tokens:?}");
     eprintln!("[{label}] generated text {:?}", outcome.text);
     model.unload().expect("the real checkpoint unloads");

@@ -113,10 +113,13 @@ impl TurboQuantCodebook {
     }
 }
 
+/// The computed codebooks, by dimension and bits.
+type CodebookCache = BTreeMap<(u64, u32), Arc<TurboQuantCodebook>>;
+
 /// The codebook for `dimension` (a power of two of at least 8) and `bits`
 /// (1 to 8), computed once per pair and shared.
 pub fn turboquant_codebook(dimension: u64, bits: u32) -> Arc<TurboQuantCodebook> {
-    static CACHE: OnceLock<Mutex<BTreeMap<(u64, u32), Arc<TurboQuantCodebook>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<CodebookCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut cache = cache.lock().unwrap();
     cache

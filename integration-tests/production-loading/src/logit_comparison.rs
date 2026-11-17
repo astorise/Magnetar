@@ -20,8 +20,9 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    GenerationParameters, ModelArtifactSource, ProductionGenerationRequest, ProductionLoadedModel,
-    PromptInput, Provider, ReferenceCpuProvider, StopConditions, production_model_fixture,
+    GenerationParameters, KvPrecisionResolution, KvPrecisions, ModelArtifactSource,
+    ProductionGenerationRequest, ProductionLoadedModel, PromptInput, Provider,
+    ReferenceCpuProvider, StopConditions, production_model_fixture,
 };
 use std::{fs, ops::ControlFlow, path::PathBuf, sync::Arc};
 
@@ -81,6 +82,154 @@ pub(crate) fn compare_on(
     format: Format,
     family: &str,
 ) -> f32 {
+    let (mut model, reference) =
+        load_checkpoint(provider, family_directory, variant, format, family);
+    let mut recorder = LogitRecorder::default();
+    let outcome = model
+        .generate_streaming_with_logits(
+            reference_request(&reference),
+            None,
+            &mut |_| ControlFlow::Continue(()),
+            &mut |logits| recorder.observe(logits),
+        )
+        .unwrap_or_else(|error| panic!("{variant} generates: {error}"));
+    let candidate = recorder.finish(
+        reference.checkpoint.clone(),
+        provider_label,
+        "f32",
+        reference.prompt_token_ids.clone(),
+        outcome.result.output.generated_token_ids.clone(),
+    );
+    let comparison = compare_logit_references(
+        &reference,
+        &candidate,
+        &NumericalProfile {
+            name: format!("{family}-f32-vs-transformers"),
+            dtype: "f32".into(),
+            max_abs_logit_difference: 1e-3,
+            require_identical_tokens: true,
+            compared_top_k: 8,
+        },
+    );
+    assert!(
+        comparison.passed(),
+        "{variant}: tokens {:?} against {:?}: {:#?}",
+        candidate.generated_token_ids,
+        reference.generated_token_ids,
+        comparison.failures
+    );
+    comparison.max_abs_difference
+}
+
+/// The reference's prompt, greedy, for as many tokens as it holds.
+fn reference_request(reference: &LogitReference) -> ProductionGenerationRequest {
+    ProductionGenerationRequest {
+        prompt: PromptInput::TokenIds(reference.prompt_token_ids.clone()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(reference.steps.len()),
+        max_generation_millis: None,
+    }
+}
+
+/// How a TurboQuant KV history changes a checkpoint's generation against
+/// f32 stores (`turboquant-kv-history`).
+pub(crate) struct KvPrecisionDrift {
+    pub(crate) resolution: KvPrecisionResolution,
+    /// The largest difference of any logit at any step over the steps
+    /// both runs share a history for (until their tokens first differ).
+    pub(crate) max_abs_difference: f32,
+    /// How many leading generated tokens agree.
+    pub(crate) agreeing_tokens: usize,
+    pub(crate) steps: usize,
+}
+
+/// Runs the checkpoint of [`compare_on`] on `provider` with f32 KV stores,
+/// then on a fresh `provider` from `make_provider` with `precisions`
+/// requested, and measures the drift.
+pub(crate) fn kv_precision_drift(
+    make_provider: &dyn Fn() -> Arc<dyn Provider>,
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+    precisions: KvPrecisions,
+) -> KvPrecisionDrift {
+    let run = |precisions| {
+        generate_logits(
+            make_provider(),
+            family_directory,
+            variant,
+            format,
+            family,
+            precisions,
+        )
+    };
+    let (f32_steps, f32_tokens, _) = run(KvPrecisions::default());
+    let (steps, tokens, resolution) = run(precisions);
+    let agreeing_tokens = f32_tokens
+        .iter()
+        .zip(&tokens)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Step `i`'s logits pick token `i`: compare until the first differing
+    // token, after which the histories differ.
+    let compared = (agreeing_tokens + 1).min(steps.len()).min(f32_steps.len());
+    let max_abs_difference = f32_steps[..compared]
+        .iter()
+        .zip(&steps[..compared])
+        .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+        .fold(0.0_f32, f32::max);
+    KvPrecisionDrift {
+        resolution,
+        max_abs_difference,
+        agreeing_tokens,
+        steps: tokens.len(),
+    }
+}
+
+/// Every step's logits, the generated tokens and the KV precision
+/// resolution of the checkpoint of [`compare_on`] on `provider` with
+/// `precisions` requested.
+pub(crate) fn generate_logits(
+    provider: Arc<dyn Provider>,
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+    precisions: KvPrecisions,
+) -> (Vec<Vec<f32>>, Vec<u32>, KvPrecisionResolution) {
+    let (mut model, reference) =
+        load_checkpoint(provider, family_directory, variant, format, family);
+    model.request_kv_precisions(precisions);
+    let mut steps: Vec<Vec<f32>> = Vec::new();
+    let outcome = model
+        .generate_streaming_with_logits(
+            reference_request(&reference),
+            None,
+            &mut |_| ControlFlow::Continue(()),
+            &mut |logits| steps.push(logits.to_vec()),
+        )
+        .unwrap_or_else(|error| panic!("{variant} generates: {error}"));
+    (
+        steps,
+        outcome.result.output.generated_token_ids,
+        model
+            .kv_precision_resolution()
+            .expect("the prefill resolved the KV precisions"),
+    )
+}
+
+/// Loads `fixtures/{family_directory}/{variant}` on `provider` with the
+/// Model Component its family selects, after checking that family, and
+/// returns it with its reference.
+fn load_checkpoint(
+    provider: Arc<dyn Provider>,
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+) -> (ProductionLoadedModel, LogitReference) {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join(family_directory)
@@ -131,7 +280,7 @@ pub(crate) fn compare_on(
         tokenizer,
     )
     .expect("the production fixture builds");
-    let mut model = ProductionLoadedModel::load_with_component(
+    let model = ProductionLoadedModel::load_with_component(
         fixture,
         ingested.payload_source.as_ref(),
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone()),
@@ -139,46 +288,5 @@ pub(crate) fn compare_on(
         Some(component),
     )
     .unwrap_or_else(|error| panic!("{variant} loads with its Component: {error}"));
-
-    let mut recorder = LogitRecorder::default();
-    let outcome = model
-        .generate_streaming_with_logits(
-            ProductionGenerationRequest {
-                prompt: PromptInput::TokenIds(reference.prompt_token_ids.clone()),
-                parameters: GenerationParameters::greedy(),
-                stop_conditions: StopConditions::default(),
-                max_new_tokens: Some(reference.steps.len()),
-                max_generation_millis: None,
-            },
-            None,
-            &mut |_| ControlFlow::Continue(()),
-            &mut |logits| recorder.observe(logits),
-        )
-        .unwrap_or_else(|error| panic!("{variant} generates: {error}"));
-    let candidate = recorder.finish(
-        reference.checkpoint.clone(),
-        provider_label,
-        "f32",
-        reference.prompt_token_ids.clone(),
-        outcome.result.output.generated_token_ids.clone(),
-    );
-    let comparison = compare_logit_references(
-        &reference,
-        &candidate,
-        &NumericalProfile {
-            name: format!("{family}-f32-vs-transformers"),
-            dtype: "f32".into(),
-            max_abs_logit_difference: 1e-3,
-            require_identical_tokens: true,
-            compared_top_k: 8,
-        },
-    );
-    assert!(
-        comparison.passed(),
-        "{variant}: tokens {:?} against {:?}: {:#?}",
-        candidate.generated_token_ids,
-        reference.generated_token_ids,
-        comparison.failures
-    );
-    comparison.max_abs_difference
+    (model, reference)
 }

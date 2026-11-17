@@ -12,6 +12,61 @@ use super::*;
 /// open`). Proves the second call is a genuine no-op, not a panic or an
 /// error, regardless of whether the bytes differ from the first call's.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+/// A TurboQuant KV precision asked for a model whose heads are not a power
+/// of two of at least 8 falls back to f32 stores, records why, and
+/// generates exactly as with f32 stores (`turboquant-kv-history`).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn turboquant_kv_stores_fall_back_to_f32_for_unsupported_head_widths() {
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let generate = |precisions: Option<KvPrecisions>| {
+        let mut model = ProductionLoadedModel::load(
+            fixture.clone(),
+            &payload_source,
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+            Arc::new(ReferenceCpuProvider::new()),
+        )
+        .expect("the model loads");
+        if let Some(precisions) = precisions {
+            model.request_kv_precisions(precisions);
+        }
+        let outcome = model
+            .generate(
+                ProductionGenerationRequest {
+                    prompt: PromptInput::TokenIds(vec![5, 6, 7]),
+                    parameters: GenerationParameters::greedy(),
+                    stop_conditions: StopConditions::default(),
+                    max_new_tokens: Some(3),
+                    max_generation_millis: None,
+                },
+                None,
+            )
+            .expect("generation succeeds");
+        (
+            outcome.result.output.generated_token_ids,
+            model.kv_precision_resolution(),
+        )
+    };
+    let (f32_tokens, _) = generate(None);
+    let (tq_tokens, resolution) = generate(Some(KvPrecisions::uniform(KvStorePrecision::Tq4)));
+    let resolution = resolution.expect("the prefill resolved the precisions");
+    assert_eq!(
+        resolution.requested,
+        KvPrecisions::uniform(KvStorePrecision::Tq4)
+    );
+    assert_eq!(resolution.resolved, KvPrecisions::default());
+    assert_eq!(resolution.fallbacks.len(), 2, "{:?}", resolution.fallbacks);
+    assert!(
+        resolution
+            .fallbacks
+            .iter()
+            .all(|reason| reason.contains("2 wide")),
+        "{:?}",
+        resolution.fallbacks
+    );
+    assert_eq!(tq_tokens, f32_tokens);
+}
+
 /// A production generation encodes a plain-text prompt with the
 /// tokenizer's special tokens (its beginning-of-sequence token); a chat
 /// prompt, whose template writes them, and token ids are used as they are

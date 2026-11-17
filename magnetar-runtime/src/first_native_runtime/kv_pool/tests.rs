@@ -38,6 +38,7 @@ fn a_released_set_serves_the_next_request_of_its_capacity() {
         Some(KvStoreSpec {
             capacity: 256,
             pool_set: c,
+            precisions: KvPrecisions::default(),
         })
     );
 }

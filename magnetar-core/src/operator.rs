@@ -329,6 +329,14 @@ pub const CONCAT_HEADS_FEATURE: &str = "concat-heads";
 /// scaling ([`RopeYarnFrequencyScaling`]).
 pub const ROPE_YARN_FREQUENCY_SCALING_FEATURE: &str = "yarn-frequency-scaling";
 
+/// The `kv-write` Kernel feature a Provider advertises when it creates and
+/// writes TurboQuant KV stores (`turboquant-kv-history`).
+pub const KV_WRITE_TURBOQUANT_FEATURE: &str = "turboquant-kv-store";
+
+/// The `attention` Kernel feature a Provider advertises when its attention
+/// reads K and V from TurboQuant KV stores (`turboquant-kv-history`).
+pub const ATTENTION_TURBOQUANT_KV_FEATURE: &str = "turboquant-kv-read";
+
 /// The Kernel features an `operator` node with these `attributes` and
 /// `input_count` inputs needs beyond the Operator's baseline form: the
 /// optional attributes and operand forms a Kernel could otherwise ignore

@@ -4164,6 +4164,25 @@ impl MemoryManager {
                     "cannot admit output '{id}': invalid tensor descriptor ({error:?})"
                 ),
             })?;
+        self.admit_kernel_output_bytes(id.clone(), byte_size, placement, owner, affinity.clone())?;
+        Ok(TensorResourceDescriptor::new(
+            id,
+            descriptor.clone(),
+            affinity,
+        ))
+    }
+
+    /// [`Self::admit_kernel_output`] for a resource whose stored size is not
+    /// its descriptor's: a KV store kept in a compact precision
+    /// (`turboquant-kv-history`) is admitted at `byte_size`.
+    pub fn admit_kernel_output_bytes(
+        &mut self,
+        id: TensorResourceId,
+        byte_size: u64,
+        placement: MemoryPlacement,
+        owner: MemoryAllocationOwner,
+        affinity: ResourceAffinity,
+    ) -> Result<(), MemoryError> {
         let request = MemoryAllocationRequest::new(
             MemoryAllocationClass::Tensor,
             byte_size,
@@ -4190,11 +4209,7 @@ impl MemoryManager {
                         .with_allocation(previous),
                 )
         {
-            return Ok(TensorResourceDescriptor::new(
-                id,
-                descriptor.clone(),
-                affinity,
-            ));
+            return Ok(());
         }
         let allocation = self.allocate(request)?;
         self.record_tensor_residency(
@@ -4204,11 +4219,7 @@ impl MemoryManager {
         if let Some(previous) = previous {
             let _ = self.release(previous);
         }
-        Ok(TensorResourceDescriptor::new(
-            id,
-            descriptor.clone(),
-            affinity,
-        ))
+        Ok(())
     }
 
     /// Removes a Tensor Resource's residency record. Callers releasing a

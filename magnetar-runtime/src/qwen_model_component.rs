@@ -448,6 +448,29 @@ impl FirstNativeModelConfig {
         }
     }
 
+    /// Each decoder layer's K and V head widths, `None` for a layer that
+    /// keeps no K/V of its own (`turboquant-kv-history`): its row widths
+    /// over its KV head count.
+    pub fn kv_head_dimensions(&self) -> Vec<Option<(u64, u64)>> {
+        let heads: Vec<u64> = match &self.layer_layout {
+            Some(layout) => layout
+                .iter()
+                .map(|layer| layer.num_key_value_heads as u64)
+                .collect(),
+            None => vec![self.architecture.kv_head_count; self.architecture.layer_count as usize],
+        };
+        self.kv_row_widths()
+            .into_iter()
+            .zip(self.kv_value_row_widths())
+            .zip(heads)
+            .map(|((key, value), heads)| {
+                key.zip(value)
+                    .filter(|_| heads > 0)
+                    .map(|(key, value)| (key / heads, value / heads))
+            })
+            .collect()
+    }
+
     /// Each decoder layer's K (and, without latent attention, V) row width,
     /// `kv_head_count * head_dimension` of that layer, or `None` for a layer
     /// that attends over an earlier layer's K/V and keeps none of its own

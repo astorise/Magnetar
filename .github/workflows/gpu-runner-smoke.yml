@@ -19,17 +19,19 @@ name: GPU Runner Smoke Test
 # runner, so the schedule cannot pile up runs alongside a manual dispatch.
 #
 # Step groups: a manual dispatch's `suite` input picks groups (kernels,
-# dense, long-context, gguf, multi-gpu, moe, gemma); its default, "standard",
+# dense, long-context, gguf, multi-gpu, moe, gemma, kv); its default, "standard",
 # leaves out the long-context campaigns (Tensor Cores on and off, about a
-# third of the run), which the daily schedule still runs with every other
-# group. The CUDA Provider build and conformance tests always run.
+# third of the run) and the TurboQuant KV checks (kv), which the daily
+# schedule still runs with every other group. The CUDA Provider build and
+# conformance tests always run. TurboQuant's gains are measured by
+# turboquant-kv-gains.yml.
 on:
   workflow_dispatch:
     inputs:
       suite:
         description: >-
           Comma-separated groups to run: kernels, dense, long-context, gguf,
-          multi-gpu, moe, gemma; or "standard" (all but long-context) or "all".
+          multi-gpu, moe, gemma, kv; or "standard" (all but long-context and kv) or "all".
           The daily schedule always runs "all".
         required: false
         default: standard
@@ -63,10 +65,10 @@ jobs:
           set -eu
           suite="$(echo "$SUITE" | tr -d ' ')"
           case ",$suite," in
-            *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe,gemma" ;;
+            *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe,gemma,kv" ;;
             *,standard,*) suite="$suite,kernels,dense,gguf,multi-gpu,moe,gemma" ;;
           esac
-          for group in kernels dense long-context gguf multi-gpu moe gemma; do
+          for group in kernels dense long-context gguf multi-gpu moe gemma kv; do
             var="SUITE_$(echo "$group" | tr 'a-z-' 'A-Z_')"
             case ",$suite," in
               *",$group,"*) echo "$var=true" >> "$GITHUB_ENV"; echo "$group: on" ;;
@@ -75,7 +77,7 @@ jobs:
           done
           for group in $(echo "$suite" | tr ',' ' '); do
             case "$group" in
-              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe|gemma) ;;
+              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe|gemma|kv) ;;
               *) echo "::error::unknown suite group: $group"; exit 1 ;;
             esac
           done
@@ -1570,6 +1572,49 @@ jobs:
             echo "::error::Gemma 4 E2B QAT Q4_0 on the optimized CPU: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: TurboQuant KV stores on real checkpoints against f32
+        # turboquant-kv-history: each checkpoint generates on one GPU with
+        # f32, tq4 and tq3 KV stores (MAGNETAR_KV_PRECISION); the greedy
+        # tokens are compared with the f32 run's. A run whose stores fell
+        # back to f32 fails. Where f32 continues "The capital of France is"
+        # with "Paris", tq4 must too; tq3 only reports.
+        if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
+        timeout-minutes: 60
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/qualification-reports/turboquant-kv"
+          mkdir -p "$report"
+          status=0
+          ids() { grep -o 'generated token ids \[[^]]*\]' "$1" | head -1 | sed 's/.*\[//; s/\]//' | tr -d ' ' | tr ',' '\n'; }
+          agree() { paste -d' ' <(ids "$1") <(ids "$2") | awk '$1 == $2 { n++; next } { exit } END { print n + 0 }'; }
+          qualify() { # label test dir_variable repository revision file
+            local label="$1" test="$2" var="$3" dir="$RUNNER_TEMP/kv-$1"
+            mkdir -p "$dir"
+            curl -fsSL "https://huggingface.co/$4/resolve/$5/$6" -o "$dir/model.gguf" || { echo "::error::$label: download failed"; status=1; return; }
+            for precision in f32 tq4 tq3; do
+              env "$var=$dir" MAGNETAR_KV_PRECISION="$precision" cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml "$test" -- --include-ignored --test-threads=1 --nocapture > "$report/$label-$precision.log" 2>&1 || { echo "::error::$label $precision: the test failed"; status=1; }
+              grep -h 'GPU(s)\|kv precisions\|generated text' "$report/$label-$precision.log" || true
+              grep -q "kv precisions K $precision V $precision" "$report/$label-$precision.log" || { echo "::error::$label: the stores are not $precision"; status=1; }
+            done
+            local total; total=$(ids "$report/$label-f32.log" | wc -l)
+            for precision in tq4 tq3; do
+              echo "$label $precision: $(agree "$report/$label-f32.log" "$report/$label-$precision.log")/$total leading tokens agree with f32"
+            done
+            if grep -Eq 'generated text " ?Paris' "$report/$label-f32.log" && ! grep -Eq 'generated text " ?Paris' "$report/$label-tq4.log"; then
+              echo "::error::$label tq4: the continuation no longer starts with 'Paris'"
+              status=1
+            fi
+            grep -Eq 'generated text " ?Paris' "$report/$label-tq3.log" || echo "::warning::$label tq3: the continuation does not start with 'Paris'"
+            rm -rf "$dir"
+          }
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          qualify qwen2.5-0.5b-q8_0 real_public_q8_0_gguf_checkpoint_generates_on_cuda MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR Qwen/Qwen2.5-0.5B-Instruct-GGUF 9217f5db79a29953eb74d5343926648285ec7e67 qwen2.5-0.5b-instruct-q8_0.gguf
+          qualify gemma-4-e2b-qat-q4_0 real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR google/gemma-4-E2B-it-qat-q4_0-gguf 675cff42a74c774d6cb76f76d8eacb49b48c9b93 gemma-4-E2B_q4_0-it.gguf
+          qualify mistral-7b-q4_k_m real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
+          exit "$status"
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
