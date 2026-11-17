@@ -1772,7 +1772,11 @@ fn a_latent_attention_inventory_needs_the_split_projections() {
         Err(QwenComponentError::TensorInventoryMissing { tensor })
             if tensor == "layers.1.self_attn.k_nope_proj"
     ));
-    // K rows are heads * (nope + rope) wide, V rows heads * v.
-    assert_eq!(config.kv_row_widths(), vec![Some(8); 3]);
-    assert_eq!(config.kv_value_row_widths(), vec![Some(6); 3]);
+    // The KV history is the latent row `[c_kv | k_pe]`, kv_lora_rank +
+    // rope wide, one key head that also holds the values: no V rows
+    // (`cache-latent-attention-history`).
+    assert_eq!(config.latent_history_width(), Some(10));
+    assert_eq!(config.kv_row_widths(), vec![Some(10); 3]);
+    assert_eq!(config.kv_value_row_widths(), vec![Some(0); 3]);
+    assert_eq!(config.kv_head_dimensions(), vec![Some((10, 10)); 3]);
 }

@@ -13,13 +13,13 @@
 
 ## 3. Runtime
 
-- [ ] 3.1 Latent layers: K rows `L + r`, no V store; the KV state names the K store for both roles; bytes per token, pool, layout metadata.
+- [x] 3.1 Latent layers: K rows `L + r`, no V store (`kv_value_row_widths` 0, `latent_history_width`); the KV state names the K store for both roles; bytes per token, pool and layout metadata follow; `batched-matmul` takes device-resident inputs.
 
 ## 4. Component
 
-- [ ] 4.1 `components/deepseek`: expanded prefill writing the latent rows, absorbed decode; rebuilt, digest repinned.
+- [x] 4.1 `components/deepseek` `678d2f6`: expanded prefill writing the latent rows, absorbed decode; rebuilt (two builds give `sha256:59a2f1e8…`), digest repinned.
 
 ## 5. Acceptance
 
-- [ ] 5.1 The tiny DeepSeek-V2 checkpoints (Hugging Face and GGUF) against `transformers` on the Reference CPU, both CPU Providers and CUDA.
+- [ ] 5.1 The tiny DeepSeek-V2 checkpoints (Hugging Face and GGUF) against `transformers`: they match on the Reference CPU, both CPU Providers and with every value device-resident (largest logit difference 1.2e-5); CUDA on the GPU runner.
 - [ ] 5.2 DeepSeek-V2-Lite-Chat on CUDA continues "The capital of France is" with "Paris"; bytes per token and TPOT against the expanded history.

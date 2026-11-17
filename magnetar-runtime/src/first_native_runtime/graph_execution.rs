@@ -1324,10 +1324,12 @@ pub(super) fn execute_first_native_graph_nodes(
         // anymore, both take `NodeValue` straight through to their Kernel
         // dispatch like every operator here. So does the head-wise
         // `concat` (`express-latent-attention-forms`): it reads only its
-        // inputs' shapes.
+        // inputs' shapes. So does `batched-matmul`
+        // (`cache-latent-attention-history`).
         let passthrough_eligible = matches!(
             node.operator.name(),
             "matmul"
+                | "batched-matmul"
                 | "matmul-bias"
                 | "matmul-residual"
                 | "gated-matmul"
@@ -1957,11 +1959,17 @@ pub(super) fn execute_first_native_graph_nodes(
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: format!("first-native graph produced no K state for layer {layer}"),
             })?;
-        let v = layer_v[layer]
-            .take()
-            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                reason: format!("first-native graph produced no V state for layer {layer}"),
-            })?;
+        // A latent history's rows hold the values too: its layer writes K
+        // only (`cache-latent-attention-history`).
+        let v = match layer_v[layer].take() {
+            Some(v) => v,
+            None if fixture.config.latent_attention.is_some() => k.clone(),
+            None => {
+                return Err(InferenceApiError::KvCacheUnavailable {
+                    reason: format!("first-native graph produced no V state for layer {layer}"),
+                });
+            }
+        };
         updated_layer_kv.insert(
             layer,
             FirstNativeLayerKvState {

@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:afd2f9cf3e58042725b092333b2390294afa8d1b0ec5cc68b54e5aa3ac536691"
+    value: "sha256:59a2f1e8200b21f40623b9d567d86c4ac9d71b41aa2c0b616c5f4019160f4e4f"
 component:
   name: "magnetar.deepseek.real"
   version: "0.1.0"

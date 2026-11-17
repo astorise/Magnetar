@@ -429,29 +429,37 @@ impl FirstNativeModelConfig {
     }
 
     /// Each decoder layer's V row width: [`Self::kv_row_widths`], except
-    /// under multi-head latent attention, whose expanded V rows are
-    /// `kv_head_count * v_head_dim` wide (`express-latent-attention-forms`).
+    /// under multi-head latent attention, whose layers keep no V rows: the
+    /// latent history's rows hold the values (`cache-latent-attention-history`).
     pub fn kv_value_row_widths(&self) -> Vec<Option<u64>> {
         let widths = self.kv_row_widths();
         match &self.latent_attention {
-            Some(mla) => widths
-                .into_iter()
-                .map(|width| {
-                    width.map(|_| {
-                        self.architecture
-                            .kv_head_count
-                            .saturating_mul(mla.v_head_dim)
-                    })
-                })
-                .collect(),
+            Some(_) => widths.into_iter().map(|width| width.map(|_| 0)).collect(),
             None => widths,
         }
+    }
+
+    /// A latent-attention layer's KV history row: the normalized latent and
+    /// the shared rotated key, `kv_lora_rank + qk_rope_head_dim` values, one
+    /// key head (`cache-latent-attention-history`).
+    pub fn latent_history_width(&self) -> Option<u64> {
+        self.latent_attention
+            .as_ref()
+            .map(|mla| u64::from(mla.kv_lora_rank).saturating_add(mla.qk_rope_head_dim))
     }
 
     /// Each decoder layer's K and V head widths, `None` for a layer that
     /// keeps no K/V of its own (`turboquant-kv-history`): its row widths
     /// over its KV head count.
     pub fn kv_head_dimensions(&self) -> Vec<Option<(u64, u64)>> {
+        // A latent history is one key head, which also holds the values.
+        if let Some(width) = self.latent_history_width() {
+            return self
+                .kv_row_widths()
+                .into_iter()
+                .map(|row| row.map(|_| (width, width)))
+                .collect();
+        }
         let heads: Vec<u64> = match &self.layer_layout {
             Some(layout) => layout
                 .iter()
@@ -474,9 +482,13 @@ impl FirstNativeModelConfig {
     /// Each decoder layer's K (and, without latent attention, V) row width,
     /// `kv_head_count * head_dimension` of that layer, or `None` for a layer
     /// that attends over an earlier layer's K/V and keeps none of its own
-    /// (`per-layer-kv-geometry`).
+    /// (`per-layer-kv-geometry`). Under latent attention, the latent
+    /// history's width ([`Self::latent_history_width`]).
     pub fn kv_row_widths(&self) -> Vec<Option<u64>> {
         let layers = self.architecture.layer_count as usize;
+        if let Some(width) = self.latent_history_width() {
+            return vec![Some(width); layers];
+        }
         match &self.layer_layout {
             Some(layout) => layout
                 .iter()
