@@ -112,9 +112,32 @@ Tokens are identical in all three.
   digits, accents, CJK, an emoji, code and newlines. Before the fix, every
   string starting with a word gained a leading "Ġ" token.
 
+The first GPU run (`moe` suite) found two problems:
+
+- **The CUDA rope dispatch refused YaRN.** It read the banded scaling
+  before YaRN, and the banded reader refuses every other scheme. The tiny
+  checkpoints on CUDA and DeepSeek-V2-Lite failed at their first rope node
+  ("frequency_scaling 'yarn' is not implemented"). DeepSeek-V2-Lite had
+  loaded across both GPUs by then. The CUDA Provider now reads YaRN first,
+  as the Runtime does. Its executor-level test of the layered models'
+  forms gains a YaRN rope.
+- **Qwen1.5-MoE's continuation changed with the tokenizer.** The prompt
+  now starts with "The" (785), as its `tokenizer.json` encodes it. The
+  model then continues it with a multiple-choice question: "______.\nA.
+  London\nB. Madrid\nC. Rome\nD. Paris\n答案:\nD. Paris". This held on
+  layer segments and tensor parallel alike. The workflow required the
+  continuation to start with "Paris", which held only with the leading
+  space. Its two Qwen1.5-MoE steps now require "Paris" in the
+  continuation. On the same tokenizer check, Qwen1.5-MoE's GGUF header
+  encodes the prompt to the upstream ids. Qwen2.5-0.5B-Instruct, run
+  greedily in `transformers`, answers " Paris." with and without the
+  leading space.
+
 **Limits:**
 - The checkpoints are tiny.
-- CUDA and the real DeepSeek-V2-Lite weights wait for the GPU workflow.
+- CUDA and the real DeepSeek-V2-Lite weights wait for the second GPU run.
+- Qwen1.5-MoE's new continuation was not compared with `transformers`.
+  The model is 14B parameters, too large to run here.
 - The GGUF tokenizer splits text with GPT-2's pattern, not each
   `tokenizer.ggml.pre`'s own. They agree on the corpus above for DeepSeek,
   but not in general.
@@ -134,5 +157,7 @@ Tokens are identical in all three.
   `logit_comparison.rs`, `tests_deepseek_v2_logits.rs`,
   `tests_gemma4_logits.rs`, `tests_gguf_real_checkpoint_smoke.rs`,
   `test_support.rs`.
-- `.github/workflows/gpu-runner-smoke.yml`: three steps in the `moe` suite.
+- `providers/cuda`: the rope dispatch reads YaRN before the banded scaling.
+- `.github/workflows/gpu-runner-smoke.yml`: three steps in the `moe` suite;
+  the Qwen1.5-MoE steps' check.
 - `components/deepseek`, `SUBMODULES.md`.

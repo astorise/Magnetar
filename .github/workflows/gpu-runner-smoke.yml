@@ -1523,6 +1523,12 @@ jobs:
           curl -fsSL "https://huggingface.co/RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf/resolve/$REVISION/Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf" -o "$dir/model.gguf"
           echo "MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
       - name: Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF across two GPUs
+        # The prompt is tokenized as the checkpoint's own tokenizer.json
+        # tokenizes it (no space before "The"). This chat model then
+        # continues it with a multiple-choice question whose answer is
+        # "D. Paris", so the continuation must contain "Paris". The
+        # continuation started with "Paris" only while the GGUF tokenizer
+        # added a leading space (fixed in Magnetar-loader-GGUF#21).
         if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 30
         env:
@@ -1533,8 +1539,8 @@ jobs:
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf/two-gpus.log"
-          grep -Eq 'generated text " ?Paris' "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf/two-gpus.log" || {
-            echo "::error::Qwen1.5-MoE Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+          grep -Eq 'generated text "[^"]*Paris' "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf/two-gpus.log" || {
+            echo "::error::Qwen1.5-MoE Q8_0: the greedy continuation of 'The capital of France is' does not contain 'Paris'"
             exit 1
           }
       - name: Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF across two GPUs (tensor parallel)
@@ -1557,8 +1563,8 @@ jobs:
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor.log"
           grep -h 'GPU(s)' "$dir"/*.log || true
           grep -h '\[step capture\]' "$dir/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
-          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor.log" || {
-            echo "::error::Qwen1.5-MoE Q8_0 tensor parallel: the continuation does not start with 'Paris'"
+          grep -Eq 'generated text "[^"]*Paris' "$dir/two-gpus-tensor.log" || {
+            echo "::error::Qwen1.5-MoE Q8_0 tensor parallel: the continuation does not contain 'Paris'"
             exit 1
           }
           layers="$(grep 'generated token ids' "$dir/two-gpus.log" || true)"
