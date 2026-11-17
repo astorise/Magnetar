@@ -45,8 +45,14 @@ continue " Paris.". The GPU runner found the same before the offsets (run
 " Paris." in `tq4` (0/64 leading tokens agree) and `tq3` (0/64), Gemma 4
 E2B kept it (4/64 each: f32 itself ends after " Paris.\n\n"), and
 Mistral 7B Q4_K_M agreed on 48/64 tokens in `tq4` and opened with
-"a city that is full of history" in `tq3`. Attention is exact under any
-fixed offsets: a key's
+"a city that is full of history" in `tq3`. With the offsets (run
+44138881338), all three continue with "Paris" in `tq4` and `tq3`; the
+leading tokens that agree with f32 are Qwen2.5-0.5B 8/64 (`tq4`) and
+2/64 (`tq3`), Gemma 4 E2B 7/64 and 12/64, Mistral 7B 13/64 and 1/64.
+Greedy agreement counts end at the first near-tie, so they vary from run
+to run (Mistral `tq4` agreed on 48 tokens without offsets); the
+first-step logit differences of the gains test measure the error more
+steadily. Attention is exact under any fixed offsets: a key's
 offset adds `q · μ` to every score of a query, which the softmax ignores,
 and values read back with their offset added. Only the quantization error
 changes.

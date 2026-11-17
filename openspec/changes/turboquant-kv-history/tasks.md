@@ -27,5 +27,5 @@
 ## 5. Qualification
 
 - [ ] 5.1 Gains on Qwen2.5-0.5B, Gemma 4 E2B and Mistral 7B (`turboquant-kv-gains.yml`, test `turboquant_kv_gains_on_cuda`): `f32`, `tq4`, `tq3` at 512 to 32,768 tokens; KV bytes per token and tokens held by the free VRAM, which contexts run, TTFT, TPOT, leading tokens and first-step logits against `f32`.
-- [ ] 5.2 The smoke workflow's `kv` group keeps `tq4` answering "Paris" where `f32` does.
+- [x] 5.2 The smoke workflow's `kv` group keeps `tq4` answering "Paris" where `f32` does: it failed for Qwen2.5-0.5B before the offsets (run 44128259285) and passes with them (run 44138881338), with `tq3` too.
 - [ ] 5.3 Evidence recorded here; default unchanged unless every profile passes.
