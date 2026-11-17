@@ -727,21 +727,6 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/dequantized.log"
-      - name: Q8_0 GGUF generates the same tokens packed and dequantized
-        if: ${{ env.SUITE_GGUF == 'true' }}
-        shell: bash
-        run: |
-          set -eu
-          packed="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
-          dequantized="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/dequantized.log")"
-          test -n "$packed"
-          grep -h 'packed weights\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
-          if [ "$packed" != "$dequantized" ]; then
-            echo "::error::Q8_0 GGUF: tokens differ between packed and dequantized weights"
-            diff <(echo "$packed") <(echo "$dequantized") || true
-            exit 1
-          fi
-          echo "$packed"
       - name: Q8_0 GGUF (Qwen2.5-0.5B) with f32 activations (disable control)
         # MAGNETAR_CUDA_INT8_ACTIVATIONS=0: the packed decode matmuls keep
         # f32 activations instead of rounding them to 8 bits per 32-value
@@ -772,6 +757,26 @@ jobs:
             echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ between int8 (default) and f32 activations"
             diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
           fi
+      - name: Q8_0 GGUF generates the same tokens packed and dequantized
+        # Packed weights with f32 activations against the same weights
+        # dequantized at load: the packing alone, so the tokens must be
+        # identical. The default run also rounds its activations to int8,
+        # which may flip a close greedy choice; the step above reports that
+        # difference as a warning.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        shell: bash
+        run: |
+          set -eu
+          packed="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/f32-activations.log")"
+          dequantized="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/dequantized.log")"
+          test -n "$packed"
+          grep -h 'packed weights\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
+          if [ "$packed" != "$dequantized" ]; then
+            echo "::error::Q8_0 GGUF: tokens differ between packed (f32 activations) and dequantized weights"
+            diff <(echo "$packed") <(echo "$dequantized") || true
+            exit 1
+          fi
+          echo "$packed"
       - name: CPU packed matmul bandwidth (diagnostic)
         # The optimized CPU Provider's decode matmul time per format on
         # Mistral shapes, on this host. Informational only.
