@@ -18,8 +18,8 @@
 - [x] 3.5a CUDA Provider: the rope dispatch reads YaRN before the banded scaling (found by the first GPU run); the Qwen1.5-MoE steps require "Paris" in the continuation, which the corrected tokenization turned into a multiple-choice question.
 - [x] 3.5b Runtime: the head-wise `concat` takes device-resident inputs (found by the second GPU run), tested on resident values; the Qwen2.5-0.5B `Q8_0` comparison sets packed weights with f32 activations against dequantized ones.
 - [x] 3.5c The tiny DeepSeek-V2 and Gemma 4 checkpoints on the Reference CPU with every value reported resident, as a device Provider's (`integration-tests/resident-provider`); the DeepSeek case fails without 3.5b's change.
-- [ ] 3.6 The six tiny checkpoints on CUDA, f32 activations (GPU workflow, `moe` suite).
-- [ ] 3.7 DeepSeek-V2-Lite-Chat `Q8_0` GGUF across two GPUs continues "The capital of France is" with "Paris" (GPU workflow, `moe` suite).
+- [x] 3.6 The six tiny checkpoints on CUDA, f32 activations (GPU workflow, `moe` suite).
+- [x] 3.7 DeepSeek-V2-Lite-Chat `Q8_0` GGUF across two GPUs continues "The capital of France is" with "Paris" (GPU workflow, `moe` suite).
 
 ## 4. Validation
 

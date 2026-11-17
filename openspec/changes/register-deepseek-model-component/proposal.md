@@ -163,9 +163,39 @@ YaRN rope and found two more problems:
 Qwen1.5-MoE passed on layer segments and tensor parallel. Its
 continuation contained "D. Paris" in both.
 
+The third GPU run (`gguf` and `moe` suites, run 44057626287, on what #206
+merged) passed every step:
+
+- **The six tiny checkpoints on CUDA**, with f32 activations, generate
+  their references' tokens:
+
+| Checkpoint | Max abs logit difference on CUDA |
+|---|---|
+| `lite` | 5.245e-6 |
+| `qlora` | 7.153e-6 |
+| `plain` | 3.815e-6 |
+| `gguf-kv-b` | 8.583e-6 |
+| `gguf-split` | 9.537e-6 |
+| `gguf-qlora` | 7.868e-6 |
+
+- **DeepSeek-V2-Lite-Chat `Q8_0`** (16.7 GB) ran across both RTX 3060s on
+  layer segments with packed weights. Greedy from "The capital of France
+  is", it generates " Paris.\n\nThe official language is French.\n\nThe
+  currency is the Euro (€).\n\nFrance is a member of the European Union
+  and the Schengen Agreement. …". Loading took 111 s, the warm first token
+  82.3 ms, and each next token 12.25 ms over 64 tokens.
+- The Qwen2.5-0.5B `Q8_0` packed run with f32 activations again generates
+  the dequantized run's tokens exactly. Every Mistral 7B step of the `gguf`
+  suite passed, and
+  so did Qwen1.5-MoE on layer segments and tensor parallel.
+
 **Limits:**
-- The checkpoints are tiny.
-- CUDA and the real DeepSeek-V2-Lite weights wait for a third GPU run.
+- The checkpoints are tiny, and DeepSeek-V2-Lite's continuation was checked
+  for "Paris", not compared token by token with another implementation.
+- DeepSeek-V2-Lite's latent attention runs expanded: its K/V cache stores
+  each head's keys and values, not the latent (Runtime milestone 2).
+- V3 and V2-236B are still refused by the Component (sigmoid and
+  group-limited routing, Runtime milestone 3).
 - Qwen1.5-MoE's new continuation was not compared with `transformers`.
   The model is 14B parameters, too large to run here.
 - The GGUF tokenizer splits text with GPT-2's pattern, not each
