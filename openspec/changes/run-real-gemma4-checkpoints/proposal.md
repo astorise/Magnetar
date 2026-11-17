@@ -61,12 +61,23 @@ tokens):
 | DeepSeek `lite` / `qlora` / `plain` | 6.676e-6 / 1.240e-5 / 3.338e-6 | 6.676e-6 / 1.240e-5 / 3.338e-6 |
 | DeepSeek `gguf-kv-b` / `gguf-split` / `gguf-qlora` | 7.629e-6 / 9.537e-6 / 1.097e-5 | 7.629e-6 / 9.537e-6 / 1.097e-5 |
 
-The tiny Gemma 4 checkpoints also pass on CUDA (GPU run 255).
+On CUDA with f32 activations (GPU run 256), the tiny Gemma 4 checkpoints
+give: `dense` 3.147e-5, `unified` 3.147e-5, `gguf-dense` 4.387e-5,
+`gguf-shared` 5.198e-5, `gguf-ple` 3.719e-5, `gguf-moe` 4.101e-5.
 
-Gemma 4 E2B QAT `Q4_0` on the optimized CPU Provider (4 threads, AVX2,
-packed weights, int8 activations): " Paris.", as the numpy forward
-predicts (its first three tokens, 9079, 236761 and 106, are the same).
-Load 40.1 s; warm TTFT 624 ms; TPOT 250 ms over 64 tokens.
+Gemma 4 E2B QAT `Q4_0`, prompt "The capital of France is", greedy, packed
+weights, int8 activations:
+
+| Provider | Load | Warm TTFT | TPOT (64 tokens) |
+|---|---|---|---|
+| CUDA, one RTX 3060 (GPU run 256) | 33.0 s | 20.2 ms | 11.22 ms |
+| Optimized CPU, the runner's 3 threads, AVX2 (GPU run 256) | 31.8 s | 555 ms | 186.5 ms |
+| Optimized CPU, 4 threads, AVX2 (local) | 40.1 s | 624 ms | 250.1 ms |
+
+All three generate " Paris." and the same 64 token ids. Their first three
+tokens (9079 " Paris", 236761 ".", 106 `<turn|>`) are those of the numpy
+forward. The test does not stop at the end of the turn, so the tokens after
+106 carry no meaning.
 
 **Limits.** One prompt and greedy decoding; no logit comparison of the
 real file with `transformers`. The numpy forward transcribes llama.cpp's

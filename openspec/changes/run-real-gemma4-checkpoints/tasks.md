@@ -15,8 +15,8 @@
 ## 4. Real checkpoint
 
 - [x] 4.1 E2B on the optimized CPU Provider continues "The capital of France is" with " Paris.", as an independent numpy forward of the file does.
-- [x] 4.2 The tiny Gemma 4 checkpoints match `transformers` on CUDA (GPU run 255).
-- [ ] 4.3 E2B on CUDA, one GPU, continues with "Paris" (GPU workflow, `gemma` group).
+- [x] 4.2 The tiny Gemma 4 checkpoints match `transformers` on CUDA (GPU runs 255 and 256).
+- [x] 4.3 E2B on CUDA, one GPU, continues with " Paris." and the same 64 tokens as the optimized CPU Provider (GPU run 256, `gemma` group).
 
 ## 5. Validation
 
