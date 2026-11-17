@@ -38,7 +38,8 @@ and `W_UV_h = v_proj[:, h·v..(h+1)·v]` (`[L, v]`):
 The decode graph:
 
 1. `q_nope`, `q_pe` as today (`q_pe` rotated);
-2. `q̃ = batched-matmul(q_nope [1, H·n], k_absorb [H·n, L])`, `[1, H·L]`;
+2. `q̃ = batched-matmul(q_nope [1, H·n], k_absorb [H·n, L])`, `[1, H·L]`
+   (group `h` of `k_absorb` is `W_UK_hᵀ`, `[n, L]`);
 3. `q = concat_heads(q̃, q_pe)`, `[1, H·(L + r)]`;
 4. the latent row `[c_kv | k_pe]` (`concat_heads` of one head each),
    marked as the K history;
@@ -47,11 +48,12 @@ The decode graph:
    `value_head_dimension = L`, `value_head_stride = L + r`, and the
    expanded form's score scale (`softmax_scale(n + r)`, YaRN included):
    the scores are the expanded form's;
-6. `o = batched-matmul(attention [1, H·L], v_absorb [H·L, v])`,
-   `[1, H·v]`, then `o_proj`.
+6. `o = batched-matmul(attention [1, H·L], v_absorb [H·v, L],
+   transpose_b)`, `[1, H·v]` (group `h` of `v_absorb` is `W_UV_hᵀ`,
+   `[v, L]`, read transposed), then `o_proj`.
 
-`k_absorb`'s group `h` is `W_UK_hᵀ` (`[n, L]`); `v_absorb`'s is `W_UV_h`
-(`[L, v]`).
+Both tables are the latent up-projection's rows as checkpoints store them
+(`[out, in]`): the key rows and the value rows of each head.
 
 ### 3. Expanded prefill
 
@@ -63,10 +65,11 @@ row 0 here, so it never needs the latent of earlier rows.
 
 ### 4. `batched-matmul`
 
-`a [T, G·K]`, `b [G·K, N]`, attribute `group_count = G`: for each group
-`g`, `out[:, g·N..(g+1)·N] = a[:, g·K..(g+1)·K] · b[g·K..(g+1)·K, :]`.
-f32 weights; the two absorbed tables are small (`H·n·L` and `H·L·v`
-values per layer, 1 Mi each in V2-Lite).
+`a [T, G·K]`, attribute `group_count = G`: for each group `g`,
+`out[:, g·N..(g+1)·N] = a[:, g·K..(g+1)·K] · B_g`, with `B_g =
+b[g·K..(g+1)·K, :]` (`b [G·K, N]`) or, with `transpose_b`,
+`b[g·N..(g+1)·N, :]ᵀ` (`b [G·N, K]`). f32 weights; the two absorbed tables
+are small (`H·n·L` and `H·v·L` values per layer, 1 Mi each in V2-Lite).
 
 ### 5. `attention.value_head_stride`
 
@@ -78,10 +81,12 @@ Default: `value_head_dimension`. With V being the K history, stride
 ### 6. Absorbed weights
 
 The loaders already split the latent up-projection into `k_nope_proj` and
-`v_proj` (`kv_b_proj`, or llama.cpp's `attn_k_b` / `attn_v_b`). They also
-emit `k_absorb` and `v_absorb`, as f32: a block transpose of `k_nope_proj`
-is not a byte copy of a quantized table, so packed tables are dequantized
-first (exact values of the stored weights).
+`v_proj` (`kv_b_proj`, or llama.cpp's `attn_k_b` / `attn_v_b`) by rows.
+They also emit the same key rows as `k_absorb` and value rows as
+`v_absorb`, under names that are not projections, so they keep the stored
+`[out, in]` orientation: row selections, exact byte copies even of
+quantized tables. A Provider whose `batched-matmul` reads f32 gets them
+dequantized.
 
 ### 7. Compatibility
 

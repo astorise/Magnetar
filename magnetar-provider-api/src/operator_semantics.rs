@@ -411,26 +411,50 @@ pub fn rmsnorm_blocks(
 }
 
 /// `batched-matmul` (`cache-latent-attention-history`): `a [T, G*K]` times
-/// `b [G*K, N]` group by group (`group_count = G`), giving `[T, G*N]`:
-/// output group `g` is `a`'s column group `g` times `b`'s row group `g`.
-/// Each product sums in index order, as `matmul` does.
+/// `b` group by group (`group_count = G`), giving `[T, G*N]`: output group
+/// `g` is `a`'s column group `g` times `b`'s row group `g`, which is
+/// `[K, N]` (`b [G*K, N]`) or, with `transpose_b`, `[N, K]` used transposed
+/// (`b [G*N, K]`). Each product sums in index order, as `matmul` does.
 pub fn batched_matmul(
     a: &HostTensor,
     b: &HostTensor,
     group_count: u64,
+    transpose_b: bool,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let invalid =
         |reason: String| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
     let (rows, a_cols) = rows_cols_of(a, "batched-matmul's input")?;
-    let (b_rows, n) = rows_cols_of(b, "batched-matmul's weight")?;
-    if group_count == 0 || !a_cols.is_multiple_of(group_count) || a_cols != b_rows {
+    let (b_rows, b_cols) = rows_cols_of(b, "batched-matmul's weight")?;
+    let shapes_fit = group_count > 0
+        && a_cols.is_multiple_of(group_count)
+        && b_rows.is_multiple_of(group_count)
+        && if transpose_b {
+            b_cols == a_cols / group_count
+        } else {
+            b_rows == a_cols
+        };
+    if !shapes_fit {
         return Err(invalid(format!(
-            "batched-matmul of {group_count} groups needs [T, G*K] and [G*K, N], got {:?} and {:?}",
+            "batched-matmul of {group_count} groups (transpose_b {transpose_b}) cannot take \
+             {:?} and {:?}",
             a.shape, b.shape
         )));
     }
+    let groups = group_count as usize;
     let k = (a_cols / group_count) as usize;
-    let (groups, n, a_cols) = (group_count as usize, n as usize, a_cols as usize);
+    let n = if transpose_b {
+        (b_rows / group_count) as usize
+    } else {
+        b_cols as usize
+    };
+    let (a_cols, b_cols) = (a_cols as usize, b_cols as usize);
+    let weight = |group: usize, i: usize, column: usize| {
+        if transpose_b {
+            b.data[(group * n + column) * b_cols + i]
+        } else {
+            b.data[(group * k + i) * b_cols + column]
+        }
+    };
     let mut data = vec![0.0f32; rows as usize * groups * n];
     for row in 0..rows as usize {
         for group in 0..groups {
@@ -439,7 +463,7 @@ pub fn batched_matmul(
             for (column, out) in out.iter_mut().enumerate() {
                 let mut sum = 0.0f32;
                 for (i, value) in input.iter().enumerate() {
-                    sum += value * b.data[(group * k + i) * n + column];
+                    sum += value * weight(group, i, column);
                 }
                 *out = sum;
             }
@@ -547,7 +571,7 @@ mod tests {
         let (rows, groups, k, n) = (3u64, 4u64, 5u64, 6u64);
         let a = tensor(rows, groups * k, 1);
         let b = tensor(groups * k, n, 2);
-        let out = batched_matmul(&a, &b, groups).unwrap();
+        let out = batched_matmul(&a, &b, groups, false).unwrap();
         assert_eq!(out.shape, vec![rows, groups * n]);
         for group in 0..groups as usize {
             for row in 0..rows as usize {
@@ -564,8 +588,21 @@ mod tests {
                 }
             }
         }
-        assert!(batched_matmul(&a, &tensor(groups * k + 1, n, 2), groups).is_err());
-        assert!(batched_matmul(&a, &b, 3).is_err());
+        // `transpose_b`: each group's block stored `[N, K]`.
+        let mut transposed = vec![0.0f32; b.data.len()];
+        for group in 0..groups as usize {
+            for i in 0..k as usize {
+                for column in 0..n as usize {
+                    transposed[(group * n as usize + column) * k as usize + i] =
+                        b.data[(group * k as usize + i) * n as usize + column];
+                }
+            }
+        }
+        let b_t = HostTensor::new([groups * n, k], transposed).unwrap();
+        assert_eq!(batched_matmul(&a, &b_t, groups, true).unwrap(), out);
+        assert!(batched_matmul(&a, &tensor(groups * k + 1, n, 2), groups, false).is_err());
+        assert!(batched_matmul(&a, &b, 3, false).is_err());
+        assert!(batched_matmul(&a, &b, groups, true).is_err());
     }
 
     /// The values under a stride are each head's leading values.

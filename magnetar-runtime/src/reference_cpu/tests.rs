@@ -3182,24 +3182,26 @@ fn absorbed_latent_attention_matches_the_expanded_form() {
     )
     .expect("expanded attention");
 
-    // Absorbed: `k_absorb`'s group h is `W_UK_h^T` (`[n, L]`), `v_absorb`'s
-    // `W_UV_h` (`[L, v]`).
+    // Absorbed: the up-projection's key and value rows as a checkpoint
+    // stores them (`[out, in]`): `k_absorb [H*n, L]`, group h being
+    // `W_UK_h^T`, and `v_absorb [H*v, L]`, group h being `W_UV_h^T`, read
+    // transposed.
     let mut k_absorb = Vec::with_capacity(heads * nope * latent);
-    let mut v_absorb = Vec::with_capacity(heads * latent * value);
+    let mut v_absorb = Vec::with_capacity(heads * value * latent);
     for head in 0..heads {
         for i in 0..nope {
             for l in 0..latent {
                 k_absorb.push(k_nope_proj.data[l * heads * nope + head * nope + i]);
             }
         }
-        for l in 0..latent {
-            for j in 0..value {
+        for j in 0..value {
+            for l in 0..latent {
                 v_absorb.push(v_proj.data[l * heads * value + head * value + j]);
             }
         }
     }
     let k_absorb = reference_cpu_host_tensor([(heads * nope) as u64, latent as u64], k_absorb);
-    let v_absorb = reference_cpu_host_tensor([(heads * latent) as u64, value as u64], v_absorb);
+    let v_absorb = reference_cpu_host_tensor([(heads * value) as u64, latent as u64], v_absorb);
     let group_count = [("group_count", integer(heads))];
     let q_latent = invoke_extended(
         "batched-matmul",
@@ -3230,7 +3232,10 @@ fn absorbed_latent_attention_matches_the_expanded_form() {
         "batched-matmul",
         &[latent_out, v_absorb],
         &[1, (heads * value) as u64],
-        &group_count,
+        &[
+            ("group_count", integer(heads)),
+            ("transpose_b", OperatorAttributeValue::Boolean(true)),
+        ],
     )
     .expect("absorbed outputs");
     assert_all_close(&absorbed.data, &expanded.data);

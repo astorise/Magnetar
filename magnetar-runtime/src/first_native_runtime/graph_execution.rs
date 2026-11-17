@@ -652,7 +652,12 @@ pub(super) fn dispatch_first_native_graph_node(
                 }
             };
             let (rows, _) = inputs[0].rows_cols()?;
-            let (_, n) = inputs[1].rows_cols()?;
+            let (b_rows, b_cols) = inputs[1].rows_cols()?;
+            // Each group's block is `[K, N]`, or `[N, K]` with `transpose_b`.
+            let n = match node.attributes.get("transpose_b") {
+                Some(OperatorAttributeValue::Boolean(true)) => b_rows / groups,
+                _ => b_cols,
+            };
             let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, groups * n]);
             let resources = ["a", "b"]
                 .into_iter()

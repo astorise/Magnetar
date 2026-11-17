@@ -1467,13 +1467,19 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
-        // `cache-latent-attention-history`: `a [T, G*K]` times `b [G*K, N]`
-        // group by group (`group_count = G`), giving `[T, G*N]`
+        // `cache-latent-attention-history`: `a [T, G*K]` times `b` group by
+        // group (`group_count = G`), each group's block `[K, N]` or, with
+        // `transpose_b`, `[N, K]` used transposed, giving `[T, G*N]`
         // (`magnetar_provider_api::batched_matmul`).
-        "batched-matmul" => OperatorAttributeSchema::default().with_rule(
-            "group_count",
-            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
-        ),
+        "batched-matmul" => OperatorAttributeSchema::default()
+            .with_rule(
+                "group_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "transpose_b",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+            ),
         "matmul" | "matmul-bias" | "matmul-residual" | "gated-matmul" => {
             OperatorAttributeSchema::default()
                 .with_rule(

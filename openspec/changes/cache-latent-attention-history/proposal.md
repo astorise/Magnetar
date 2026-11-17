@@ -33,14 +33,16 @@ it at every step. It is also the cache TurboQuant should apply to next
   latent width. It also writes the latent rows to the history.
 - **Operators** (`magnetar-core`, Reference CPU, CPU and CUDA Providers):
   - `batched-matmul` (in the catalog, not implemented): `a [T, G·K]` times
-    `b [G·K, N]` per group `g`, giving `[T, G·N]`;
+    one `[K, N]` block of `b` per group `g` (or an `[N, K]` block read
+    transposed, `transpose_b`), giving `[T, G·N]`;
   - `attention.value_head_stride`: the value of a KV head is the first
     `value_head_dimension` values of a `value_head_stride`-wide head of the
     V input, so V may be the key history itself.
-- **Weights.** The loaders also derive each latent layer's
-  `self_attn.k_absorb` (`[heads · qk_nope, latent]`, each head's `W_UKᵀ`)
-  and `self_attn.v_absorb` (`[heads · latent, v_head]`, each head's
-  `W_UV`) from the latent up-projection, in every form they read it.
+- **Weights.** The loaders also emit each latent layer's
+  `self_attn.k_absorb` (`[heads · qk_nope, latent]`) and
+  `self_attn.v_absorb` (`[heads · v_head, latent]`): the latent
+  up-projection's key and value rows as stored, in every form they read
+  it.
 - **History geometry** (`magnetar-runtime`): a latent layer keeps one store
   of `latent + rope` wide rows and no value store.
 - **The DeepSeek Component** emits both graphs: the expanded prefill writing
