@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// The tokenization of a production generation's prompt
+/// (`encode-plain-text-prompts-with-special-tokens`). A plain-text prompt is
+/// encoded with the tokenizer's special tokens -- the beginning-of-sequence
+/// token of a model whose tokenizer declares one -- as `transformers`'
+/// `tokenizer(text)` and llama.cpp encode it. Chat messages are rendered by
+/// their template, which writes those tokens itself, so the rendered text
+/// is encoded as is; token ids are used as given.
+pub(crate) fn prompt_tokenization_request(prompt: PromptInput) -> TokenizationRequest {
+    let add_special_tokens = matches!(prompt, PromptInput::PlainText(_));
+    TokenizationRequest {
+        add_special_tokens,
+        ..TokenizationRequest::new(prompt)
+    }
+}
+
 /// The first real, minimal Qwen Model Component (task 11.4/11.5,
 /// `model-component-graph-contract`): a compiled `components/qwen`
 /// Component binary, built via `cargo build --target wasm32-unknown-unknown
@@ -1015,7 +1030,7 @@ pub(super) fn prepare_production_generation(
 
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
-        TokenizationRequest::new(prompt),
+        prompt_tokenization_request(prompt),
         chat_formatter,
     )?;
     stop_conditions.prepared_stop_sequences = stop_conditions
@@ -1729,7 +1744,7 @@ impl ProductionLoadedModel {
         let clock = self.runtime.phase_ledger().clock();
         let tokenized = tokenize_prompt_input(
             &self.fixture.tokenizer,
-            TokenizationRequest::new(prompt),
+            prompt_tokenization_request(prompt),
             chat_formatter,
         )?;
         stop_conditions.prepared_stop_sequences = stop_conditions

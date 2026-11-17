@@ -1524,8 +1524,8 @@ jobs:
           MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
         run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml the_tiny_gemma4_checkpoints_match_transformers_on_cuda -- --include-ignored --test-threads=1 --nocapture
       - name: Download the pinned real Gemma 4 E2B instruct QAT Q4_0 GGUF checkpoint
-        # register-gemma4-model-component: 3.3 GB, pinned by its sha256,
-        # which the test verifies. The Mistral exports are removed first.
+        # run-real-gemma4-checkpoints: 3.3 GB, pinned by its sha256, which
+        # the test verifies. The Mistral exports are removed first.
         if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' }}
         env:
           REVISION: 675cff42a74c774d6cb76f76d8eacb49b48c9b93
@@ -1553,6 +1553,21 @@ jobs:
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/one-gpu.log"
           grep -Eq 'generated text " ?Paris' "$dir/one-gpu.log" || {
             echo "::error::Gemma 4 E2B QAT Q4_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Gemma 4 E2B instruct QAT Q4_0 GGUF on the optimized CPU Provider
+        # run-real-gemma4-checkpoints: the same file on the CPU Provider of
+        # providers/cpu, its Q4_0, Q6_K and F16 weights read packed.
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' && env.MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/gemma-4-e2b-qat-q4_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Gemma 4 E2B QAT Q4_0 on the optimized CPU: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint

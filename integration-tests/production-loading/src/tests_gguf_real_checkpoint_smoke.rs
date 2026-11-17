@@ -995,3 +995,19 @@ fn real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda() {
         sha256: GEMMA4_E2B_QAT_SHA256,
     });
 }
+
+/// The same Gemma 4 E2B checkpoint on the optimized CPU Provider, its
+/// packed `Q4_0`, `Q6_K` and `F16` weights read in their checkpoint
+/// encoding.
+#[test]
+#[ignore = "downloads/holds a 3.3GB real quantized checkpoint"]
+fn real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native gemma-4-e2b-it qat q4_0 gguf",
+        dir_env: "MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR",
+        repository: "google/gemma-4-E2B-it-qat-q4_0-gguf",
+        revision: GEMMA4_E2B_QAT_REVISION,
+        file: "gemma-4-E2B_q4_0-it.gguf",
+        sha256: GEMMA4_E2B_QAT_SHA256,
+    });
+}

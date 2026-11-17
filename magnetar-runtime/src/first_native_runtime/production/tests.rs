@@ -12,6 +12,28 @@ use super::*;
 /// open`). Proves the second call is a genuine no-op, not a panic or an
 /// error, regardless of whether the bytes differ from the first call's.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+/// A production generation encodes a plain-text prompt with the
+/// tokenizer's special tokens (its beginning-of-sequence token); a chat
+/// prompt, whose template writes them, and token ids are used as they are
+/// (`encode-plain-text-prompts-with-special-tokens`).
+#[test]
+fn plain_text_prompts_are_encoded_with_the_tokenizer_special_tokens() {
+    let mut metadata = crate::tests::generation_tokenizer_metadata();
+    metadata
+        .special_tokens
+        .push(SpecialToken::new(SpecialTokenKind::Bos, "<s>", 297));
+    let tokenizer = FixtureTokenizer::new(metadata);
+    let encode = |prompt| {
+        tokenize_prompt_input(&tokenizer, prompt_tokenization_request(prompt), None)
+            .expect("the prompt encodes")
+            .token_ids
+    };
+    let plain = encode(PromptInput::PlainText("hi".into()));
+    assert_eq!(plain.first(), Some(&297), "{plain:?} starts with the BOS");
+    assert!(!prompt_tokenization_request(PromptInput::ChatMessages(Vec::new())).add_special_tokens);
+    assert_eq!(encode(PromptInput::TokenIds(vec![5, 6])), vec![5, 6]);
+}
+
 #[test]
 fn register_qwen_component_artifact_is_idempotent() {
     register_qwen_component_artifact(

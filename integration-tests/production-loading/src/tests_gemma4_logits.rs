@@ -12,7 +12,7 @@
 //! weights, so they test the handling of the format, not the quantization
 //! error.
 
-use crate::logit_comparison::{Format, compare_on, compare_with_reference};
+use crate::logit_comparison::{Format, compare_on, compare_with_reference, cpu_providers};
 use magnetar_integration_resident_provider::ResidentReferenceCpuProvider;
 
 fn compare(variant: &str, format: Format, family: &str) -> f32 {
@@ -108,5 +108,18 @@ fn the_tiny_gemma4_checkpoints_match_transformers_on_cuda() {
             family,
         );
         eprintln!("cuda {variant}: max |logit difference| {difference:.3e}");
+    }
+}
+
+/// Every checkpoint above on the CPU Providers of `providers/cpu` (see
+/// [`cpu_providers`]): their Kernels for the layered forms, the optimized
+/// one reading the GGUF files' packed `Q4_0` and `Q8_0` weights directly.
+#[test]
+fn the_tiny_gemma4_checkpoints_match_transformers_on_the_cpu_providers() {
+    for (provider, label) in cpu_providers() {
+        for (variant, format, family) in VARIANTS {
+            let difference = compare_on(provider.clone(), label, "gemma4", variant, format, family);
+            eprintln!("{label} {variant}: max |logit difference| {difference:.3e}");
+        }
     }
 }

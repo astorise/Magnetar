@@ -1389,12 +1389,11 @@ pub fn packed_weight_format(
         return Ok(None);
     };
     let transposed = stored_transposed_dims(tensor)?.is_some();
-    // Packed k-quants and i-quants serve projections (transposed storage, read by the
-    // decode matmul); an untransposed one, such as an embedding table, is
-    // read row by row, which is only cheap dequantized once at load.
-    if format != crate::packed_weight::PackedWeightFormat::Q8_0 && !transposed {
-        return Ok(None);
-    }
+    // A transposed-storage matrix is a projection, read by the matmul; an
+    // untransposed one is a table, such as an embedding table, whose rows
+    // the embedding Kernels read in its packed encoding
+    // (`keep-quantized-embedding-tables-packed`). A Provider that cannot
+    // read one declines it and receives it dequantized, as before.
     let stored_cols = if transposed { *rows } else { *cols };
     // Stored rows that are not whole blocks (a block spanning two rows)
     // have no packed matrix form; such a tensor is only ever dequantized.

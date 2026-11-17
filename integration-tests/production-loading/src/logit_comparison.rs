@@ -51,6 +51,26 @@ pub(crate) fn compare_with_reference(
     )
 }
 
+/// The two CPU Providers of `providers/cpu`, labelled: its Reference CPU
+/// Provider (packed weights expanded to f32 at load) and the optimized CPU
+/// Provider computing from the packed weights with f32 activations (its
+/// int8 activations round by more than the comparison allows).
+pub(crate) fn cpu_providers() -> [(Arc<dyn Provider>, &'static str); 2] {
+    use magnetar_provider_cpu::native::{NativeCpuExecutor, NativeCpuProvider};
+    [
+        (
+            Arc::new(magnetar_provider_cpu::ReferenceCpuProvider::new()),
+            "magnetar-provider-cpu-reference",
+        ),
+        (
+            Arc::new(NativeCpuProvider::with_executor(
+                NativeCpuExecutor::with_settings(true, false, 2),
+            )),
+            "magnetar-cpu-native",
+        ),
+    ]
+}
+
 /// [`compare_with_reference`] on `provider` (`provider_label` names it in
 /// the candidate document).
 pub(crate) fn compare_on(
