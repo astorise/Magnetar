@@ -1615,6 +1615,34 @@ jobs:
           qualify gemma-4-e2b-qat-q4_0 real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR google/gemma-4-E2B-it-qat-q4_0-gguf 675cff42a74c774d6cb76f76d8eacb49b48c9b93 gemma-4-E2B_q4_0-it.gguf
           qualify mistral-7b-q4_k_m real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
           exit "$status"
+      - name: TurboQuant KV gains at long contexts (Gemma 4 E2B)
+        # turboquant-kv-history: the gains test of turboquant-kv-gains.yml on
+        # one checkpoint, so the kv group reports them too: KV bytes per
+        # token, the tokens the free VRAM holds, which contexts run, TTFT,
+        # TPOT and the agreement with f32, in the run summary.
+        if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
+        timeout-minutes: 60
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_LABEL: gemma-4-e2b-qat-q4_0
+          MAGNETAR_KV_GAINS_CONTEXTS: "512,4096,16384,32768"
+          REVISION: 675cff42a74c774d6cb76f76d8eacb49b48c9b93
+        shell: bash
+        run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/qualification-reports/turboquant-kv"
+          mkdir -p "$report"
+          dir="$RUNNER_TEMP/kv-gains-e2b"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/$REVISION/gemma-4-E2B_q4_0-it.gguf" -o "$dir/model.gguf"
+          test "$(sha256sum "$dir/model.gguf" | cut -d' ' -f1)" = fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634
+          MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$dir" MAGNETAR_KV_GAINS_REPORT="$report/gains-e2b.md" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains-e2b.log"
+          status=$?
+          [ -f "$report/gains-e2b.md" ] && cat "$report/gains-e2b.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$dir"
+          exit "$status"
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
