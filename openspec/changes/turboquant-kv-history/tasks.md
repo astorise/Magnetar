@@ -2,6 +2,7 @@
 
 - [x] 1.1 `magnetar-provider-api`: codebooks (Lloyd-Max on the sphere-coordinate density, `tq4`/`tq3`), signs, fast Walsh-Hadamard transform, quantize/dequantize of a row of heads, packing.
 - [x] 1.2 Tests: orthogonality and involution of the transform; symmetric, sorted codebooks with the expected MSE at 4 and 3 bits; round trip error within the expected distortion on random rows; packed bytes per row.
+- [x] 1.3 Store offsets (`turboquant_store_offsets`, `TurboQuantStoreState`): set by the write at row 0, rows quantized as their difference from them; test: a shared component is kept exactly.
 
 ## 2. Runtime
 
@@ -9,17 +10,18 @@
 - [x] 2.2 Precision policy (`MAGNETAR_KV_PRECISION`, `_K`, `_V`) resolved per loaded model against advertisements and head widths, with recorded fallback; `KvStoreSpec` and the KV pool carry it.
 - [x] 2.3 Store creation through the Provider call, admission at stored size.
 - [x] 2.4 Fallback to f32 for unsupported head widths, with the recorded reason (Runtime test); generation on the Reference CPU with `tq4`/`tq3` stores (tiny Gemma 4 checkpoints).
-- [ ] 2.5 KV layout metadata records the precisions; continuing, reusing or restoring a history in other precisions is refused.
+- [x] 2.5 KV layout metadata and compatibility record the precisions; continuing a history in other precisions is refused (`a_kv_history_is_only_continued_in_its_recorded_precisions`); pooled sets are reused only in their own precisions.
 
 ## 3. CPU Providers
 
-- [x] 3.1 `providers/cpu`: TurboQuant stores (f32 storage, rounded rows) and advertisements, both CPU Providers.
+- [x] 3.1 `providers/cpu`: TurboQuant stores (f32 storage, rounded rows, offsets) and advertisements, both CPU Providers.
 - [x] 3.2 Tiny checkpoints with `tq4`: generation runs and the logit error against `f32` is reported.
 
 ## 4. CUDA
 
 - [x] 4.1 Store, quantizing `kv-write`, download/expansion/copy.
 - [x] 4.2 Decode attention on codes (split-KV, grouped-query); prefill through dequantized scratch.
+- [ ] 4.4 Offsets: set by the write at row 0 (`tq_offsets_kernel`, padding rows of a replayed prefill excluded), subtracted before quantizing, added back on read; `q · μ_k` in decode scores, `μ_v` after the inverse rotation (written; conformance runs on the GPU runner).
 - [ ] 4.3 Conformance against the Reference CPU on the same rounded stores (written; runs on the GPU runner); step capture.
 
 ## 5. Qualification

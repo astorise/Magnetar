@@ -2,11 +2,19 @@
 
 ### Requirement: TurboQuant KV Storage Precision
 
-A KV store SHALL be creatable in the `tq4` or `tq3` precision: each head's row stored as its f32 norm and the 4- or 3-bit indices of the nearest Lloyd-Max centroids of its coordinates after a fixed randomized Hadamard rotation, as `magnetar-provider-api` defines them. A store SHALL keep its logical `[capacity, width]` f32 descriptor, and attention SHALL compute as on the dequantized values the store holds.
+A KV store SHALL be creatable in the `tq4` or `tq3` precision: each head's row, less the store's offsets, stored as its f32 norm and the 4- or 3-bit indices of the nearest Lloyd-Max centroids of its coordinates after a fixed randomized Hadamard rotation, as `magnetar-provider-api` defines them. A store SHALL keep its logical `[capacity, width]` f32 descriptor, and attention SHALL compute as on the dequantized values the store holds.
 
 #### Scenario: Quantized history keeps the graph contract
 - **WHEN** a model runs with `MAGNETAR_KV_PRECISION=tq4` on a Provider that advertises TurboQuant stores
 - **THEN** its Component and graphs are unchanged and every `kv-write` stores rows that read back as their TurboQuant dequantization
+
+### Requirement: TurboQuant Store Offsets
+
+A TurboQuant store SHALL keep one f32 offset per column of its rows, set by the write at row 0 to the mean of the rows that write computes and zero before it, and SHALL hold every row as its offsets plus the TurboQuant dequantization of its difference from them.
+
+#### Scenario: A shared component is kept exactly
+- **WHEN** a prefill writes rows that share a large per-column component into a `tq4` store
+- **THEN** the store's offsets are those rows' mean, and a row equal to the offsets reads back exactly
 
 ### Requirement: KV Precision Resolution And Admission
 

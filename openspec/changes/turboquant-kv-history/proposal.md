@@ -39,6 +39,12 @@ milestone 2).
     3 bits (`tq3`);
   - the stored value is `‖x‖ · Πᵀ ĉ`.
 
+  Each store also keeps per-column offsets, the mean of the rows of the
+  write that starts its history; rows are quantized as their difference
+  from them and read back with them added. A component every key shares
+  (a key bias, outlier channels) is then kept exactly; attention is
+  unchanged by any fixed offsets.
+
   The codebooks are computed, not tabulated: Lloyd iterations on that
   density in f64, deterministic.
 - **KV storage precision** (`magnetar-runtime`): `f32` (default), `tq4`,
@@ -60,9 +66,10 @@ milestone 2).
   - `kv-write` quantizes in the kernel that writes, at the captured step's
     advancing offset;
   - decode attention computes on the codes. Each query head is rotated once
-    (`Π q`), a key's score is `‖k‖ · Σ (Πq)_j c[idx_j]`, values accumulate
-    in the rotated domain, and one inverse rotation per head ends the step.
-    No stored row is dequantized;
+    (`Π q`), a key's score is `q · μ_k + ‖k − μ_k‖ · Σ (Πq)_j c[idx_j]`,
+    values accumulate in the rotated domain, and one inverse rotation per
+    head, plus the value offsets, ends the step. No stored row is
+    dequantized;
   - prefill attention dequantizes the rows it reads into a scratch buffer
     and runs the existing kernels.
 - **Qualification**: on real checkpoints, against the `f32` history:

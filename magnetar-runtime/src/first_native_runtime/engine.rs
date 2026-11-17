@@ -1325,6 +1325,7 @@ impl E2eRuntimeModelExecutionEngine {
                 let (set, dropped) = self.kv_pool.acquire(
                     &key,
                     capacity,
+                    precisions,
                     self.kv_set_bytes(capacity, precisions),
                     provider,
                 );
@@ -1408,6 +1409,44 @@ impl E2eRuntimeModelExecutionEngine {
             };
             (resolved, fallbacks)
         })
+    }
+
+    /// A KV history's precisions (`turboquant-kv-history`): a prefill
+    /// records the precisions its stores are created in, in the history's
+    /// compatibility and KV layout metadata; a later step only continues a
+    /// history whose recorded precisions are those this model's stores now
+    /// resolve to, and refuses any other as incompatible.
+    fn check_kv_history_precisions(
+        &self,
+        runtime: &mut Runtime,
+        kv_state: &mut FirstNativeExecutionKvState,
+        prefill: bool,
+        execution_plan: &PreparedExecutionPlan,
+    ) -> Result<(), InferenceApiError> {
+        let provider = execution_plan
+            .node_bindings
+            .first()
+            .map(|binding| binding.provider.clone());
+        let mode = kv_quantization_mode(self.resolve_kv_precisions(runtime, provider.as_ref()));
+        if !prefill {
+            let mut requested = kv_state.compatibility.clone();
+            requested.quantization_mode = mode;
+            runtime.validate_kv_cache_reuse(&kv_state.cache, &requested, None)?;
+            return Ok(());
+        }
+        kv_state.compatibility.quantization_mode = mode.clone();
+        let cache = runtime
+            .kv_caches_mut()
+            .cache_mut(&kv_state.cache)
+            .map_err(InferenceApiError::from)?;
+        cache.compatibility.quantization_mode = mode.clone();
+        cache.layout.quantization = mode.map(|mode| KvCacheQuantization {
+            mode,
+            // One f32 norm per head row.
+            group_size: None,
+            scale_dtype: Some(DTypeDescriptor::portable(ComputeDType::Float32)),
+        });
+        Ok(())
     }
 
     /// The bytes of one store set of `capacity` rows: the K and V of every
@@ -1679,6 +1718,14 @@ impl E2eRuntimeModelExecutionEngine {
                         .unwrap_or(KvStoreSpec::owned(rows_needed)),
                 )
             };
+            if kv_stores.is_some() {
+                self.check_kv_history_precisions(
+                    runtime,
+                    &mut kv_state,
+                    generated_tokens.is_empty(),
+                    execution_plan,
+                )?;
+            }
             let (dispatch, mut bindings, layer_kv, resolved_provider) = if generated_tokens
                 .is_empty()
             {

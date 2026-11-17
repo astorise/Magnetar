@@ -13,8 +13,16 @@
 //! Online Vector Quantization with Near-optimal Distortion Rate"). The
 //! stored row reads back as `‖x‖ · Πᵀ ĉ`.
 //!
-//! Nothing here depends on data: the signs and the codebooks are functions
-//! of `d` and `b` alone, computed deterministically in `f64`.
+//! A store also keeps one `f32` offset per column of its rows
+//! ([`turboquant_store_offsets`]): the mean of the rows of the write that
+//! starts its history (the write at row 0). Each row is quantized as its
+//! difference from the offsets and reads back with them added, so a
+//! component every row shares (a key projection's bias, outlier channels)
+//! is kept exactly instead of taking up the codes' precision. Offsets are
+//! all zero until that write.
+//!
+//! The signs and the codebooks are functions of `d` and `b` alone,
+//! computed deterministically in `f64`; only the offsets depend on data.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -362,6 +370,102 @@ pub fn kv_store_round_trip(
     )
 }
 
+/// A TurboQuant store's offsets (one per column of its `width`-wide rows):
+/// the mean of `rows`, the rows of the write that starts the store's
+/// history, summed in row order in `f32` and divided by their count. Zeros
+/// for no rows.
+pub fn turboquant_store_offsets(rows: &[f32], width: usize) -> Vec<f32> {
+    let mut offsets = vec![0.0f32; width];
+    if width == 0 || rows.len() < width {
+        return offsets;
+    }
+    let count = rows.len() / width;
+    for row in rows.chunks_exact(width) {
+        for (offset, value) in offsets.iter_mut().zip(row) {
+            *offset += value;
+        }
+    }
+    offsets
+        .iter_mut()
+        .for_each(|offset| *offset /= count as f32);
+    offsets
+}
+
+/// `rows` (whole heads of `head_dimension` values; `offsets.len()` values
+/// per row) as a TurboQuant store with those offsets holds them: each head
+/// of `row - offsets` quantized and read back, plus `offsets`. Unchanged
+/// for `f32`. `None` when the head width is unsupported or the rows are not
+/// whole heads of `offsets`' width.
+pub fn kv_store_round_trip_with_offsets(
+    rows: &[f32],
+    head_dimension: u64,
+    precision: KvStorePrecision,
+    offsets: &[f32],
+) -> Option<Vec<f32>> {
+    if precision.bits().is_none() {
+        return Some(rows.to_vec());
+    }
+    let width = offsets.len();
+    if width == 0
+        || head_dimension == 0
+        || !width.is_multiple_of(head_dimension as usize)
+        || !rows.len().is_multiple_of(width)
+    {
+        return None;
+    }
+    let centered: Vec<f32> = rows
+        .chunks_exact(width)
+        .flat_map(|row| {
+            row.iter()
+                .zip(offsets)
+                .map(|(value, offset)| value - offset)
+        })
+        .collect();
+    let mut stored = kv_store_round_trip(&centered, head_dimension, precision)?;
+    for row in stored.chunks_exact_mut(width) {
+        for (value, offset) in row.iter_mut().zip(offsets) {
+            *value += offset;
+        }
+    }
+    Some(stored)
+}
+
+/// What a Provider that keeps a TurboQuant store's rows as their round trip
+/// (the CPU Providers) knows of the store: its precision, head width and
+/// offsets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurboQuantStoreState {
+    pub precision: KvStorePrecision,
+    pub head_dimension: u64,
+    /// See [`turboquant_store_offsets`]; zeros until the write at row 0.
+    pub offsets: Vec<f32>,
+}
+
+impl TurboQuantStoreState {
+    /// A store of `width`-wide rows, its offsets zero.
+    pub fn new(precision: KvStorePrecision, head_dimension: u64, width: u64) -> Self {
+        Self {
+            precision,
+            head_dimension,
+            offsets: vec![0.0; width as usize],
+        }
+    }
+
+    /// `rows` written at `row_offset`, as the store holds them. A write at
+    /// row 0 starts the history: it first sets the offsets from its rows.
+    /// `None` when the rows are not whole rows of the store.
+    pub fn write(&mut self, rows: &[f32], row_offset: u64) -> Option<Vec<f32>> {
+        let width = self.offsets.len();
+        if width == 0 || !rows.len().is_multiple_of(width) {
+            return None;
+        }
+        if row_offset == 0 && !rows.is_empty() {
+            self.offsets = turboquant_store_offsets(rows, width);
+        }
+        kv_store_round_trip_with_offsets(rows, self.head_dimension, self.precision, &self.offsets)
+    }
+}
+
 /// Packs `indices` (each below `2^bits`) into bytes: 4-bit codes two per
 /// byte, low nibble first; 3-bit codes eight per three bytes,
 /// little-endian bit order.
@@ -489,6 +593,57 @@ mod tests {
             kv_store_round_trip(&row, 96, KvStorePrecision::F32),
             Some(row)
         );
+    }
+
+    /// A component every row shares is kept exactly by the offsets: rows
+    /// with a large common part read back far closer with them than
+    /// without, and a row equal to the offsets reads back exactly.
+    #[test]
+    fn offsets_keep_what_every_row_shares() {
+        let d = 64usize;
+        let width = 2 * d;
+        let common: Vec<f32> = pseudo_random_row(width, 7)
+            .iter()
+            .map(|value| value * 20.0)
+            .collect();
+        let rows: Vec<f32> = (0..8)
+            .flat_map(|row| {
+                pseudo_random_row(width, 100 + row)
+                    .into_iter()
+                    .zip(&common)
+                    .map(|(value, common)| value + common)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let error = |stored: &[f32]| -> f32 {
+            stored
+                .iter()
+                .zip(&rows)
+                .map(|(stored, row)| (stored - row).powi(2))
+                .sum::<f32>()
+                .sqrt()
+        };
+        let mut store = TurboQuantStoreState::new(KvStorePrecision::Tq4, d as u64, width as u64);
+        let centered = store.write(&rows, 0).expect("whole rows");
+        let plain = kv_store_round_trip(&rows, d as u64, KvStorePrecision::Tq4).unwrap();
+        assert!(
+            error(&centered) * 5.0 < error(&plain),
+            "with offsets {} without {}",
+            error(&centered),
+            error(&plain)
+        );
+        // The offsets are the rows' mean, and stay for later writes.
+        let mean = turboquant_store_offsets(&rows, width);
+        assert_eq!(store.offsets, mean);
+        assert_eq!(store.write(&mean, 8).unwrap(), mean);
+        // A later write at row 0 starts a new history.
+        store.write(&rows[..width], 0).unwrap();
+        assert_eq!(store.offsets, rows[..width].to_vec());
+        // f32 stores are unchanged.
+        let mut f32_store =
+            TurboQuantStoreState::new(KvStorePrecision::F32, d as u64, width as u64);
+        assert_eq!(f32_store.write(&rows, 0).unwrap(), rows);
+        assert_eq!(store.write(&rows[..d], 9), None, "not a whole row");
     }
 
     #[test]

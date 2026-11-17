@@ -103,6 +103,19 @@ pub struct KvPrecisionResolution {
 /// (`append-kv-history-in-place`): each store's rows, the pooled store
 /// set its stores belong to, if any, and the precision new stores are
 /// created in (`turboquant-kv-history`).
+/// How a history's KV layout metadata and compatibility name its
+/// precisions (`turboquant-kv-history`): `None` for f32 stores, so f32
+/// histories keep the compatibility they always had.
+pub(crate) fn kv_quantization_mode(precisions: KvPrecisions) -> Option<String> {
+    (precisions != KvPrecisions::default()).then(|| {
+        format!(
+            "turboquant-kv:k={},v={}",
+            precisions.k.as_str(),
+            precisions.v.as_str()
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KvStoreSpec {
     pub(crate) capacity: u64,
@@ -142,6 +155,9 @@ pub(crate) fn is_pooled_kv_store(id: &TensorResourceId) -> bool {
 pub(crate) struct PooledKvSet {
     pub(crate) id: u64,
     pub(crate) capacity: u64,
+    /// The precisions its stores were created in (`turboquant-kv-history`);
+    /// a set only serves requests whose stores use the same.
+    pub(crate) precisions: KvPrecisions,
     pub(crate) bytes: u64,
     last_used: u64,
 }
@@ -254,6 +270,7 @@ impl KvStorePool {
         &self,
         key: &str,
         capacity: u64,
+        precisions: KvPrecisions,
         bytes: u64,
         provider: ProviderBinding,
     ) -> (Option<u64>, Vec<PooledKvSet>) {
@@ -271,7 +288,7 @@ impl KvStorePool {
         let tick = state.tick;
         let mut dropped = Vec::new();
         if let Some(current) = state.in_use.remove(key) {
-            if current.capacity == capacity {
+            if current.capacity == capacity && current.precisions == precisions {
                 let id = current.id;
                 state.in_use.insert(
                     key.into(),
@@ -289,7 +306,7 @@ impl KvStorePool {
             .free
             .iter()
             .enumerate()
-            .filter(|(_, set)| set.capacity == capacity)
+            .filter(|(_, set)| set.capacity == capacity && set.precisions == precisions)
             .max_by_key(|(_, set)| set.last_used)
             .map(|(index, _)| index);
         let set = match reused {
@@ -309,6 +326,7 @@ impl KvStorePool {
                 PooledKvSet {
                     id: state.next_set,
                     capacity,
+                    precisions,
                     bytes,
                     last_used: tick,
                 }
@@ -326,18 +344,14 @@ impl KvStorePool {
         (Some(id), dropped)
     }
 
-    /// The set the request keyed `key` uses: its id and capacity.
+    /// The set the request keyed `key` uses: its id, capacity and
+    /// precisions.
     pub(crate) fn current(&self, key: &str) -> Option<KvStoreSpec> {
         let state = self.0.lock().unwrap();
-        let precisions = state
-            .resolution
-            .as_ref()
-            .map(|resolution| resolution.resolved)
-            .unwrap_or_default();
         state.in_use.get(key).map(|set| KvStoreSpec {
             capacity: set.capacity,
             pool_set: Some(set.id),
-            precisions,
+            precisions: set.precisions,
         })
     }
 
@@ -364,6 +378,17 @@ impl KvStorePool {
     /// Bytes held by every set, free or in use.
     pub(crate) fn held_bytes(&self) -> u64 {
         self.0.lock().unwrap().held_bytes()
+    }
+
+    /// Resolves the precisions to `resolved`, as a prefill whose stores
+    /// support them would (tests).
+    #[cfg(test)]
+    pub(crate) fn resolve_precisions_to(&self, resolved: KvPrecisions) {
+        self.0.lock().unwrap().resolution = Some(KvPrecisionResolution {
+            requested: resolved,
+            resolved,
+            fallbacks: Vec::new(),
+        });
     }
 
     /// How many sets are free (tests).

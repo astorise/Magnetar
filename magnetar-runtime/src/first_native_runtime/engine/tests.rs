@@ -84,6 +84,52 @@ fn e2e_kv_wrong_session_reuse_is_rejected_by_compatibility() {
         .expect("reusing one session's committed KV cache under another session's compatibility is rejected");
 }
 
+/// `turboquant-kv-history`: a prefill records its stores' precisions in
+/// the history's compatibility and KV layout metadata (none for f32, as
+/// before), and a history is not continued once this model's stores
+/// resolve to other precisions.
+#[test]
+fn a_kv_history_is_only_continued_in_its_recorded_precisions() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).expect("loads");
+    let engine = new_kv_lifecycle_engine(&fixture);
+    let request = kv_lifecycle_test_request(
+        &fixture,
+        &runtime,
+        &instance,
+        "kv-precisions",
+        None,
+        &[1, 2],
+    )
+    .expect("request");
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        &fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )
+    .expect("plans");
+    let prefill = engine
+        .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+        .expect("prefill");
+    engine
+        .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+        .expect("commit");
+    let cache = prefill_cache_id_from_step(&prefill).expect("cache");
+    let recorded = runtime.kv_cache(&cache).expect("the history's cache");
+    assert_eq!(recorded.compatibility.quantization_mode, None);
+    assert_eq!(recorded.layout.quantization, None);
+
+    engine
+        .kv_pool
+        .resolve_precisions_to(KvPrecisions::uniform(KvStorePrecision::Tq4));
+    match engine.execute_generation_step(&mut runtime, &request, &[1], Some(&mut plans.decode)) {
+        Err(error) => assert!(format!("{error:?}").contains("dtype mismatch"), "{error:?}"),
+        Ok(_) => panic!("an f32 history was continued with tq4 stores"),
+    }
+}
+
 #[test]
 fn e2e_generation_step_rechecks_model_instance_readiness() {
     let fixture = e2e_fixture().expect("fixture builds");
