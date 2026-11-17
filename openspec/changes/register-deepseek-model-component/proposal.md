@@ -47,7 +47,23 @@ issue's first acceptance step is tiny random `deepseek_v2` bundles compared with
   - Each is ingested by the Hugging Face loader and loaded with the Component
     its family selects. It then generates 12 greedy tokens on the Reference
     CPU, and every step's top-8 logits are compared with the reference.
-  - The Gemma 4 comparison shares the same helper (`logit_comparison.rs`).
+  - The Gemma 4 comparison shares the same helper (`logit_comparison.rs`),
+    which now takes the Provider to run on.
+- **`deepseek2` GGUF files.** Three tiny quantized `deepseek2` files are
+  checked in beside the bundles, written with llama.cpp's metadata keys and
+  tensor names by a script checked in with them. Each is compared with
+  `transformers` run on its dequantized weights:
+  - `gguf-kv-b`: the latent up-projection in one `attn_kv_b` matrix, as
+    the converter wrote it until 2025 and as the published DeepSeek-V2-Lite
+    files hold it;
+  - `gguf-split`: `attn_k_b` and `attn_v_b`, as it writes it since;
+  - `gguf-qlora`: a low-rank query and a routed scaling factor.
+- **CUDA.** The six tiny checkpoints, and DeepSeek-V2-Lite-Chat's
+  published `Q8_0` GGUF across two GPUs, run in the GPU workflow's `moe`
+  suite.
+- **GGUF loader** (`loaders/gguf`). A byte-level BPE no longer adds a space
+  before the text. With it, "The capital of France is" began with "ĠThe";
+  llama.cpp and the checkpoints' own `tokenizer.json` begin with "The".
 
 ## Evidence
 
@@ -72,9 +88,36 @@ Tokens are identical in all three.
   `lite` bundle differ by 1.02 at the first step, and its tokens differ from
   the second.
 
+The `deepseek2` GGUF files, on the Reference CPU:
+
+| File | Max abs logit difference |
+|---|---|
+| `gguf-kv-b`: `attn_kv_b`, `Q8_0` projections, `Q4_0` experts | 7.629e-6 |
+| `gguf-split`: `attn_k_b`/`attn_v_b`, `Q4_0` projections, `Q8_0` experts | 9.537e-6 |
+| `gguf-qlora`: low-rank query, routed scaling 2.5, split form | 1.097e-5 |
+
+Tokens are identical in all three.
+
+- **The first `gguf-kv-b` run differed from step 5.** The reference picked
+  token 1, which the file declared as its beginning-of-sequence token, and
+  the Runtime never samples that token after the first step. The logits were
+  within 1e-3. The tiny files now declare no beginning-of-sequence token,
+  and the references are unchanged.
+- **The comparison can fail.** A `gguf-split` file written without YaRN
+  differs from the reference by 1.30 at the first step. A `gguf-qlora` file
+  with `expert_weights_scale` 1 instead of 2.5 differs by 2.52.
+- **The tokenizer.** Against DeepSeek-V2-Lite-Chat's `tokenizer.json`, the
+  GGUF tokenizer built from its published file's header encodes a corpus of
+  ten strings to the same ids, and decodes them the same way. These include
+  digits, accents, CJK, an emoji, code and newlines. Before the fix, every
+  string starting with a word gained a leading "Ġ" token.
+
 **Limits:**
 - The checkpoints are tiny.
-- Not run: a `deepseek2` GGUF, CUDA, and real DeepSeek-V2-Lite weights.
+- CUDA and the real DeepSeek-V2-Lite weights wait for the GPU workflow.
+- The GGUF tokenizer splits text with GPT-2's pattern, not each
+  `tokenizer.ggml.pre`'s own. They agree on the corpus above for DeepSeek,
+  but not in general.
 - V3 and V2-236B are still refused by the Component, since sigmoid and
   group-limited routing are Runtime milestone 3.
 
@@ -85,7 +128,11 @@ Tokens are identical in all three.
   the refusal.
 - `loaders/huggingface`: `config.rs` (the refusal and its test).
 - `magnetar-runtime/fixtures/components/`: the artifact and its manifest.
+- `loaders/gguf`: `tokenizer.rs` (the leading space, and a byte-level parity
+  test beside the SentencePiece one).
 - `integration-tests/production-loading`: `fixtures/deepseek_v2/`,
   `logit_comparison.rs`, `tests_deepseek_v2_logits.rs`,
-  `tests_gemma4_logits.rs`, `test_support.rs`.
+  `tests_gemma4_logits.rs`, `tests_gguf_real_checkpoint_smoke.rs`,
+  `test_support.rs`.
+- `.github/workflows/gpu-runner-smoke.yml`: three steps in the `moe` suite.
 - `components/deepseek`, `SUBMODULES.md`.

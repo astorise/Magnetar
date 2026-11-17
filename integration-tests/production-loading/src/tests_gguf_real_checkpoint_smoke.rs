@@ -938,3 +938,32 @@ fn real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
         sha256: QWEN_MOE_Q8_0_SHA256,
     });
 }
+
+/// `legraphista/DeepSeek-V2-Lite-Chat-IMat-GGUF`'s exact pinned commit:
+/// llama.cpp's May 2024 exports of `deepseek-ai/DeepSeek-V2-Lite-Chat`,
+/// whose latent attention's up-projection is one `attn_kv_b` matrix.
+const DEEPSEEK_V2_LITE_REVISION: &str = "b6350f4c672640e949652ae480226b25deb88091";
+/// `DeepSeek-V2-Lite-Chat.Q8_0.gguf`'s sha256 (16,702,517,568 bytes) at
+/// [`DEEPSEEK_V2_LITE_REVISION`], as Hugging Face declares it: every matrix
+/// `Q8_0`.
+const DEEPSEEK_V2_LITE_Q8_0_SHA256: &str =
+    "sha256:458d8dbb5c64109623751f3c7e691f285770a6521bf06bf86172980b995b3bde";
+
+/// DeepSeek-V2-Lite-Chat `Q8_0` on CUDA, through the DeepSeek Model
+/// Component: 27 layers of multi-head latent attention (expanded), YaRN, a
+/// dense first layer, then 64 routed experts (top 6) beside 2 shared ones.
+/// 16.7 GB packed, more than one 12 GB GPU holds, so it runs with
+/// `MAGNETAR_CUDA_DEVICES` listing two, the Runtime placing its layers
+/// across them.
+#[test]
+#[ignore = "downloads/holds a 16.7GB real quantized checkpoint and needs two CUDA Devices"]
+fn real_public_deepseek_v2_lite_q8_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda deepseek-v2-lite-chat q8_0 gguf",
+        dir_env: "MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "legraphista/DeepSeek-V2-Lite-Chat-IMat-GGUF",
+        revision: DEEPSEEK_V2_LITE_REVISION,
+        file: "DeepSeek-V2-Lite-Chat.Q8_0.gguf",
+        sha256: DEEPSEEK_V2_LITE_Q8_0_SHA256,
+    });
+}

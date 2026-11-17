@@ -4,9 +4,10 @@
 //!
 //! The checkpoint is ingested through a real loader and loaded with the real
 //! Model Component its architecture family selects. It then generates as
-//! many greedy tokens as the reference holds on the Reference CPU (one
-//! prefill and then decode steps with the KV cache). Every step's top-8
-//! logits are compared with the reference: identical tokens, within 1e-3.
+//! many greedy tokens as the reference holds, on the Reference CPU or a
+//! given Provider (one prefill and then decode steps with the KV cache).
+//! Every step's top-8 logits are compared with the reference: identical
+//! tokens, within 1e-3.
 
 use magnetar_inference_qualification::numerics::{
     LogitRecorder, LogitReference, NumericalProfile, compare_logit_references,
@@ -20,7 +21,7 @@ use magnetar_runtime::production_model_ingestion::{
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
     GenerationParameters, ModelArtifactSource, ProductionGenerationRequest, ProductionLoadedModel,
-    PromptInput, ReferenceCpuProvider, StopConditions, production_model_fixture,
+    PromptInput, Provider, ReferenceCpuProvider, StopConditions, production_model_fixture,
 };
 use std::{fs, ops::ControlFlow, path::PathBuf, sync::Arc};
 
@@ -31,10 +32,30 @@ pub(crate) enum Format {
     Gguf,
 }
 
-/// Runs the checkpoint in `fixtures/{family_directory}/{variant}` and returns
-/// its largest logit difference from the reference beside it, after checking
-/// the family its loader declares.
+/// Runs the checkpoint in `fixtures/{family_directory}/{variant}` on the
+/// Reference CPU and returns its largest logit difference from the
+/// reference beside it, after checking the family its loader declares.
 pub(crate) fn compare_with_reference(
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+) -> f32 {
+    compare_on(
+        Arc::new(ReferenceCpuProvider::new()),
+        "magnetar-reference-cpu",
+        family_directory,
+        variant,
+        format,
+        family,
+    )
+}
+
+/// [`compare_with_reference`] on `provider` (`provider_label` names it in
+/// the candidate document).
+pub(crate) fn compare_on(
+    provider: Arc<dyn Provider>,
+    provider_label: &str,
     family_directory: &str,
     variant: &str,
     format: Format,
@@ -59,8 +80,9 @@ pub(crate) fn compare_with_reference(
                 .ingest(&source)
                 .unwrap_or_else(|error| panic!("{variant} ingests: {error}"));
             let bytes = fs::read(directory.join("tokenizer.json")).expect("tokenizer readable");
-            let tokenizer = HuggingFaceTokenizer::from_bytes(&bytes, None, "tiny-gemma4", Some(64))
-                .expect("the tokenizer builds");
+            let tokenizer =
+                HuggingFaceTokenizer::from_bytes(&bytes, None, format!("tiny-{family}"), Some(64))
+                    .expect("the tokenizer builds");
             (ingested, Arc::new(tokenizer))
         }
         Format::Gguf => {
@@ -69,9 +91,12 @@ pub(crate) fn compare_with_reference(
                 .unwrap_or_else(|error| panic!("{variant} ingests: {error}"));
             let bytes = fs::read(directory.join("model.gguf")).expect("GGUF readable");
             let artifact = magnetar_format_gguf::parse(&bytes).expect("the GGUF parses");
-            let tokenizer =
-                GgufTokenizer::from_gguf_metadata(&artifact.metadata, "tiny-gemma4", Some(64))
-                    .expect("the tokenizer builds");
+            let tokenizer = GgufTokenizer::from_gguf_metadata(
+                &artifact.metadata,
+                format!("tiny-{family}"),
+                Some(64),
+            )
+            .expect("the tokenizer builds");
             (ingested, Arc::new(tokenizer))
         }
     };
@@ -90,10 +115,10 @@ pub(crate) fn compare_with_reference(
         fixture,
         ingested.payload_source.as_ref(),
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone()),
-        Arc::new(ReferenceCpuProvider::new()),
+        provider,
         Some(component),
     )
-    .unwrap_or_else(|error| panic!("{variant} loads with the Gemma Component: {error}"));
+    .unwrap_or_else(|error| panic!("{variant} loads with its Component: {error}"));
 
     let mut recorder = LogitRecorder::default();
     let outcome = model
@@ -112,7 +137,7 @@ pub(crate) fn compare_with_reference(
         .unwrap_or_else(|error| panic!("{variant} generates: {error}"));
     let candidate = recorder.finish(
         reference.checkpoint.clone(),
-        "magnetar-reference-cpu",
+        provider_label,
         "f32",
         reference.prompt_token_ids.clone(),
         outcome.result.output.generated_token_ids.clone(),
@@ -121,7 +146,7 @@ pub(crate) fn compare_with_reference(
         &reference,
         &candidate,
         &NumericalProfile {
-            name: "gemma4-f32-vs-transformers".into(),
+            name: format!("{family}-f32-vs-transformers"),
             dtype: "f32".into(),
             max_abs_logit_difference: 1e-3,
             require_identical_tokens: true,

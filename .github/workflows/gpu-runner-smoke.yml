@@ -1567,6 +1567,51 @@ jobs:
             echo "::warning::Qwen1.5-MoE Q8_0: token ids differ between layer segments and tensor parallel"
             diff <(echo "$layers") <(echo "$tensor") || true
           fi
+      - name: Tiny DeepSeek-V2 checkpoints against transformers on CUDA
+        # register-deepseek-model-component: the checked-in tiny bundles and
+        # deepseek2 GGUF files (both forms of the latent up-projection,
+        # packed Q8_0 and Q4_0) through the DeepSeek Component on CUDA, with
+        # f32 activations, compared with their transformers logits (1e-3).
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
+        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml the_tiny_deepseek_v2_checkpoints_match_transformers_on_cuda -- --include-ignored --test-threads=1 --nocapture
+      - name: Download the pinned real DeepSeek-V2-Lite-Chat Q8_0 GGUF checkpoint
+        # register-deepseek-model-component: 16.7 GB packed, more than one
+        # 12 GB GPU, pinned by its sha256, which the test verifies. The
+        # Qwen1.5-MoE checkpoint is removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' }}
+        env:
+          REVISION: b6350f4c672640e949652ae480226b25deb88091
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "${MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR:-/nonexistent}"
+          df -h "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/deepseek-v2-lite-chat-q8_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/legraphista/DeepSeek-V2-Lite-Chat-IMat-GGUF/resolve/$REVISION/DeepSeek-V2-Lite-Chat.Q8_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF across two GPUs
+        # Multi-head latent attention (expanded), YaRN, 64 routed experts
+        # (top 6) beside 2 shared ones, through the DeepSeek Component.
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_deepseek_v2_lite_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus.log"
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus.log" || {
+            echo "::error::DeepSeek-V2-Lite-Chat Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
       - name: GPU peer-to-peer readiness, again (diagnostic)
         # The readiness printed at the start, repeated where the job's log
         # tail keeps it.
