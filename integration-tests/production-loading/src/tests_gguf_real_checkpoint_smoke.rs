@@ -540,14 +540,26 @@ fn generate_gguf_with(
     );
     let attribution = model.take_phase_attribution();
     model.disable_phase_attribution();
-    if let Some(prefill) =
-        attribution.summary(magnetar_runtime::phase_attribution::StepKind::Prefill)
-    {
-        let mut phases: Vec<_> = prefill.phases.iter().collect();
+    // Where the prefill's and the decode steps' host time goes, largest
+    // leaves first.
+    for (kind, name) in [
+        (
+            magnetar_runtime::phase_attribution::StepKind::Prefill,
+            "prefill",
+        ),
+        (
+            magnetar_runtime::phase_attribution::StepKind::Decode,
+            "decode steps",
+        ),
+    ] {
+        let Some(summary) = attribution.summary(kind) else {
+            continue;
+        };
+        let mut phases: Vec<_> = summary.phases.iter().collect();
         phases.sort_by_key(|(_, total)| std::cmp::Reverse(total.host_micros));
         let phases: Vec<String> = phases
             .into_iter()
-            .take(6)
+            .take(8)
             .map(|(key, total)| {
                 format!(
                     "{:?}{} {:.2} ms",
@@ -561,8 +573,9 @@ fn generate_gguf_with(
             })
             .collect();
         eprintln!(
-            "[{label}] prefill: {:.2} ms, {}",
-            prefill.wall_micros as f64 / 1_000.0,
+            "[{label}] {name} ({}): {:.2} ms, {}",
+            summary.steps,
+            summary.wall_micros as f64 / 1_000.0,
             phases.join(", ")
         );
     }

@@ -1766,6 +1766,8 @@ jobs:
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_CUDA_DEVICES: "0,1"
+          # Whether its decode steps are captured (the latent history's TPOT).
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
         shell: bash
         run: |
           set -o pipefail
@@ -1787,6 +1789,8 @@ jobs:
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_CUDA_DEVICES: "0,1"
+          # Whether its decode steps are captured (the latent history's TPOT).
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
           MAGNETAR_KV_PRECISION: tq4
         shell: bash
         run: |
