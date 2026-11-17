@@ -967,3 +967,31 @@ fn real_public_deepseek_v2_lite_q8_0_gguf_checkpoint_generates_on_cuda() {
         sha256: DEEPSEEK_V2_LITE_Q8_0_SHA256,
     });
 }
+
+/// `google/gemma-4-E2B-it-qat-q4_0-gguf`'s exact pinned commit: Google's
+/// quantization-aware-trained `Q4_0` export of Gemma 4 E2B instruct.
+const GEMMA4_E2B_QAT_REVISION: &str = "675cff42a74c774d6cb76f76d8eacb49b48c9b93";
+/// `gemma-4-E2B_q4_0-it.gguf`'s sha256 (3,349,516,256 bytes) at
+/// [`GEMMA4_E2B_QAT_REVISION`], as Hugging Face declares it: `Q4_0`
+/// projections, `Q6_K` token and per-layer input tables, an `F16`
+/// per-layer projection.
+const GEMMA4_E2B_QAT_SHA256: &str =
+    "sha256:fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634";
+
+/// Gemma 4 E2B instruct (QAT `Q4_0`) on CUDA, through the Gemma 4 Model
+/// Component: 35 layers, four sliding-window layers to each full one, each
+/// kind with its own head width; the last 20 read the KV of earlier layers;
+/// per-layer inputs from a 262,144-row `Q6_K` table; the logit soft-cap.
+/// 3.3 GB packed: one 12 GB GPU holds it.
+#[test]
+#[ignore = "downloads/holds a 3.3GB real quantized checkpoint"]
+fn real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda gemma-4-e2b-it qat q4_0 gguf",
+        dir_env: "MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR",
+        repository: "google/gemma-4-E2B-it-qat-q4_0-gguf",
+        revision: GEMMA4_E2B_QAT_REVISION,
+        file: "gemma-4-E2B_q4_0-it.gguf",
+        sha256: GEMMA4_E2B_QAT_SHA256,
+    });
+}

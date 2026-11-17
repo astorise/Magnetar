@@ -19,7 +19,7 @@ name: GPU Runner Smoke Test
 # runner, so the schedule cannot pile up runs alongside a manual dispatch.
 #
 # Step groups: a manual dispatch's `suite` input picks groups (kernels,
-# dense, long-context, gguf, multi-gpu, moe); its default, "standard",
+# dense, long-context, gguf, multi-gpu, moe, gemma); its default, "standard",
 # leaves out the long-context campaigns (Tensor Cores on and off, about a
 # third of the run), which the daily schedule still runs with every other
 # group. The CUDA Provider build and conformance tests always run.
@@ -29,7 +29,7 @@ on:
       suite:
         description: >-
           Comma-separated groups to run: kernels, dense, long-context, gguf,
-          multi-gpu, moe; or "standard" (all but long-context) or "all".
+          multi-gpu, moe, gemma; or "standard" (all but long-context) or "all".
           The daily schedule always runs "all".
         required: false
         default: standard
@@ -63,10 +63,10 @@ jobs:
           set -eu
           suite="$(echo "$SUITE" | tr -d ' ')"
           case ",$suite," in
-            *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe" ;;
-            *,standard,*) suite="$suite,kernels,dense,gguf,multi-gpu,moe" ;;
+            *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe,gemma" ;;
+            *,standard,*) suite="$suite,kernels,dense,gguf,multi-gpu,moe,gemma" ;;
           esac
-          for group in kernels dense long-context gguf multi-gpu moe; do
+          for group in kernels dense long-context gguf multi-gpu moe gemma; do
             var="SUITE_$(echo "$group" | tr 'a-z-' 'A-Z_')"
             case ",$suite," in
               *",$group,"*) echo "$var=true" >> "$GITHUB_ENV"; echo "$group: on" ;;
@@ -75,7 +75,7 @@ jobs:
           done
           for group in $(echo "$suite" | tr ',' ' '); do
             case "$group" in
-              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe) ;;
+              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe|gemma) ;;
               *) echo "::error::unknown suite group: $group"; exit 1 ;;
             esac
           done
@@ -1511,6 +1511,50 @@ jobs:
           grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
           grep -Eq 'generated text " ?Paris' "$dir/packed.log" || \
             echo "::warning::Mistral 7B IQ2_XXS: the greedy continuation of 'The capital of France is' does not start with 'Paris' (a 2-bit export may lose it)"
+      - name: Tiny Gemma 4 checkpoints against transformers on CUDA
+        # register-gemma4-model-component: the checked-in tiny Hugging Face
+        # bundles and gemma4 GGUF files (shared KV, per-layer inputs,
+        # experts; packed Q4_0 and Q8_0) through the Gemma 4 Component on
+        # CUDA, with f32 activations, compared with their transformers
+        # logits (1e-3).
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
+        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml the_tiny_gemma4_checkpoints_match_transformers_on_cuda -- --include-ignored --test-threads=1 --nocapture
+      - name: Download the pinned real Gemma 4 E2B instruct QAT Q4_0 GGUF checkpoint
+        # register-gemma4-model-component: 3.3 GB, pinned by its sha256,
+        # which the test verifies. The Mistral exports are removed first.
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' }}
+        env:
+          REVISION: 675cff42a74c774d6cb76f76d8eacb49b48c9b93
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/gemma-4-e2b-it-qat-q4_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/$REVISION/gemma-4-E2B_q4_0-it.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Gemma 4 E2B instruct QAT Q4_0 GGUF on CUDA
+        # Sliding and full layers with their own head widths, shared KV,
+        # per-layer inputs from a packed Q6_K table, the logit soft-cap,
+        # through the Gemma 4 Component on one GPU.
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' && env.MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/gemma-4-e2b-qat-q4_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/one-gpu.log"
+          grep -Eq 'generated text " ?Paris' "$dir/one-gpu.log" || {
+            echo "::error::Gemma 4 E2B QAT Q4_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
