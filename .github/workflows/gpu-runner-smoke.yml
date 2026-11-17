@@ -1615,43 +1615,53 @@ jobs:
           qualify gemma-4-e2b-qat-q4_0 real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR google/gemma-4-E2B-it-qat-q4_0-gguf 675cff42a74c774d6cb76f76d8eacb49b48c9b93 gemma-4-E2B_q4_0-it.gguf
           qualify mistral-7b-q4_k_m real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
           exit "$status"
-      - name: TurboQuant KV gains at long contexts (Gemma 4 E2B)
-        # turboquant-kv-history: the gains test of turboquant-kv-gains.yml on
-        # one checkpoint, so the kv group reports them too: KV bytes per
-        # token, the tokens the free VRAM holds, which contexts run, TTFT,
-        # TPOT and the agreement with f32, in the run summary (next step).
-        # Up to 16,384 tokens: 32,768 did not finish within the hour (run
-        # 44128259285); turboquant-kv-gains.yml measures it.
+      - name: TurboQuant KV gains at long contexts
+        # turboquant-kv-history: the gains test of turboquant-kv-gains.yml,
+        # so the kv group reports them too: KV bytes per token, the tokens
+        # the free VRAM holds, which contexts run, TTFT, TPOT and the
+        # agreement with f32, in the run summary (next step). Qwen2.5-0.5B
+        # up to 32,768 tokens; Mistral 7B Q4_K_M from 4,096, whose f32
+        # history at 32,768 tokens (8 GiB) does not fit beside its weights
+        # on a 12 GB GPU. Gemma 4 E2B is not measured here: its prefill took
+        # 19 s at 4,096 tokens and did not finish 16,384 within the hour
+        # (run 44145395903).
         if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
-        timeout-minutes: 60
+        timeout-minutes: 90
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_KV_POOL_BYTES: "0"
-          MAGNETAR_KV_GAINS_LABEL: gemma-4-e2b-qat-q4_0
-          MAGNETAR_KV_GAINS_CONTEXTS: "512,4096,16384"
-          REVISION: 675cff42a74c774d6cb76f76d8eacb49b48c9b93
         shell: bash
         run: |
           set -uo pipefail
           report="$RUNNER_TEMP/qualification-reports/turboquant-kv"
           mkdir -p "$report"
-          dir="$RUNNER_TEMP/kv-gains-e2b"
-          mkdir -p "$dir"
-          curl -fsSL "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/$REVISION/gemma-4-E2B_q4_0-it.gguf" -o "$dir/model.gguf"
-          test "$(sha256sum "$dir/model.gguf" | cut -d' ' -f1)" = fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634
-          MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$dir" MAGNETAR_KV_GAINS_REPORT="$report/gains-e2b.md" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains-e2b.log"
-          status=$?
-          rm -rf "$dir"
+          status=0
+          # label contexts repository revision file sha256
+          while read -r label contexts repository revision file sha256; do
+            dir="$RUNNER_TEMP/kv-gains-$label"
+            mkdir -p "$dir"
+            curl -fsSL "https://huggingface.co/$repository/resolve/$revision/$file" -o "$dir/model.gguf" || { echo "::error::$label: download failed"; status=1; continue; }
+            [ "$(sha256sum "$dir/model.gguf" | cut -d' ' -f1)" = "$sha256" ] || { echo "::error::$label: sha256 mismatch"; status=1; rm -rf "$dir"; continue; }
+            MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$dir" MAGNETAR_KV_GAINS_LABEL="$label" \
+            MAGNETAR_KV_GAINS_CONTEXTS="$contexts" MAGNETAR_KV_GAINS_REPORT="$report/gains-$label.md" \
+              cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains-$label.log" || { echo "::error::$label: the gains test failed"; status=1; }
+            rm -rf "$dir"
+          done <<'CHECKPOINTS'
+          qwen2.5-0.5b-q8_0 512,4096,16384,32768 Qwen/Qwen2.5-0.5B-Instruct-GGUF 9217f5db79a29953eb74d5343926648285ec7e67 qwen2.5-0.5b-instruct-q8_0.gguf ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e
+          mistral-7b-q4_k_m 4096,16384,32768 bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6
+          CHECKPOINTS
           exit "$status"
       - name: TurboQuant KV gains summary
-        # The report the gains test rewrites after each precision, also
+        # The reports the gains test rewrites after each precision, also
         # when the step above ran out of time.
         if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
         shell: bash
         run: |
-          report="$RUNNER_TEMP/qualification-reports/turboquant-kv/gains-e2b.md"
-          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; else echo "no gains report"; fi
+          for report in "$RUNNER_TEMP"/qualification-reports/turboquant-kv/gains-*.md; do
+            [ -f "$report" ] || continue
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          done
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
