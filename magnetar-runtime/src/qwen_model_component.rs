@@ -439,6 +439,20 @@ impl FirstNativeModelConfig {
         }
     }
 
+    /// The groups a quantized latent history is stored in
+    /// (`turboquant-kv-history`): the greatest common divisor of
+    /// `kv_lora_rank` and `qk_rope_head_dim`, so that no group mixes the
+    /// latent with the rotated key (64 in DeepSeek-V2 and V3, whose
+    /// 576-value rows are no power of two). `None` without latent attention.
+    pub fn latent_quantization_group(&self) -> Option<u64> {
+        let mla = self.latent_attention.as_ref()?;
+        let (mut a, mut b) = (u64::from(mla.kv_lora_rank), mla.qk_rope_head_dim);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        Some(a)
+    }
+
     /// A latent-attention layer's KV history row: the normalized latent and
     /// the shared rotated key, `kv_lora_rank + qk_rope_head_dim` values, one
     /// key head (`cache-latent-attention-history`).
@@ -452,12 +466,15 @@ impl FirstNativeModelConfig {
     /// keeps no K/V of its own (`turboquant-kv-history`): its row widths
     /// over its KV head count.
     pub fn kv_head_dimensions(&self) -> Vec<Option<(u64, u64)>> {
-        // A latent history is one key head, which also holds the values.
+        // A latent history is one key head, which also holds the values; a
+        // quantized store splits its rows into groups of
+        // [`Self::latent_quantization_group`] values (`turboquant-kv-history`).
         if let Some(width) = self.latent_history_width() {
+            let group = self.latent_quantization_group().unwrap_or(width);
             return self
                 .kv_row_widths()
                 .into_iter()
-                .map(|row| row.map(|_| (width, width)))
+                .map(|row| row.map(|_| (group, group)))
                 .collect();
         }
         let heads: Vec<u64> = match &self.layer_layout {

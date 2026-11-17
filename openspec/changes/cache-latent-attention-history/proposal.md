@@ -70,6 +70,7 @@ it at every step. It is also the cache TurboQuant should apply to next
 
 ## Non-goals
 
-- TurboQuant on the latent history is the next step, once this one holds.
+- A decode kernel reading the TurboQuant codes of a latent history (it is
+  dequantized into scratch for now).
 - An absorbed prefill (for a prefill that continues a history) and
   FlashMLA-style kernels are out of scope.

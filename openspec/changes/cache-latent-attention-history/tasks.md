@@ -23,3 +23,10 @@
 
 - [ ] 5.1 The tiny DeepSeek-V2 checkpoints (Hugging Face and GGUF) against `transformers`: they match on the Reference CPU, both CPU Providers and with every value device-resident (largest logit difference 1.2e-5); CUDA on the GPU runner.
 - [ ] 5.2 DeepSeek-V2-Lite-Chat on CUDA continues "The capital of France is" with "Paris"; bytes per token and TPOT against the expanded history.
+
+## 6. TurboQuant on the latent history (`turboquant-kv-history`, second step)
+
+- [x] 6.1 A latent history is quantized in groups of gcd(`kv_lora_rank`, `qk_rope_head_dim`) values (64 in DeepSeek-V2 and V3: nine groups per 576-value row, 324 bytes per row and layer in `tq4` against 2,304 in f32); narrower groups keep f32 with the reason recorded.
+- [x] 6.2 CUDA: strided attention values read from a TurboQuant store through dequantized scratch, the store read once for K and V; conformance on a tq4 store of 576-value rows.
+- [x] 6.3 The tiny GGUF checkpoints (the `wide` bundle) run with `tq4` and `tq3` latent histories on the Reference CPU, and both CPU Providers match it exactly; the Hugging Face ones keep f32 (groups of 4).
+- [ ] 6.4 DeepSeek-V2-Lite-Chat with a `tq4` latent history on CUDA continues with "Paris" (GPU workflow, `moe` group); agreement with f32 recorded.

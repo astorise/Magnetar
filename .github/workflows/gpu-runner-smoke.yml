@@ -1757,8 +1757,10 @@ jobs:
           curl -fsSL "https://huggingface.co/legraphista/DeepSeek-V2-Lite-Chat-IMat-GGUF/resolve/$REVISION/DeepSeek-V2-Lite-Chat.Q8_0.gguf" -o "$dir/model.gguf"
           echo "MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
       - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF across two GPUs
-        # Multi-head latent attention (expanded), YaRN, 64 routed experts
-        # (top 6) beside 2 shared ones, through the DeepSeek Component.
+        # Multi-head latent attention (the latent history [c_kv | k_pe] and
+        # absorbed decode, cache-latent-attention-history), YaRN, 64 routed
+        # experts (top 6) beside 2 shared ones, through the DeepSeek
+        # Component.
         if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 30
         env:
@@ -1772,6 +1774,31 @@ jobs:
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_deepseek_v2_lite_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus.log"
           grep -Eq 'generated text " ?Paris' "$dir/two-gpus.log" || {
             echo "::error::DeepSeek-V2-Lite-Chat Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF with a TurboQuant latent history
+        # turboquant-kv-history on the latent history: its 576-value rows
+        # stored tq4 in groups of 64 (324 bytes per row and layer against
+        # 2,304 in f32). The stores must be tq4 and the continuation must
+        # still start with "Paris"; the generated tokens are compared with
+        # the f32 run's.
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_KV_PRECISION: tq4
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_deepseek_v2_lite_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tq4.log"
+          grep -q 'kv precisions K tq4 V tq4' "$dir/two-gpus-tq4.log" || { echo "::error::DeepSeek-V2-Lite-Chat: the latent stores are not tq4"; exit 1; }
+          ids() { grep -o 'generated token ids \[[^]]*\]' "$1" | head -1 | sed 's/.*\[//; s/\]//' | tr -d ' ' | tr ',' '\n'; }
+          echo "tq4: $(paste -d' ' <(ids "$dir/two-gpus.log") <(ids "$dir/two-gpus-tq4.log") | awk '$1 == $2 { n++; next } { exit } END { print n + 0 }') leading tokens agree with f32"
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tq4.log" || {
+            echo "::error::DeepSeek-V2-Lite-Chat Q8_0 tq4: the continuation no longer starts with 'Paris'"
             exit 1
           }
       - name: GPU peer-to-peer readiness, again (diagnostic)
