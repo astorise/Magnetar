@@ -171,6 +171,14 @@ jobs:
         # at 512 and 4096 rows; diagnostic only.
         timeout-minutes: 15
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml long_context_kernel_times -- --ignored --nocapture
+      - name: CUDA decode attention times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # The Device time of one decode step's attention over 512 to 32,768
+        # keys in f32 and tq4 stores, with and without an exact head
+        # (keep-turboquant-kv-head-exact), for Qwen2.5-0.5B's and Mistral
+        # 7B's heads, and the bandwidth each reaches; diagnostic only.
+        timeout-minutes: 15
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml decode_attention_times -- --ignored --nocapture
       - name: CUDA packed embedding lookup times (diagnostic)
         if: ${{ env.SUITE_KERNELS == 'true' }}
         # The Device time and bytes written of a lookup from a packed table
@@ -1577,11 +1585,15 @@ jobs:
         # f32, tq4 and tq3 KV stores (MAGNETAR_KV_PRECISION); the greedy
         # tokens are compared with the f32 run's. A run whose stores fell
         # back to f32 fails. Where f32 continues "The capital of France is"
-        # with "Paris", tq4 must too; tq3 only reports.
+        # with "Paris", tq4 must too; tq3 only reports. Every row is
+        # quantized (no exact head, keep-turboquant-kv-head-exact): these
+        # short prompts would otherwise lie in the head and test nothing of
+        # the codes; the gains step measures the head.
         if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
         timeout-minutes: 60
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_KV_EXACT_ROWS: "0"
         shell: bash
         run: |
           set -uo pipefail
