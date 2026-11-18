@@ -207,3 +207,29 @@ and 16,384 (34.20 against 29.26), as the decode on codes does: the four
 threads of a key read rotated queries 64 floats apart, in one shared-memory
 bank. providers/cuda 417616d splits each group's eight-value blocks among
 them instead.
+
+Each group's eight-value blocks split among a key's four threads
+(providers/cuda 417616d, run 44407276899), the decode on codes, in us:
+
+| Keys | 128 threads | four threads, groups split | blocks split | with a 1,024-row head | f32 |
+|---|---|---|---|---|---|
+| 1,024 | 107.0 | 79.7 | 53.9 | 40.2 | 38.6 |
+| 4,096 | 158.1 | 209.9 | 126.0 | 139.5 | 149.9 |
+| 16,384 | 567.4 | 658.0 | 401.9 | 412.1 | 552.0 |
+| 32,768 | 1,032.6 | 1,305.0 | 839.5 | 738.4 | 1,125.0 |
+
+DeepSeek-V2-Lite-Chat Q8_0, prefilled in passes of 2,048 rows
+(`chunk-latent-prefills`), 64/64 tokens equal to `f32` everywhere, TPOT in
+ms:
+
+| History | 1,024 | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|---|
+| f32 | 13.42 | 16.38 | 26.93 | 42.47 |
+| `tq4`, exact head 1,024 | 15.09 | 17.46 | 27.55 | 40.52 |
+| `tq4`, no exact head | 14.78 | 17.55 | 27.07 | 43.16 |
+
+The decode on codes is now faster than `f32`'s from 4,096 keys (839.5
+against 1,125.0 us at 32,768, about 7.7 ms less per token over 27 layers),
+yet the `tq4` TPOT stays within 5% of `f32`'s: the rest of a `tq4` decode
+step costs about that much more at 32,768 tokens, which this run does not
+locate.
