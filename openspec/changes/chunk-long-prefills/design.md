@@ -84,3 +84,49 @@ unchanged.
 - **Numerics.** Passes of another row count may take other matmul Kernels;
   they never change positions or keys. The CUDA test bounds the first-step
   logits difference.
+
+## Evidence
+
+One RTX 3060 (12 GB), run 44256946982 (the first run, 44251614646, found the
+plan range of decision 2).
+
+**Chunked against one pass** (`chunked_prefill_matches_one_pass_on_cuda`,
+16 greedy tokens):
+
+| Checkpoint | Prompt | Passes | TTFT | vs one pass | First-step logits | Tokens |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B Q8_0 | 3,000 | 1 | 1,192 ms | | | |
+| | | 3 of 1,024 | 1,298 ms | +8.9% | identical | 16/16 |
+| | | 6 of 512 | 1,428 ms | +19.8% | identical | 16/16 |
+| Mistral 7B Q4_K_M | 4,000 | 1 | 38.12 s | | | |
+| | | 2 of 2,048 | 39.87 s | +4.6% | identical | 16/16 |
+| | | 4 of 1,024 | 41.68 s | +9.4% | identical | 16/16 |
+
+The passes take the same Kernels as one pass and read the same keys, so the
+logits are bit-identical. Each pass re-reads the history so far (and the
+Tensor Core attention splits it into bf16 terms again), which costs a few
+percent per pass.
+
+**Longer contexts** (TurboQuant gains test, 64 greedy tokens, passes of
+2,048 rows; one-pass values from run 44203342858):
+
+| Mistral 7B Q4_K_M | 16,384 tokens | 32,768 tokens |
+|---|---|---|
+| One pass, every precision | out of memory in `gate_proj` | not reached |
+| `f32` | TTFT 170.5 s, TPOT 40.89 ms | out of memory (history 8 GiB) |
+| `tq4` | TTFT 169.8 s, TPOT 35.09 ms (1.17x f32), 64/64 tokens = f32 | TTFT 365.7 s, TPOT 51.68 ms |
+| `tq3` | TTFT 169.8 s, TPOT 36.81 ms (1.11x f32), 64/64 tokens = f32 | TTFT 367.3 s, TPOT 55.18 ms |
+
+| Qwen2.5-0.5B Q8_0, `f32` | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|
+| TTFT, one pass | 1,636 ms | 7,979 ms | 19,792 ms |
+| TTFT, passes of 2,048 | 1,689 ms (+3.2%) | 8,230 ms (+3.1%) | 20,380 ms (+3.0%) |
+
+Findings:
+- Chunking turns TurboQuant's smaller history into longer contexts: Mistral
+  7B now generates after 32,768 tokens on one 12 GB GPU with a `tq4` or
+  `tq3` history.
+- Mistral 7B's prefill itself is slow: 4,096 tokens in about 39 s, roughly
+  1.5 TFLOP/s on its packed Q4_K weights. That, not the chunking, bounds
+  its TTFT at long contexts.
+

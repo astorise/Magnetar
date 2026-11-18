@@ -13,5 +13,5 @@
 
 ## 3. GPU qualification
 
-- [ ] 3.1 `chunked_prefill_matches_one_pass_on_cuda` (`kv` group): Qwen2.5-0.5B Q8_0 (3,000 tokens; chunks of 1,024 and 512) and Mistral 7B Q4_K_M (4,000 tokens; chunks of 2,048 and 1,024): same first token, first-step logits within 0.5, TTFT against one pass.
-- [ ] 3.2 TurboQuant gains with chunked prefills: Mistral 7B Q4_K_M at 16,384 and 32,768 tokens in `f32`, `tq4` and `tq3`; Qwen2.5-0.5B TTFT at 16,384 and 32,768 against one pass (run 44203342858).
+- [x] 3.1 `chunked_prefill_matches_one_pass_on_cuda` (`kv` group): Qwen2.5-0.5B Q8_0 (3,000 tokens; chunks of 1,024 and 512) and Mistral 7B Q4_K_M (4,000 tokens; chunks of 2,048 and 1,024): the first-step logits equal the one-pass prefill's exactly and 16/16 tokens agree, in every case (run 44256946982). TTFT +9% / +20% (Qwen, 3 and 6 passes), +4.6% / +9.4% (Mistral, 2 and 4 passes). See design.md, Evidence.
+- [x] 3.2 TurboQuant gains with chunked prefills (run 44256946982): Mistral 7B Q4_K_M runs 16,384 tokens in `f32`, `tq4` and `tq3` and 32,768 in `tq4` and `tq3` (the `f32` history does not fit beside the weights), where every precision ran out of memory at 16,384 before; Qwen2.5-0.5B's TTFT with passes of 2,048 rows is 3% above one pass at 4,096 to 32,768 tokens (run 44203342858).
