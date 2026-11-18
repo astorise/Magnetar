@@ -72,6 +72,25 @@ tokens every precision runs out of memory in layer
 0's `gate_proj` (the fused gated MLP), 3,890 MiB free on the first GPU
 after the load.
 
+Run 44375603855 (providers/cuda 90d5efd, the grouped expert prefill, eight
+pairs and one column per warp): `grouped_moe_prefill_matches_the_per_pair_kernels`
+passes (bit for bit). `moe_prefill_kernel_times`, DeepSeek-V2-Lite's experts
+(2048 hidden, 1408 intermediate, 64 experts, top 6), packed `Q8_0`:
+
+| Tokens | One pair at a time | Grouped by expert |
+|---|---|---|
+| 1,024 | 187.09 ms | 107.56 ms |
+| 4,096 | 750.54 ms | 429.70 ms |
+
+DeepSeek-V2-Lite-Chat's TTFT then falls from 5,989.3 to 3,800.4 ms at 1,024
+tokens and from 24,776.6 to 16,281.5 ms at 4,096 (`f32` history), its 64
+tokens and first-step logits still equal (16,384 tokens still run out of
+memory: decisions 1 to 3 were not in that run). Each lane of that form
+converts its quants again for every pair and reads its values again for
+every column; providers/cuda 49a84d2 serves two columns per warp, each
+lane converting its quants once per step and reading a pair's values once
+for both columns.
+
 ## Risks
 
 - **Blocks re-split A.** A's split is per block, as before per call; B's
