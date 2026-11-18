@@ -194,7 +194,11 @@ fn the_tiny_deepseek_v2_checkpoints_run_with_a_turboquant_latent_history() {
                     drift.max_abs_difference
                 );
             } else {
-                assert_eq!(drift.resolution.resolved, KvPrecisions::default(), "{variant}");
+                assert_eq!(
+                    drift.resolution.resolved,
+                    KvPrecisions::default(),
+                    "{variant}"
+                );
                 assert!(
                     drift
                         .resolution
