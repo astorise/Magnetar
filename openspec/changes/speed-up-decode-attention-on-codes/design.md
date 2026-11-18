@@ -56,7 +56,13 @@ partials per head.
 `min(ceil(4 x SMs / kv_heads), max(1, chunks / 2), 32)` for the history
 being decoded (at least two chunks per block, at most four blocks per
 multiprocessor), then reduced to fill whole waves of the multiprocessors
-when the last wave would be less than three quarters full.
+when the last wave would be less than three quarters full. The blocks a
+multiprocessor holds come from the Kernel's occupancy at its shared
+memory size (at most four).
+
+`S` grows with the history, and a captured step cannot grow the
+attention scratch: the scratch is sized for `min(chunks, 32)` partials
+per query head, `chunks` counted over the stores' capacity.
 
 ## Risks
 
