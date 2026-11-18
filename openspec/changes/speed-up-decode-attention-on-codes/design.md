@@ -113,3 +113,22 @@ value coordinates per weight it loads (weights stored key-major, the
 group's heads contiguous), so a shared-memory load feeds several
 multiply-adds. First on the f32 grouped decode Kernel, whose bytes the
 gain would show directly, then on the code Kernels.
+
+Run 44302848278 (providers/cuda f404ebf) tiles the f32 grouped Kernel
+(a thread scores a key against four or two heads from float4 loads, and
+sums a value coordinate of four or eight heads from float4 weight loads;
+results bit-identical). One decode step's attention:
+
+| f32, us | 4,096 keys | 16,384 | 32,768 |
+|---|---|---|---|
+| Qwen2.5-0.5B, before | 44.4 | 136.5 | 252.9 |
+| Qwen2.5-0.5B, tiled | 39.6 | 120.0 | 224.0 |
+| Mistral 7B, before | 186.4 | 689.1 | 1,387.2 |
+| Mistral 7B, tiled | 185.4 | 687.0 | 1,386.6 |
+
+Qwen2.5-0.5B's attention (64-wide heads, 7 query heads per KV head) is
+11% to 12% faster, and its f32 TPOT drops from 9.35 to 8.66 ms at 32,768
+tokens and from 6.57 to 6.16 ms at 16,384 (run 44302848278 against
+44289082020). Mistral 7B's (128-wide heads, 4 per KV head, already at
+194 GB/s) does not move. Shared-memory loads per multiply-add bound part
+of the 64-wide case only; they are not the whole bound.

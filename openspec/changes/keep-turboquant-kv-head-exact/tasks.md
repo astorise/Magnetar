@@ -16,5 +16,5 @@
 
 ## 4. Qualification
 
-- [ ] 4.1 TPOT against f32 at 512 to 32,768 tokens (Qwen2.5-0.5B, Mistral 7B): at least f32's at 512 tokens; the codes-only decode's from 4,096 on. Run 44289082020: f32's at 512 tokens (1.01x and 0.99x) and `tq4` within 3% of the codes-only decode past the head; `tq3` past the head 8-24% slower than without a head in the previous run (suspected accumulators in local memory, removed in providers/cuda 5164290, to be measured).
+- [x] 4.1 TPOT against f32 at 512 to 32,768 tokens (Qwen2.5-0.5B, Mistral 7B): at least f32's at 512 tokens; the codes-only decode's from 4,096 on. Run 44289082020: f32's at 512 tokens (1.01x and 0.99x) and `tq4` within 3% of the codes-only decode past the head. `tq3` past the head was 8-24% slower than without a head; with the grouped Kernel's accumulators kept in registers (providers/cuda 5164290), run 44302848278 has it within 1-4% (design, Evidence).
 - [x] 4.2 Agreement with f32 (leading tokens, first-step logits) against the codes-only history (run 44289082020; design, Evidence): f32's logits exactly up to the head; past it, closer to f32 on Mistral 7B, as close on Qwen2.5-0.5B.

@@ -11,5 +11,5 @@
 
 ## 3. Register tiling
 
-- [ ] 3.1 The f32 grouped decode Kernel with queries and weights held in registers across several keys and coordinates (decision 5); conformance; `decode_attention_times`.
-- [ ] 3.2 The same on the code Kernels if 3.1 confirms the bound.
+- [x] 3.1 The f32 grouped decode Kernel with several multiply-adds per shared load (decision 5); conformance; `decode_attention_times` (run 44302848278): 11-12% faster for 64-wide heads (f32 TPOT -6% to -7% at 16,384 and 32,768 tokens on Qwen2.5-0.5B), unchanged for 128-wide.
+- [ ] 3.2 The same on the grouped code Kernel (providers/cuda de9dffc), measured.

@@ -110,12 +110,15 @@ there at 53.8 ms with the head and 53.1 ms without.)
   1.5% on Qwen2.5-0.5B, 1.3% to 3% on Mistral 7B).
 - **`tq3` with the head was 8% to 24% slower past it than `tq3` without in
   run 44283381146** (Qwen2.5-0.5B at 32,768 tokens: 11.25 against
-  9.04 ms), a gap that grows with the history where `tq4`'s does not. A
-  suspected cause: the grouped code Kernel stored the exact head's sums
-  through a run-time head index, which can move its accumulators from
-  registers to local memory in every loop. providers/cuda 5164290 unrolls
-  that loop with constant indices; to be measured, with each Kernel's
-  local memory reported.
+  9.04 ms), a gap that grew with the history where `tq4`'s did not. The
+  grouped code Kernel stored the exact head's sums through a run-time
+  head index, which can move its accumulators from registers to local
+  memory in every loop; providers/cuda 5164290 unrolls that loop with
+  constant indices (every decode Kernel now reports no local memory). Run
+  44302848278: `tq3` with the head is back within 1% to 4% of `tq3`
+  without in run 44283381146 (Qwen2.5-0.5B 4.76, 6.55 and 9.15 ms against
+  4.62, 6.29 and 9.04 at 4,096 to 32,768 tokens; Mistral 7B 23.53, 37.62
+  and 56.04 against 23.30, 37.04 and 55.46).
 - **Agreement.** All 64 tokens agree with f32 for every precision and
   context but `tq3` at 16,384 tokens on Qwen2.5-0.5B (32/64). On Mistral 7B
   the head brings the first step's largest logit difference from 2.24 to
