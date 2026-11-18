@@ -82,3 +82,47 @@ none, with the reason recorded, and every row is quantized.
   decode reads codes, and rotates one sum per block that reads them:
   measured against the codes-only decode at 4,096 to 32,768 tokens.
 - Memory: `E` f32 rows per store, reported with the KV bytes per token.
+
+## Evidence
+
+One RTX 3060 (12 GB). Run 44289082020 (providers/cuda c0b093f): greedy
+decoding of 64 tokens after prompts of 512 to 32,768 tokens, `tq4` with
+the default head of 1,024 rows and with none, `tq3` with the head; run
+44283381146 (the commit before) measured `tq4` and `tq3` without a head.
+
+| TPOT vs f32 | 512 | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|---|
+| Qwen2.5-0.5B, `tq4` with the head | 1.01x | 0.91x | 0.96x | 1.01x |
+| Qwen2.5-0.5B, `tq4` without | 0.81x | 0.92x | 0.96x | 1.01x |
+| Qwen2.5-0.5B, `tq3` with the head | 1.01x | 0.87x | 0.85x | 0.83x |
+| Mistral 7B Q4_K_M, `tq4` with the head | 0.99x | 0.99x | 1.12x | - |
+| Mistral 7B Q4_K_M, `tq4` without | 0.95x | 1.02x | 1.14x | - |
+| Mistral 7B Q4_K_M, `tq3` with the head | 0.99x | 0.94x | 0.98x | - |
+
+(Mistral 7B's f32 history does not fit at 32,768 tokens; `tq4` decodes
+there at 53.8 ms with the head and 53.1 ms without.)
+
+- **Up to the head, f32's speed and f32's logits.** At 512 tokens every
+  history lies in the heads: TPOT is f32's (3.65 against 3.69 ms; 17.98
+  against 17.86 ms) and the first step's logits are f32's exactly (largest
+  difference 0, against 3.2 and 1.1 without the head).
+- **Past the head, `tq4` within 3% of the codes-only decode** (0.3% to
+  1.5% on Qwen2.5-0.5B, 1.3% to 3% on Mistral 7B).
+- **`tq3` with the head was 8% to 24% slower past it than `tq3` without in
+  run 44283381146** (Qwen2.5-0.5B at 32,768 tokens: 11.25 against
+  9.04 ms), a gap that grows with the history where `tq4`'s does not. A
+  suspected cause: the grouped code Kernel stored the exact head's sums
+  through a run-time head index, which can move its accumulators from
+  registers to local memory in every loop. providers/cuda 5164290 unrolls
+  that loop with constant indices; to be measured, with each Kernel's
+  local memory reported.
+- **Agreement.** All 64 tokens agree with f32 for every precision and
+  context but `tq3` at 16,384 tokens on Qwen2.5-0.5B (32/64). On Mistral 7B
+  the head brings the first step's largest logit difference from 2.24 to
+  0.42 at 4,096 tokens and from 1.88 to 0.98 at 16,384; on Qwen2.5-0.5B it
+  stays within the codes-only run's (10.5 against 9.6, 7.6 against 7.8,
+  7.0 against 7.2).
+
+Kernel times (run 44290046381, `decode_attention_times`, one decode step's
+attention): with the head, 512 keys take f32's time (Qwen2.5-0.5B 12.7 us,
+against 34.6 us on codes; Mistral 7B 35.7 against 45.8 us).
