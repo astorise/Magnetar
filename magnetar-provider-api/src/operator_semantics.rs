@@ -527,8 +527,12 @@ fn latent_product(
             weight.shape, latent.shape
         )));
     }
-    let (rows, width, latent_width, n) =
-        (rows as usize, width as usize, latent_width as usize, n as usize);
+    let (rows, width, latent_width, n) = (
+        rows as usize,
+        width as usize,
+        latent_width as usize,
+        n as usize,
+    );
     let mut data = vec![0.0_f32; rows * n];
     for row in 0..rows {
         let out = &mut data[row * n..(row + 1) * n];
