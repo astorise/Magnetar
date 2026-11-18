@@ -146,3 +146,13 @@ The f32 latent decode is 4.6x faster at 32,768 keys (50 GB/s against
 both take about 100 us: 8 chunks and 2 head blocks give 16 blocks for 28
 multiprocessors. `latent_decode_matches_the_cpu` (33 to 1,100 keys, a
 sliding window) passes.
+
+DeepSeek-V2-Lite-Chat Q8_0 across both GPUs (run 44358602056, the gains
+test, 64 greedy tokens): at 1,024 prompt tokens, TPOT 15.06 ms with an
+f32 latent history, 15.31 ms with `tq4` without an exact head, 17.96 ms
+with the default head of 1,024 rows; all 64 tokens and the first step's
+logits are f32's. At 4,096 tokens every precision's one-pass prefill runs
+out of memory (the latent attention's prefill is not chunked, and the
+`fill` placement leaves little free on the first GPU), so longer contexts
+are not measured on this hardware. Short prompts keep " Paris." with both
+histories (TPOT 13.51 and 13.54 ms).
