@@ -187,6 +187,13 @@ jobs:
         # 7B's heads, and the bandwidth each reaches; diagnostic only.
         timeout-minutes: 15
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml decode_attention_times -- --ignored --nocapture
+      - name: CUDA latent prefill attention times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # One latent prefill attention pass (chunk-latent-prefills) at
+        # DeepSeek-V2-Lite's shapes over f32 and tq4 histories, and its
+        # split step alone; diagnostic only.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml latent_prefill_attention_times -- --ignored --nocapture
       - name: CUDA packed embedding lookup times (diagnostic)
         if: ${{ env.SUITE_KERNELS == 'true' }}
         # The Device time and bytes written of a lookup from a packed table

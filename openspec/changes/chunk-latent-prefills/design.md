@@ -64,3 +64,36 @@ history in the latent width.
 - **Expansion memory.** A pass holds the expanded keys and values of every
   row it reads: 20 KB per row at DeepSeek-V2-Lite's shapes (335 MB at 16,384
   rows), within a layer's node.
+
+## Evidence
+
+Run 44404969859 (providers/cuda 02b3b21, components/deepseek a79e2ee):
+`attention_over_latent_keys_and_values_matches_the_cpu` passes; the tiny
+DeepSeek-V2 checkpoints on CUDA match `transformers` (largest logit
+difference 9.8e-6). DeepSeek-V2-Lite-Chat Q8_0 across both GPUs, prompts
+prefilled in passes of 2,048 rows:
+
+| History | Context | TTFT (ms) | TPOT (ms) | Tokens = f32 | Max \|Δ logit\| step 1 |
+|---|---|---|---|---|---|
+| f32 | 1,024 | 2,952.3 | 13.39 | - | - |
+| f32 | 4,096 | 13,106.3 | 16.41 | - | - |
+| f32 | 16,384 | 82,486.6 | 26.91 | - | - |
+| f32 | 32,768 | 274,038.5 | 42.98 | - | - |
+| `tq4`, exact head 1,024 | 1,024 | 3,641.6 | 15.06 | 64/64 | 0 |
+| `tq4`, exact head 1,024 | 4,096 | 18,199.1 | 19.84 | 64/64 | 7.10 |
+| `tq4`, exact head 1,024 | 16,384 | 113,112.7 | 34.60 | 64/64 | 9.17 |
+| `tq4`, exact head 1,024 | 32,768 | 327,023.8 | 52.76 | 64/64 | 13.78 |
+| `tq4`, no exact head | 1,024 | 4,160.1 | 15.59 | 64/64 | 8.39 |
+| `tq4`, no exact head | 4,096 | 19,357.2 | 20.39 | 64/64 | 11.18 |
+| `tq4`, no exact head | 16,384 | 118,196.1 | 34.96 | 64/64 | 12.49 |
+| `tq4`, no exact head | 32,768 | 329,956.8 | 52.01 | 64/64 | 14.98 |
+
+An `f32` history now reaches 16,384 and 32,768 tokens (run 44389385779: out
+of memory at 16,384 in one pass). With a `tq4` history the first step's
+logits differ from `f32`'s (decision 4: the prefill reads the history's
+round trip; with every prompt row in the exact head they are equal), the
+64 tokens still equal. The `tq4` prefill takes longer than the `f32` one
+(3,641.6 against 2,952.3 ms at 1,024 tokens in one pass, before any
+chunking); `latent_prefill_attention_times` times the pass over each
+history. This run's decode on codes is the slower four-way split of
+providers/cuda 27e1b9e (`cache-latent-attention-history`).
