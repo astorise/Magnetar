@@ -91,6 +91,15 @@ every column; providers/cuda 49a84d2 serves two columns per warp, each
 lane converting its quants once per step and reading a pair's values once
 for both columns.
 
+Run 44382825307 (providers/cuda c6434f5 and the gather on every prefill
+graph, the one-column grouped expert Kernels): every CUDA conformance test
+passes, `long_prefill_matmuls_run_in_row_blocks` included. DeepSeek-V2-Lite
+prefills 16,384 tokens with a `tq4` latent history (TTFT 99,466.3 ms with the
+exact head, 114,672.2 ms without; TPOT 28.45 and 29.89 ms); with an `f32`
+history, 1,024 MB of history at that length against 144 MB, the prefill runs
+out of the second GPU's memory at layer 25 after 74 s (176 MiB free on it
+after the failure, 1,806 MiB on the first).
+
 ## Risks
 
 - **Blocks re-split A.** A's split is per block, as before per call; B's

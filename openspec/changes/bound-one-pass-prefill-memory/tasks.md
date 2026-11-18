@@ -12,5 +12,5 @@
 
 ## 3. GPU qualification
 
-- [ ] 3.1 The new conformance tests pass on CUDA, and `moe_prefill_kernel_times` gives the grouped prefill's time against one pair at a time. Run 44375603855: the grouped prefill matches the per-pair Kernels bit for bit, 107.56 against 187.09 ms at 1,024 tokens, 429.70 against 750.54 ms at 4,096; DeepSeek-V2-Lite's TTFT 3,800.4 ms (1,024 tokens) and 16,281.5 ms (4,096). Pending: the row blocks' test, the two-column form's time.
-- [ ] 3.2 DeepSeek-V2-Lite-Chat Q8_0 across both GPUs (balanced) prefills 16,384 tokens with `f32` and `tq4` latent histories; TTFT and TPOT recorded in `cache-latent-attention-history` task 6.7.
+- [ ] 3.1 The new conformance tests pass on CUDA, and `moe_prefill_kernel_times` gives the grouped prefill's time against one pair at a time. Run 44375603855: the grouped prefill matches the per-pair Kernels bit for bit, 107.56 against 187.09 ms at 1,024 tokens, 429.70 against 750.54 ms at 4,096; DeepSeek-V2-Lite's TTFT 3,800.4 ms (1,024 tokens) and 16,281.5 ms (4,096). Run 44382825307: every conformance test passes, `long_prefill_matmuls_run_in_row_blocks` included. Pending: the two-column form's time.
+- [ ] 3.2 DeepSeek-V2-Lite-Chat Q8_0 across both GPUs (balanced) prefills 16,384 tokens with `f32` and `tq4` latent histories; TTFT and TPOT recorded in `cache-latent-attention-history` task 6.7. Run 44382825307: `tq4` does (TTFT 99.5 s with the exact head, 114.7 s without); `f32` runs out of the second GPU's memory at layer 25.
