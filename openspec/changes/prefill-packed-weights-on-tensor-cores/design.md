@@ -29,7 +29,23 @@ product of terms down to 2^-24 of the whole, smallest first:
 `lo·hi + mid·mid + hi·lo + mid·hi + hi·mid + hi·hi`.
 
 The dropped products (`mid·lo`, `lo·mid`, `lo·lo`) are below 2^-25 of each
-product: the result is as precise as the f32 Kernels'.
+product.
+
+### 3. A partial per tile, added in f32
+
+The Tensor Cores' f32 accumulation aligns the products and the
+accumulator to the largest of them and truncates the rest. Accumulated in
+one chain over every tile, the largest term is the running sum, and the
+truncations of every `mma` add up with one sign. The six products of
+each 16-inner tile therefore accumulate into a partial that starts at
+zero, and an ordinary f32 add (round to nearest) takes the partial into
+the output: the result is as precise as the f32 Kernels'.
+
+With six products in one chain, the gated packed `Q8_0` conformance case
+at 70 rows exceeded its f32 tolerance on the RTX 3060 (-404.9817 against
+-404.9833, run 44274927793). Modelled with truncating accumulation, the
+chain gives 1.5e-3 (as measured) and the per-tile partials 3.7e-4, with or
+without guard bits, against 1.29e-3 allowed.
 
 A first version split each operand into two terms and kept three products
 (`a_hi·b_hi + a_lo·b_hi + a_hi·b_lo`, about 17 significant bits, the
@@ -42,7 +58,7 @@ exceed that tolerance with three or four products (largest difference
 terms with these six stay within it (3.7e-4). The tolerance is kept; the
 six products cost twice the Tensor Core work of three.
 
-### 3. Where
+### 4. Where
 
 The packed branch of `matmul_with_addend`, after the row Kernels: more
 than 64 rows (`MATMUL_TILE_MIN_ROWS`), no transposition, both inner and
