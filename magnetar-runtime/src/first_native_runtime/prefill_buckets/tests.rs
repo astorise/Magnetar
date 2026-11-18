@@ -176,7 +176,8 @@ fn run_capped(
             } else {
                 CachedGraphs::new(graphs)
             });
-            assert_eq!(graphs.logits_row, gather && cache.is_prefill_bucket(length));
+            // Every prefill graph takes the gather, a bucket's or not.
+            assert_eq!(graphs.logits_row, gather);
             let plans = graphs
                 .prepared_plans(
                     &runtime,

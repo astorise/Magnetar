@@ -1867,8 +1867,10 @@ impl ProductionLoadedModel {
             }
             // Padding rows are only invisible to KV history kept in place,
             // where attention reads the first `key_count` rows: a graph whose
-            // KV edges have other readers runs at the prompt's exact length.
-            if (graph_length != prompt_token_count || component_graphs.logits_row)
+            // KV edges have other readers runs at the prompt's exact length,
+            // outside every bucket and the chunk.
+            if (graph_length != prompt_token_count
+                || self.graph_cache.is_prefill_bucket(graph_length))
                 && !component_graphs
                     .prefill_memo
                     .kv_edges_feed_only_attention(&component_graphs.prefill)

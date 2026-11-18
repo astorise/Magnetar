@@ -168,3 +168,23 @@ run 44369519228) keeps the decode on codes alone at its times (150.6,
 569.2 and 1,030.5 us at 4,096, 16,384 and 32,768 keys) and brings the
 head's 4,096-key step to 227.7 us (595.1 and 1,123.7 at 16,384 and
 32,768).
+
+DeepSeek-V2-Lite-Chat Q8_0 across both GPUs with the layers balanced (run
+44374637064; 3,890 and 2,740 MiB free after the load), against the first GPU
+filled (run 44358602056, out of memory from 4,096 tokens):
+
+| History | Context | TTFT (ms) | TPOT (ms) | TPOT vs f32 | Tokens = f32 |
+|---|---|---|---|---|---|
+| f32 | 1,024 | 5,989.3 | 15.09 | 1.00x | 64/64 |
+| f32 | 4,096 | 24,776.6 | 16.56 | 1.00x | 64/64 |
+| `tq4`, exact head 1,024 | 1,024 | 6,010.3 | 16.89 | 0.89x | 64/64 |
+| `tq4`, exact head 1,024 | 4,096 | 24,905.8 | 17.96 | 0.92x | 64/64 |
+| `tq4`, no exact head | 1,024 | 6,025.8 | 15.44 | 0.98x | 64/64 |
+| `tq4`, no exact head | 4,096 | 25,361.6 | 16.97 | 0.98x | 64/64 |
+
+The first-step logits equal f32's in every case. At 16,384 tokens every
+history runs out of the first GPU's memory in the prefill's layer 0 gated
+MLP (`bound-one-pass-prefill-memory`). With the tiled prefill attention for
+192-dimension keys and 128-dimension values (providers/cuda 758b8ba) and the
+balanced placement together, TTFT at 1,024 tokens is 5,989.3 against
+6,975.8 ms; the run does not separate the two.

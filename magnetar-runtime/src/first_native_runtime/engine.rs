@@ -784,9 +784,13 @@ impl ComponentGraphCache {
     }
 
     /// Freshly built graphs of `graph_length` prefill rows, ready to cache:
-    /// fused ([`Self::optimize`]) and, for a bucket's graphs, with the
-    /// logits row gather. A bucket graph whose LM head cannot take the
-    /// gather keeps every row's logits; the engine then reads row `n - 1`.
+    /// fused ([`Self::optimize`]) and with the logits row gather, outside
+    /// tensor parallelism. Every prefill samples one row (a bucket's, a
+    /// chunked prefill's passes, a prompt run in one pass at its own
+    /// length), so the LM head runs on that row only: a long prompt's
+    /// prefill never holds every row's logits. A graph whose LM head cannot
+    /// take the gather keeps every row's logits; the engine then reads row
+    /// `n - 1`.
     pub(crate) fn prepare(
         &self,
         runtime: &Runtime,
@@ -794,8 +798,7 @@ impl ComponentGraphCache {
         graph_length: u64,
     ) -> CachedGraphs {
         let mut graphs = self.optimize(runtime, graphs);
-        let gathered = self
-            .is_prefill_bucket(graph_length)
+        let gathered = (!self.tensor_parallel())
             .then(|| {
                 crate::first_native_runtime::prefill_buckets::insert_logits_row_gather(
                     &graphs.prefill,
