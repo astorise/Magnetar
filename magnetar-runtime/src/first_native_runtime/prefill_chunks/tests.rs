@@ -128,3 +128,33 @@ fn a_production_model_prefills_long_prompts_in_chunks_of_one_graph() {
     assert_eq!(&logits, exact_logits);
     assert_eq!(model.kv_pool_bytes(), 0);
 }
+
+/// The generation loop checks a prefill's plan against the whole prompt:
+/// the plan of the chunk's graph serves prompts longer than its rows (they
+/// run in passes), while the plan of a one-pass graph of the same length
+/// serves only prompts it holds.
+#[test]
+fn the_chunk_graph_plan_serves_longer_prompts() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let long_prompt = first_native_plan_context(PreparedExecutionPhase::Prefill, 10_000);
+    let plans = |chunk: u64| {
+        let cache = ComponentGraphCache::default();
+        cache.set_prefill_chunk(chunk);
+        let graphs = first_native_component_graphs_for_prompt(&fixture, 4).expect("graphs build");
+        cache
+            .prepare(&runtime, graphs, 4)
+            .prepared_plans(&runtime, &instance, 4, &provider)
+            .expect("plans prepare")
+    };
+    let mut chunked = plans(4);
+    require_compatible_first_native_plan(Some(&mut chunked.prefill), &long_prompt)
+        .expect("the chunk graph's plan serves a longer prompt");
+    let mut one_pass = plans(0);
+    assert_eq!(
+        require_compatible_first_native_plan(Some(&mut one_pass.prefill), &long_prompt),
+        Err(PreparedExecutionPlanError::PlanWorkloadIncompatible)
+    );
+}

@@ -41,6 +41,13 @@ All passes, and every prompt longer than the chunk, share one cached graph
 and one Prepared Execution Plan. Every pass selects one logits row (the LM
 head runs on one row); only the last pass's are the prefill's.
 
+The generation loop checks a prefill's plan against the whole prompt
+(`PlanGuard::SequenceRange`), so the plan of the chunk's graph declares
+that it serves prompts of any length, while every other plan still serves
+up to its own rows. The first GPU run found this (run 44251614646: every
+chunked prompt longer than 32 tokens, the tiny fixtures' floor, was
+refused with `PlanWorkloadIncompatible`).
+
 ### 3. Eligibility is structural
 
 `ComponentGraphCache::prefill_graph_length` returns the chunk length for a

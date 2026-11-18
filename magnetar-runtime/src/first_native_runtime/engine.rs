@@ -572,6 +572,9 @@ pub(crate) struct CachedGraphs {
     /// Whether the prefill graph takes `input.logits_row` and produces the
     /// logits of that one row (`prefill_buckets::insert_logits_row_gather`).
     pub(crate) logits_row: bool,
+    /// Whether the prefill graph is the chunk's (`chunk-long-prefills`): its
+    /// plan serves every longer prompt, which runs in passes of it.
+    pub(crate) serves_longer_prompts: bool,
     pub(crate) prefill_memo: GraphExecutionMemo,
     pub(crate) decode_memo: GraphExecutionMemo,
     /// The Prepared Execution Plans last prepared for these graphs, with
@@ -598,6 +601,7 @@ impl CachedGraphs {
         Self {
             graphs,
             logits_row: false,
+            serves_longer_prompts: false,
             prefill_memo: GraphExecutionMemo::default(),
             decode_memo: GraphExecutionMemo::default(),
             plans: std::sync::Mutex::new(None),
@@ -629,11 +633,16 @@ impl CachedGraphs {
         {
             return Ok(plans.clone());
         }
-        let plans = prepare_first_native_execution_plans_for_provider(
+        let plans = prepare_first_native_execution_plans_serving(
             runtime,
             instance,
             FirstNativeComponentGraphs::clone(&self.graphs),
             prompt_token_count,
+            if self.serves_longer_prompts {
+                u64::MAX
+            } else {
+                prompt_token_count
+            },
             provider,
         )?;
         self.preparations
@@ -800,6 +809,8 @@ impl ComponentGraphCache {
         }
         let mut cached = CachedGraphs::new(graphs);
         cached.logits_row = logits_row;
+        cached.serves_longer_prompts =
+            !self.tensor_parallel() && self.prefill_chunk() == graph_length;
         cached
     }
 
