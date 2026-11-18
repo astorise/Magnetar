@@ -100,6 +100,13 @@ history, 1,024 MB of history at that length against 144 MB, the prefill runs
 out of the second GPU's memory at layer 25 after 74 s (176 MiB free on it
 after the failure, 1,806 MiB on the first).
 
+Run 44389385779 (providers/cuda 49a84d2, two columns per warp): the grouped
+prefill still matches the per-pair Kernels bit for bit, and takes 76.17 ms
+at 1,024 tokens (107.56 with one column) and 302.26 ms at 4,096 (429.70).
+DeepSeek-V2-Lite's TTFT with an `f32` history: 2,960.1 ms at 1,024 tokens,
+12,858.4 ms at 4,096; with a `tq4` history at 16,384 tokens: 82,740.1 ms
+with the exact head (99,466.3 before), 90,384.7 ms without (114,672.2).
+
 ## Risks
 
 - **Blocks re-split A.** A's split is per block, as before per call; B's
