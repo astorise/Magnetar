@@ -202,10 +202,20 @@ Findings:
   | tq3 | 4.80 ms (0.76×) | 5.05 ms (0.86×) | 7.39 ms (0.88×) | 11.74 ms (0.80×) |
 
   Mistral 7B Q4_K_M at 4,096 tokens: 23.33 ms (f32), 23.52 ms (tq4,
-  0.99×), 27.93 ms (tq3, 0.84×). `tq4` now decodes as fast as f32 with a
-  7× smaller history; short histories still pay the fixed rotations, and
-  3-bit codes, read one by one, cost more. `f32` stays the default until
-  short histories match too.
+  0.99×), 27.93 ms (tq3, 0.84×). With 3-bit key codes read eight per
+  three bytes too (run 44203342858):
+
+  | Qwen2.5-0.5B | 512 | 4,096 | 16,384 | 32,768 |
+  |---|---|---|---|---|
+  | f32 | 3.75 ms | 4.57 ms | 6.48 ms | 9.38 ms |
+  | tq4 | 4.44 ms (0.85×) | 4.62 ms (0.99×) | 6.71 ms (0.97×) | 9.03 ms (1.04×) |
+  | tq3 | 4.43 ms (0.85×) | 4.66 ms (0.98×) | 6.28 ms (1.03×) | 9.28 ms (1.01×) |
+
+  Mistral 7B Q4_K_M at 4,096 tokens: 23.34 ms (f32), 23.12 ms (tq4,
+  1.01×), 23.47 ms (tq3, 0.99×). TurboQuant histories now decode as fast
+  as f32 ones from 4,096 tokens, 7-10× smaller; short histories still pay
+  the fixed rotations and an extra kernel per step (0.85× at 512 tokens).
+  `f32` stays the default until they match too.
 - Greedy agreement counts stop at the first near-tie and vary between
   contexts (Qwen2.5-0.5B `tq4`: 64, 36, 16, 64).
 
