@@ -5,5 +5,5 @@
 
 ## 2. Qualification
 
-- [ ] 2.1 GPU runner: every conformance test passes at its unchanged tolerance. `q8_packed_gated_matmul_and_embedding_match_reference_cpu`'s 70-row case failed with two terms and three products (run 44266581438) and with six products in one chain (run 44274927793); per-tile partials to confirm. TTFT against the f32 path and the two-term version.
+- [x] 2.1 GPU runner: every conformance test passes at its unchanged tolerance (run 44283381146, the gated packed `Q8_0` case at 70 rows included, which failed with two terms and three products in run 44266581438 and with six products in one chain in run 44274927793). TTFT 1.75x faster than the f32 path for Mistral 7B Q4_K_M at 4,096 tokens (40.0 to 22.9 s), 1.57x at 32,768; 1.19x to 1.30x for Qwen2.5-0.5B Q8_0; generated tokens unchanged (design, Evidence).
 - [x] 2.2 Two terms, three products (run 44266581438 against 44256946982): Mistral 7B Q4_K_M 3.05x faster at 4,096 tokens (40.0 to 13.1 s), 2.72x at 16,384, 2.37x at 32,768; Qwen2.5-0.5B Q8_0 2.10x at 4,096, 1.56x at 32,768; generated tokens unchanged. Below f32 precision: replaced (design, decision 2).

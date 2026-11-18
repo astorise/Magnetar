@@ -75,19 +75,31 @@ output dimensions multiples of 8. Otherwise the f32 path as before.
 
 ## Evidence
 
-One RTX 3060 (12 GB). Run 44266581438 measured the first version (two terms,
-three products) against run 44256946982 (same checkpoints, prompts and
-chunking, f32 long packed matmuls):
+One RTX 3060 (12 GB), the same checkpoints, prompts and chunking (2,048-row
+passes) in every run. Run 44256946982 used the f32 long packed matmuls;
+run 44266581438 the first version (two terms, three products); run
+44283381146 the kept version (three terms, six products, a partial per
+tile added in f32):
 
-| TTFT | f32 | Two terms, 3 products | Speedup |
-|---|---|---|---|
-| Mistral 7B Q4_K_M, 4,096 tokens | 40.01 s | 13.13 s | 3.05x |
-| Mistral 7B Q4_K_M, 16,384 tokens | 170.47 s | 62.76 s | 2.72x |
-| Mistral 7B Q4_K_M, 32,768 tokens (`tq4`) | 365.74 s | 154.14 s | 2.37x |
-| Qwen2.5-0.5B Q8_0, 4,096 tokens | 1,688.6 ms | 803.7 ms | 2.10x |
-| Qwen2.5-0.5B Q8_0, 16,384 tokens | 8,229.7 ms | 4,640.2 ms | 1.77x |
-| Qwen2.5-0.5B Q8_0, 32,768 tokens | 20,379.5 ms | 13,075.6 ms | 1.56x |
+| TTFT | f32 | Two terms, 3 products | Three terms, 6 products | Kept vs f32 |
+|---|---|---|---|---|
+| Mistral 7B Q4_K_M, 4,096 tokens | 40.01 s | 13.13 s | 22.85 s | 1.75x |
+| Mistral 7B Q4_K_M, 16,384 tokens | 170.47 s | 62.76 s | 102.02 s | 1.67x |
+| Mistral 7B Q4_K_M, 32,768 tokens (`tq4`) | 365.74 s | 154.14 s | 232.69 s | 1.57x |
+| Qwen2.5-0.5B Q8_0, 4,096 tokens | 1,688.6 ms | 803.7 ms | 1,301.5 ms | 1.30x |
+| Qwen2.5-0.5B Q8_0, 16,384 tokens | 8,229.7 ms | 4,640.2 ms | 6,639.9 ms | 1.24x |
+| Qwen2.5-0.5B Q8_0, 32,768 tokens | 20,379.5 ms | 13,075.6 ms | 17,090.8 ms | 1.19x |
 
-The generated tokens after the chunked prefill test's prompts were the same
-as with the f32 path, and chunked and one-pass prefills stayed bit-identical.
-The three-term, six-product version is to be measured (task 2.1).
+Every CUDA conformance test passed at its unchanged tolerance in run
+44283381146, the gated packed `Q8_0` case at 70 rows included. The six
+products in one chain (run 44274927793, which failed that case) took the
+same time to within 1.5% (Mistral 7B 22.5 s and 100.6 s at 4,096 and
+16,384 tokens): the per-tile add costs nothing measurable. The kept
+version takes 1.3x to 1.7x the first version's time: twice the Tensor Core
+work, and three split terms per operand instead of two.
+
+The tokens generated after the chunked prefill test's prompts (Mistral 7B,
+4,000 tokens; Qwen2.5-0.5B, 3,000) were the same in all four runs, and
+chunked and one-pass prefills stayed bit-identical (run 44283381146:
+largest first-step logit difference 0 for chunks of 2,048 and 1,024 rows,
+and of 1,024 and 512).
