@@ -321,6 +321,13 @@ pub const MOE_PER_EXPERT_SCALE_FEATURE: &str = "per-expert-scale";
 /// attention, `express-latent-attention-forms`).
 pub const ATTENTION_VALUE_HEAD_DIMENSION_FEATURE: &str = "attention-value-head-dimension";
 
+/// Kernel feature an `attention` Kernel advertises when it honours
+/// `value_head_stride`: V rows hold `kv_head_count` heads of that many
+/// values, each head's value being its leading `value_head_dimension`
+/// values, so V may be the key history itself
+/// (`cache-latent-attention-history`).
+pub const ATTENTION_VALUE_HEAD_STRIDE_FEATURE: &str = "attention-value-head-stride";
+
 /// Kernel feature a `concat` Kernel advertises when it honours `axis =
 /// "heads"`: the inputs joined head by head instead of row after row.
 pub const CONCAT_HEADS_FEATURE: &str = "concat-heads";
@@ -328,6 +335,14 @@ pub const CONCAT_HEADS_FEATURE: &str = "concat-heads";
 /// Kernel feature a `rope` Kernel advertises when it honours YaRN frequency
 /// scaling ([`RopeYarnFrequencyScaling`]).
 pub const ROPE_YARN_FREQUENCY_SCALING_FEATURE: &str = "yarn-frequency-scaling";
+
+/// The `kv-write` Kernel feature a Provider advertises when it creates and
+/// writes TurboQuant KV stores (`turboquant-kv-history`).
+pub const KV_WRITE_TURBOQUANT_FEATURE: &str = "turboquant-kv-store";
+
+/// The `attention` Kernel feature a Provider advertises when its attention
+/// reads K and V from TurboQuant KV stores (`turboquant-kv-history`).
+pub const ATTENTION_TURBOQUANT_KV_FEATURE: &str = "turboquant-kv-read";
 
 /// The Kernel features an `operator` node with these `attributes` and
 /// `input_count` inputs needs beyond the Operator's baseline form: the
@@ -350,6 +365,9 @@ pub fn required_kernel_features(
             }
             if present("value_head_dimension") {
                 features.push(ATTENTION_VALUE_HEAD_DIMENSION_FEATURE);
+            }
+            if present("value_head_stride") {
+                features.push(ATTENTION_VALUE_HEAD_STRIDE_FEATURE);
             }
         }
         "concat" => {
@@ -1449,7 +1467,20 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
-        "matmul" | "batched-matmul" | "matmul-bias" | "matmul-residual" | "gated-matmul" => {
+        // `cache-latent-attention-history`: `a [T, G*K]` times `b` group by
+        // group (`group_count = G`), each group's block `[K, N]` or, with
+        // `transpose_b`, `[N, K]` used transposed, giving `[T, G*N]`
+        // (`magnetar_provider_api::batched_matmul`).
+        "batched-matmul" => OperatorAttributeSchema::default()
+            .with_rule(
+                "group_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "transpose_b",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+            ),
+        "matmul" | "matmul-bias" | "matmul-residual" | "gated-matmul" => {
             OperatorAttributeSchema::default()
                 .with_rule(
                     "transpose_a",
@@ -1505,6 +1536,12 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             // the Q/K `head_dimension` (`express-latent-attention-forms`).
             .with_rule(
                 "value_head_dimension",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // Width of each KV head in V's rows, of which the value is the
+            // leading `value_head_dimension` (`cache-latent-attention-history`).
+            .with_rule(
+                "value_head_stride",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         // `axis = "heads"` joins the inputs head by head (see [`ConcatAxis`]):

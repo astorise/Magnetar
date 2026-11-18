@@ -83,6 +83,7 @@ quantization = "provider-api"
 runtime_event = "provider-api"
 tensor = "provider-api"
 tensor_parallel = "provider-api"
+turboquant = "provider-api"
 
 # Runtime orchestration.
 adapter = "runtime"

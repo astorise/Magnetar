@@ -485,7 +485,9 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 36] = [
     // `express-latent-attention-forms`: queries and keys joined head by head.
     first_decoder_optional("concat", OperatorFamily::Tensor),
     first_decoder_optional("activation", OperatorFamily::Activation),
-    placeholder("batched-matmul", OperatorFamily::LinearAlgebra),
+    // `cache-latent-attention-history`: absorbed latent-attention queries
+    // and outputs, head by head.
+    first_decoder_optional("batched-matmul", OperatorFamily::LinearAlgebra),
     placeholder("layernorm", OperatorFamily::Normalization),
     first_decoder_optional("gelu", OperatorFamily::Activation),
     placeholder("dequantize", OperatorFamily::Quantization),

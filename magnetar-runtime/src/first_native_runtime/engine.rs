@@ -1313,6 +1313,7 @@ impl E2eRuntimeModelExecutionEngine {
             .node_bindings
             .first()
             .map(|binding| binding.provider.clone());
+        let precisions = self.resolve_kv_precisions(runtime, provider.as_ref());
         let (set, capacity, dropped) = match (bucketed, provider) {
             (true, Some(provider)) => {
                 // Never past the model's context, when that holds the request.
@@ -1321,9 +1322,13 @@ impl E2eRuntimeModelExecutionEngine {
                     bucket if context >= rows_needed => bucket.min(context),
                     bucket => bucket,
                 };
-                let (set, dropped) =
-                    self.kv_pool
-                        .acquire(&key, capacity, self.kv_set_bytes(capacity), provider);
+                let (set, dropped) = self.kv_pool.acquire(
+                    &key,
+                    capacity,
+                    precisions,
+                    self.kv_set_bytes(capacity, precisions),
+                    provider,
+                );
                 (set, capacity, dropped)
             }
             // Not pooled: a set the key still holds goes back to the pool.
@@ -1334,29 +1339,123 @@ impl E2eRuntimeModelExecutionEngine {
             Some(set) => KvStoreSpec {
                 capacity,
                 pool_set: Some(set),
+                precisions,
             },
-            None => KvStoreSpec::owned(rows_needed),
+            None => KvStoreSpec {
+                precisions,
+                ..KvStoreSpec::owned(rows_needed)
+            },
         })
+    }
+
+    /// The precisions this loaded model's KV stores are created in
+    /// (`turboquant-kv-history`), resolved once: a requested TurboQuant
+    /// precision is kept for a role only when `provider` advertises
+    /// TurboQuant stores on `kv-write` and on every attention Kernel and
+    /// every layer's head width for that role allows it; otherwise the role
+    /// is f32 and the reason is recorded.
+    pub(super) fn resolve_kv_precisions(
+        &self,
+        runtime: &Runtime,
+        provider: Option<&ProviderBinding>,
+    ) -> KvPrecisions {
+        let head_dimensions = self.fixture.config.kv_head_dimensions();
+        self.kv_pool.resolve_precisions(|requested| {
+            let mut fallbacks = Vec::new();
+            let mut resolve_role =
+                |role: &str, precision: KvStorePrecision, pick: fn(&(u64, u64)) -> u64| {
+                    if precision == KvStorePrecision::F32 {
+                        return KvStorePrecision::F32;
+                    }
+                    let advertised = provider.is_some_and(|provider| {
+                        provider_kernels_declare(
+                            runtime,
+                            provider,
+                            "kv-write",
+                            crate::operator::KV_WRITE_TURBOQUANT_FEATURE,
+                        ) && provider_kernels_declare(
+                            runtime,
+                            provider,
+                            "attention",
+                            crate::operator::ATTENTION_TURBOQUANT_KV_FEATURE,
+                        )
+                    });
+                    if !advertised {
+                        fallbacks.push(format!(
+                            "{role}: {} requested, but the Provider does not advertise TurboQuant \
+                         KV stores on kv-write and every attention Kernel; f32 stores",
+                            precision.as_str()
+                        ));
+                        return KvStorePrecision::F32;
+                    }
+                    if let Some(width) = head_dimensions
+                        .iter()
+                        .flatten()
+                        .map(pick)
+                        .find(|width| !precision.supports_head_dimension(*width))
+                    {
+                        fallbacks.push(format!(
+                            "{role}: {} requested, but a layer's {role} heads are {width} wide \
+                         (not a power of two of at least 8); f32 stores",
+                            precision.as_str()
+                        ));
+                        return KvStorePrecision::F32;
+                    }
+                    precision
+                };
+            let resolved = KvPrecisions {
+                k: resolve_role("K", requested.k, |(key, _)| *key),
+                v: resolve_role("V", requested.v, |(_, value)| *value),
+            };
+            (resolved, fallbacks)
+        })
+    }
+
+    /// A KV history's precisions (`turboquant-kv-history`): a prefill
+    /// records the precisions its stores are created in, in the history's
+    /// compatibility and KV layout metadata; a later step only continues a
+    /// history whose recorded precisions are those this model's stores now
+    /// resolve to, and refuses any other as incompatible.
+    fn check_kv_history_precisions(
+        &self,
+        runtime: &mut Runtime,
+        kv_state: &mut FirstNativeExecutionKvState,
+        prefill: bool,
+        execution_plan: &PreparedExecutionPlan,
+    ) -> Result<(), InferenceApiError> {
+        let provider = execution_plan
+            .node_bindings
+            .first()
+            .map(|binding| binding.provider.clone());
+        let mode = kv_quantization_mode(self.resolve_kv_precisions(runtime, provider.as_ref()));
+        if !prefill {
+            let mut requested = kv_state.compatibility.clone();
+            requested.quantization_mode = mode;
+            runtime.validate_kv_cache_reuse(&kv_state.cache, &requested, None)?;
+            return Ok(());
+        }
+        kv_state.compatibility.quantization_mode = mode.clone();
+        let cache = runtime
+            .kv_caches_mut()
+            .cache_mut(&kv_state.cache)
+            .map_err(InferenceApiError::from)?;
+        cache.compatibility.quantization_mode = mode.clone();
+        cache.layout.quantization = mode.map(|mode| KvCacheQuantization {
+            mode,
+            // One f32 norm per head row.
+            group_size: None,
+            scale_dtype: Some(DTypeDescriptor::portable(ComputeDType::Float32)),
+        });
+        Ok(())
     }
 
     /// The bytes of one store set of `capacity` rows: the K and V of every
     /// layer that keeps its own, at that layer's widths
     /// (`per-layer-kv-geometry`; V's own width under latent attention,
     /// `express-latent-attention-forms`).
-    fn kv_set_bytes(&self, capacity: u64) -> u64 {
-        let config = &self.fixture.config;
-        config
-            .kv_row_widths()
-            .into_iter()
-            .zip(config.kv_value_row_widths())
-            .filter_map(|(key, value)| key.zip(value))
-            .fold(0u64, |bytes, (key, value)| {
-                bytes.saturating_add(
-                    key.saturating_add(value)
-                        .saturating_mul(capacity)
-                        .saturating_mul(4),
-                )
-            })
+    /// At their stored size in `precisions` (`turboquant-kv-history`).
+    fn kv_set_bytes(&self, capacity: u64, precisions: KvPrecisions) -> u64 {
+        kv_bytes_per_token(&self.fixture.config, precisions).saturating_mul(capacity)
     }
 
     /// Releases the stores of sets the pool dropped.
@@ -1619,6 +1718,14 @@ impl E2eRuntimeModelExecutionEngine {
                         .unwrap_or(KvStoreSpec::owned(rows_needed)),
                 )
             };
+            if kv_stores.is_some() {
+                self.check_kv_history_precisions(
+                    runtime,
+                    &mut kv_state,
+                    generated_tokens.is_empty(),
+                    execution_plan,
+                )?;
+            }
             let (dispatch, mut bindings, layer_kv, resolved_provider) = if generated_tokens
                 .is_empty()
             {

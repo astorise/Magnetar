@@ -1772,7 +1772,27 @@ fn a_latent_attention_inventory_needs_the_split_projections() {
         Err(QwenComponentError::TensorInventoryMissing { tensor })
             if tensor == "layers.1.self_attn.k_nope_proj"
     ));
-    // K rows are heads * (nope + rope) wide, V rows heads * v.
-    assert_eq!(config.kv_row_widths(), vec![Some(8); 3]);
-    assert_eq!(config.kv_value_row_widths(), vec![Some(6); 3]);
+    // The KV history is the latent row `[c_kv | k_pe]`, kv_lora_rank +
+    // rope wide, one key head that also holds the values: no V rows
+    // (`cache-latent-attention-history`).
+    assert_eq!(config.latent_history_width(), Some(10));
+    assert_eq!(config.kv_row_widths(), vec![Some(10); 3]);
+    assert_eq!(config.kv_value_row_widths(), vec![Some(0); 3]);
+    // A quantized latent history is stored in groups of gcd(8, 2) = 2
+    // values, which TurboQuant (8 or more) refuses: such a model keeps f32.
+    assert_eq!(config.latent_quantization_group(), Some(2));
+    assert_eq!(config.kv_head_dimensions(), vec![Some((2, 2)); 3]);
+    // DeepSeek-V2's 512 + 64 = 576-value rows: groups of 64.
+    let mut v2 = config.clone();
+    if let Some(latent) = v2.latent_attention.as_mut() {
+        latent.kv_lora_rank = 512;
+        latent.qk_rope_head_dim = 64;
+    }
+    assert_eq!(v2.latent_history_width(), Some(576));
+    assert_eq!(v2.latent_quantization_group(), Some(64));
+    assert_eq!(
+        v2.kv_head_dimensions(),
+        vec![Some((64, 64)); 3],
+        "nine groups of 64 per row"
+    );
 }

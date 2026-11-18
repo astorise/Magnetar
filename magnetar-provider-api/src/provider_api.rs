@@ -501,6 +501,24 @@ pub trait ProviderExecutionApi: Send + Sync {
         Ok(false)
     }
 
+    /// Creates `id` as a zeroed KV store of `shape` (`[capacity, width]`,
+    /// whole heads of `head_dimension` values) in `precision`
+    /// (`turboquant-kv-history`): its logical contract stays an f32
+    /// `[capacity, width]` tensor, and every row `kv-write` writes into it
+    /// reads back as [`crate::kv_store_round_trip`] of that row. Returns
+    /// `Ok(false)` when this Provider does not create stores in that
+    /// precision (the default).
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: crate::KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        let _ = (id, shape, precision, head_dimension);
+        Ok(false)
+    }
+
     /// The [`TensorValue`] counterpart to [`Self::write_tensor_admitted`]:
     /// admits `value`'s byte size (when it is [`TensorValue::Host`]; a
     /// Provider whose [`TensorValue::Opaque`] resources have their own

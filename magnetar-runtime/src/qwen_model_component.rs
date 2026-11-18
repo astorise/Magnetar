@@ -429,31 +429,83 @@ impl FirstNativeModelConfig {
     }
 
     /// Each decoder layer's V row width: [`Self::kv_row_widths`], except
-    /// under multi-head latent attention, whose expanded V rows are
-    /// `kv_head_count * v_head_dim` wide (`express-latent-attention-forms`).
+    /// under multi-head latent attention, whose layers keep no V rows: the
+    /// latent history's rows hold the values (`cache-latent-attention-history`).
     pub fn kv_value_row_widths(&self) -> Vec<Option<u64>> {
         let widths = self.kv_row_widths();
         match &self.latent_attention {
-            Some(mla) => widths
-                .into_iter()
-                .map(|width| {
-                    width.map(|_| {
-                        self.architecture
-                            .kv_head_count
-                            .saturating_mul(mla.v_head_dim)
-                    })
-                })
-                .collect(),
+            Some(_) => widths.into_iter().map(|width| width.map(|_| 0)).collect(),
             None => widths,
         }
+    }
+
+    /// The groups a quantized latent history is stored in
+    /// (`turboquant-kv-history`): the greatest common divisor of
+    /// `kv_lora_rank` and `qk_rope_head_dim`, so that no group mixes the
+    /// latent with the rotated key (64 in DeepSeek-V2 and V3, whose
+    /// 576-value rows are no power of two). `None` without latent attention.
+    pub fn latent_quantization_group(&self) -> Option<u64> {
+        let mla = self.latent_attention.as_ref()?;
+        let (mut a, mut b) = (u64::from(mla.kv_lora_rank), mla.qk_rope_head_dim);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        Some(a)
+    }
+
+    /// A latent-attention layer's KV history row: the normalized latent and
+    /// the shared rotated key, `kv_lora_rank + qk_rope_head_dim` values, one
+    /// key head (`cache-latent-attention-history`).
+    pub fn latent_history_width(&self) -> Option<u64> {
+        self.latent_attention
+            .as_ref()
+            .map(|mla| u64::from(mla.kv_lora_rank).saturating_add(mla.qk_rope_head_dim))
+    }
+
+    /// Each decoder layer's K and V head widths, `None` for a layer that
+    /// keeps no K/V of its own (`turboquant-kv-history`): its row widths
+    /// over its KV head count.
+    pub fn kv_head_dimensions(&self) -> Vec<Option<(u64, u64)>> {
+        // A latent history is one key head, which also holds the values; a
+        // quantized store splits its rows into groups of
+        // [`Self::latent_quantization_group`] values (`turboquant-kv-history`).
+        if let Some(width) = self.latent_history_width() {
+            let group = self.latent_quantization_group().unwrap_or(width);
+            return self
+                .kv_row_widths()
+                .into_iter()
+                .map(|row| row.map(|_| (group, group)))
+                .collect();
+        }
+        let heads: Vec<u64> = match &self.layer_layout {
+            Some(layout) => layout
+                .iter()
+                .map(|layer| layer.num_key_value_heads as u64)
+                .collect(),
+            None => vec![self.architecture.kv_head_count; self.architecture.layer_count as usize],
+        };
+        self.kv_row_widths()
+            .into_iter()
+            .zip(self.kv_value_row_widths())
+            .zip(heads)
+            .map(|((key, value), heads)| {
+                key.zip(value)
+                    .filter(|_| heads > 0)
+                    .map(|(key, value)| (key / heads, value / heads))
+            })
+            .collect()
     }
 
     /// Each decoder layer's K (and, without latent attention, V) row width,
     /// `kv_head_count * head_dimension` of that layer, or `None` for a layer
     /// that attends over an earlier layer's K/V and keeps none of its own
-    /// (`per-layer-kv-geometry`).
+    /// (`per-layer-kv-geometry`). Under latent attention, the latent
+    /// history's width ([`Self::latent_history_width`]).
     pub fn kv_row_widths(&self) -> Vec<Option<u64>> {
         let layers = self.architecture.layer_count as usize;
+        if let Some(width) = self.latent_history_width() {
+            return vec![Some(width); layers];
+        }
         match &self.layer_layout {
             Some(layout) => layout
                 .iter()
@@ -904,7 +956,7 @@ pub fn latent_attention_projection_shapes(
     let values = attention_heads * mla.v_head_dim;
     let latent = u64::from(mla.kv_lora_rank);
     let query_input = mla.q_lora_rank.map_or(hidden_size, u64::from);
-    let mut shapes = Vec::with_capacity(10);
+    let mut shapes = Vec::with_capacity(12);
     if let Some(rank) = mla.q_lora_rank {
         shapes.push(("self_attn.q_a_proj", vec![hidden_size, u64::from(rank)]));
         shapes.push(("self_attn.q_a_norm", vec![u64::from(rank)]));
@@ -921,6 +973,10 @@ pub fn latent_attention_projection_shapes(
         ("self_attn.k_nope_proj", vec![latent, nope]),
         ("self_attn.v_proj", vec![latent, values]),
         ("self_attn.o_proj", vec![values, hidden_size]),
+        // The absorbed decode's tables (`cache-latent-attention-history`):
+        // the up-projection's key and value rows, `[out, in]` as stored.
+        ("self_attn.k_absorb", vec![nope, latent]),
+        ("self_attn.v_absorb", vec![values, latent]),
     ]);
     shapes
 }

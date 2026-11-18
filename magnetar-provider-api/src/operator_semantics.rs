@@ -410,6 +410,104 @@ pub fn rmsnorm_blocks(
     })
 }
 
+/// `batched-matmul` (`cache-latent-attention-history`): `a [T, G*K]` times
+/// `b` group by group (`group_count = G`), giving `[T, G*N]`: output group
+/// `g` is `a`'s column group `g` times `b`'s row group `g`, which is
+/// `[K, N]` (`b [G*K, N]`) or, with `transpose_b`, `[N, K]` used transposed
+/// (`b [G*N, K]`). Each product sums in index order, as `matmul` does.
+pub fn batched_matmul(
+    a: &HostTensor,
+    b: &HostTensor,
+    group_count: u64,
+    transpose_b: bool,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let invalid =
+        |reason: String| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
+    let (rows, a_cols) = rows_cols_of(a, "batched-matmul's input")?;
+    let (b_rows, b_cols) = rows_cols_of(b, "batched-matmul's weight")?;
+    let shapes_fit = group_count > 0
+        && a_cols.is_multiple_of(group_count)
+        && b_rows.is_multiple_of(group_count)
+        && if transpose_b {
+            b_cols == a_cols / group_count
+        } else {
+            b_rows == a_cols
+        };
+    if !shapes_fit {
+        return Err(invalid(format!(
+            "batched-matmul of {group_count} groups (transpose_b {transpose_b}) cannot take \
+             {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let groups = group_count as usize;
+    let k = (a_cols / group_count) as usize;
+    let n = if transpose_b {
+        (b_rows / group_count) as usize
+    } else {
+        b_cols as usize
+    };
+    let (a_cols, b_cols) = (a_cols as usize, b_cols as usize);
+    let weight = |group: usize, i: usize, column: usize| {
+        if transpose_b {
+            b.data[(group * n + column) * b_cols + i]
+        } else {
+            b.data[(group * k + i) * b_cols + column]
+        }
+    };
+    let mut data = vec![0.0f32; rows as usize * groups * n];
+    for row in 0..rows as usize {
+        for group in 0..groups {
+            let input = &a.data[row * a_cols + group * k..row * a_cols + (group + 1) * k];
+            let out = &mut data[(row * groups + group) * n..(row * groups + group + 1) * n];
+            for (column, out) in out.iter_mut().enumerate() {
+                let mut sum = 0.0f32;
+                for (i, value) in input.iter().enumerate() {
+                    sum += value * weight(group, i, column);
+                }
+                *out = sum;
+            }
+        }
+    }
+    Ok(HostTensor {
+        shape: vec![rows, (groups * n) as u64],
+        data,
+    })
+}
+
+/// The values `attention` reads from `v` under `value_head_stride`
+/// (`cache-latent-attention-history`): `v`'s rows hold `kv_head_count`
+/// heads of `stride` values, and each head's value is its leading
+/// `value_head_dimension`. Returns `[rows, kv_head_count *
+/// value_head_dimension]`.
+pub fn value_heads(
+    v: &HostTensor,
+    kv_head_count: u64,
+    stride: u64,
+    value_head_dimension: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = rows_cols_of(v, "attention's V")?;
+    if kv_head_count == 0 || value_head_dimension > stride || cols != kv_head_count * stride {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "V rows of {cols} values cannot hold {kv_head_count} heads of {stride} values \
+                 with {value_head_dimension}-value values"
+            ),
+        ));
+    }
+    let (stride, width) = (stride as usize, value_head_dimension as usize);
+    let data = v
+        .data
+        .chunks_exact(stride)
+        .flat_map(|head| head[..width].iter().copied())
+        .collect();
+    Ok(HostTensor {
+        shape: vec![rows, kv_head_count * value_head_dimension],
+        data,
+    })
+}
+
 /// `concat` with `axis = "heads"` (`express-latent-attention-forms`): joins
 /// `[T, head_count * a]` and `[T, second_head_count * b]` rows head by head
 /// into `[T, head_count * (a + b)]`, output head `h` being the first input's
@@ -455,3 +553,6 @@ pub fn concat_heads(
         data,
     })
 }
+
+#[cfg(test)]
+mod tests;

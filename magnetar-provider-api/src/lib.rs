@@ -32,6 +32,7 @@ pub mod quantization;
 pub mod runtime_event;
 pub mod tensor;
 pub mod tensor_parallel;
+pub mod turboquant;
 
 pub use compute_support::*;
 pub use execution::*;
@@ -43,3 +44,4 @@ pub use quantization::*;
 pub use runtime_event::*;
 pub use tensor::*;
 pub use tensor_parallel::*;
+pub use turboquant::*;

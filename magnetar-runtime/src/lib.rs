@@ -83,6 +83,8 @@ pub mod scheduler;
 pub mod session;
 pub use magnetar_provider_api::tensor;
 pub use magnetar_provider_api::tensor_parallel;
+pub use magnetar_provider_api::turboquant;
+pub use magnetar_provider_api::{KvStorePrecision, kv_store_round_trip};
 pub mod tokenizer;
 pub use magnetar_core::trace_id;
 

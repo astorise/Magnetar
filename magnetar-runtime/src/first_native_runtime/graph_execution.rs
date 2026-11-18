@@ -633,6 +633,48 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        // `cache-latent-attention-history`: per-group products, the
+        // weight's row groups matching the input's column groups.
+        "batched-matmul" => {
+            if inputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 2 batched-matmul inputs"),
+                });
+            }
+            let groups = match node.attributes.get("group_count") {
+                Some(OperatorAttributeValue::Integer(groups)) if *groups > 0 => *groups as u64,
+                _ => {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' needs a positive batched-matmul group_count"
+                        ),
+                    });
+                }
+            };
+            let (rows, _) = inputs[0].rows_cols()?;
+            let (b_rows, b_cols) = inputs[1].rows_cols()?;
+            // Each group's block is `[K, N]`, or `[N, K]` with `transpose_b`.
+            let n = match node.attributes.get("transpose_b") {
+                Some(OperatorAttributeValue::Boolean(true)) => b_rows / groups,
+                _ => b_cols,
+            };
+            let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, groups * n]);
+            let resources = ["a", "b"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("batched-matmul", OperatorFamily::LinearAlgebra),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "row-scale" => {
             if inputs.len() != 2 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1282,10 +1324,12 @@ pub(super) fn execute_first_native_graph_nodes(
         // anymore, both take `NodeValue` straight through to their Kernel
         // dispatch like every operator here. So does the head-wise
         // `concat` (`express-latent-attention-forms`): it reads only its
-        // inputs' shapes.
+        // inputs' shapes. So does `batched-matmul`
+        // (`cache-latent-attention-history`).
         let passthrough_eligible = matches!(
             node.operator.name(),
             "matmul"
+                | "batched-matmul"
                 | "matmul-bias"
                 | "matmul-residual"
                 | "gated-matmul"
@@ -1498,29 +1542,91 @@ pub(super) fn execute_first_native_graph_nodes(
                             Some(_) => MemoryAllocationOwner::Session(KV_STORE_POOL_OWNER.into()),
                             None => MemoryAllocationOwner::Session(kv_cache_id.to_string()),
                         };
-                        let target: OutputTarget = (
-                            store.clone(),
-                            resolved_output_placement(
-                                dispatch_ctx.prepared_plan.as_deref(),
-                                node_id,
-                            ),
-                            owner,
+                        let placement = resolved_output_placement(
+                            dispatch_ctx.prepared_plan.as_deref(),
+                            node_id,
                         );
-                        let (store_id, _) = resolve_output_target(
-                            &mut dispatch_ctx,
-                            &format!("{node_id}.kv-store"),
-                            store_descriptor.clone(),
-                            Some(target),
-                        )?;
-                        // Zeroed where the store lives when the Provider can,
-                        // instead of building and uploading host zeros: at
-                        // prefill, one store per layer and role.
-                        let zeroed = dispatch_ctx
-                            .provider
-                            .write_zeroed_tensor(&store_id, &[capacity, width])
-                            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
-                                reason: error.to_string(),
+                        // A store in a TurboQuant precision is admitted at
+                        // its stored size and created by the Provider in
+                        // that precision (`turboquant-kv-history`).
+                        let precision = spec.precisions.for_role(role);
+                        let head_dimension = fixture
+                            .config
+                            .kv_head_dimensions()
+                            .get(layer)
+                            .copied()
+                            .flatten()
+                            .map(|(key, value)| match role {
+                                KvRole::K => key,
+                                KvRole::V => value,
+                            });
+                        let compact = match head_dimension {
+                            Some(head) if precision != KvStorePrecision::F32 => {
+                                Some((head, precision.stored_bytes(capacity, width, head)))
+                            }
+                            _ => None,
+                        };
+                        let zeroed = if let Some((head, stored_bytes)) = compact {
+                            let stored_bytes = stored_bytes.ok_or_else(|| {
+                                InferenceApiError::KvCacheUnavailable {
+                                    reason: format!(
+                                        "layer {layer}: a {} store of {width}-wide rows cannot \
+                                         hold {head}-wide heads",
+                                        precision.as_str()
+                                    ),
+                                }
                             })?;
+                            dispatch_ctx
+                                .runtime
+                                .memory_mut()
+                                .admit_kernel_output_bytes(
+                                    store.clone(),
+                                    stored_bytes,
+                                    placement,
+                                    owner,
+                                    ResourceAffinity::new(FallbackClass::Transparent),
+                                )
+                                .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
+                                    reason: format!(
+                                        "cannot admit the {} KV store {store}: {error:?}",
+                                        precision.as_str()
+                                    ),
+                                })?;
+                            let created = dispatch_ctx
+                                .provider
+                                .write_zeroed_kv_store(&store, &[capacity, width], precision, head)
+                                .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                                    reason: error.to_string(),
+                                })?;
+                            if !created {
+                                return Err(InferenceApiError::KvCacheUnavailable {
+                                    reason: format!(
+                                        "layer {layer}: the Provider advertises TurboQuant KV \
+                                         stores but declined a {} store",
+                                        precision.as_str()
+                                    ),
+                                });
+                            }
+                            true
+                        } else {
+                            let target: OutputTarget = (store.clone(), placement, owner);
+                            let (store_id, _) = resolve_output_target(
+                                &mut dispatch_ctx,
+                                &format!("{node_id}.kv-store"),
+                                store_descriptor.clone(),
+                                Some(target),
+                            )?;
+                            // Zeroed where the store lives when the Provider
+                            // can, instead of building and uploading host
+                            // zeros: at prefill, one store per layer and role.
+                            dispatch_ctx
+                                .provider
+                                .write_zeroed_tensor(&store_id, &[capacity, width])
+                                .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                                    reason: error.to_string(),
+                                })?
+                        };
+                        let store_id = store.clone();
                         if !zeroed {
                             let zeros = HostTensor::new(
                                 [capacity, width],
@@ -1853,11 +1959,17 @@ pub(super) fn execute_first_native_graph_nodes(
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: format!("first-native graph produced no K state for layer {layer}"),
             })?;
-        let v = layer_v[layer]
-            .take()
-            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                reason: format!("first-native graph produced no V state for layer {layer}"),
-            })?;
+        // A latent history's rows hold the values too: its layer writes K
+        // only (`cache-latent-attention-history`).
+        let v = match layer_v[layer].take() {
+            Some(v) => v,
+            None if fixture.config.latent_attention.is_some() => k.clone(),
+            None => {
+                return Err(InferenceApiError::KvCacheUnavailable {
+                    reason: format!("first-native graph produced no V state for layer {layer}"),
+                });
+            }
+        };
         updated_layer_kv.insert(
             layer,
             FirstNativeLayerKvState {

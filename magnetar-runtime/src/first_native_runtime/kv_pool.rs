@@ -17,21 +17,119 @@ pub(crate) const DEFAULT_KV_POOL_BYTES: u64 = 1 << 30;
 /// The Memory Manager owner of pooled stores: they belong to no request.
 pub(crate) const KV_STORE_POOL_OWNER: &str = "kv-store-pool";
 
+/// The variable naming the KV storage precision of K and V
+/// (`turboquant-kv-history`): `f32` (the default), `tq4` or `tq3`.
+pub(crate) const KV_PRECISION_ENV: &str = "MAGNETAR_KV_PRECISION";
+/// Overrides [`KV_PRECISION_ENV`] for K.
+pub(crate) const KV_PRECISION_K_ENV: &str = "MAGNETAR_KV_PRECISION_K";
+/// Overrides [`KV_PRECISION_ENV`] for V.
+pub(crate) const KV_PRECISION_V_ENV: &str = "MAGNETAR_KV_PRECISION_V";
+
+/// The storage precision of the K and of the V stores
+/// (`turboquant-kv-history`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvPrecisions {
+    pub k: KvStorePrecision,
+    pub v: KvStorePrecision,
+}
+
+impl KvPrecisions {
+    /// Both roles in `precision`.
+    pub fn uniform(precision: KvStorePrecision) -> Self {
+        Self {
+            k: precision,
+            v: precision,
+        }
+    }
+
+    pub(super) fn for_role(&self, role: KvRole) -> KvStorePrecision {
+        match role {
+            KvRole::K => self.k,
+            KvRole::V => self.v,
+        }
+    }
+
+    /// From [`KV_PRECISION_ENV`], [`KV_PRECISION_K_ENV`] and
+    /// [`KV_PRECISION_V_ENV`]; an unknown value is an error.
+    pub(crate) fn from_env() -> Result<Self, String> {
+        let read = |name: &str| -> Result<Option<KvStorePrecision>, String> {
+            match std::env::var(name) {
+                Err(_) => Ok(None),
+                Ok(value) => KvStorePrecision::parse(&value).map(Some).ok_or_else(|| {
+                    format!("{name}='{value}' is not a KV precision (f32, tq4, tq3)")
+                }),
+            }
+        };
+        let both = read(KV_PRECISION_ENV)?.unwrap_or_default();
+        Ok(Self {
+            k: read(KV_PRECISION_K_ENV)?.unwrap_or(both),
+            v: read(KV_PRECISION_V_ENV)?.unwrap_or(both),
+        })
+    }
+}
+
+/// The bytes one token of KV history takes in `precisions`: the K and V
+/// rows of every layer that keeps its own, at the stored size of each
+/// layer's widths and head widths (`turboquant-kv-history`).
+pub(crate) fn kv_bytes_per_token(config: &FirstNativeModelConfig, precisions: KvPrecisions) -> u64 {
+    let stored = |precision: KvStorePrecision, width: u64, head: u64| {
+        precision
+            .stored_bytes(1, width, head)
+            .unwrap_or_else(|| width.saturating_mul(4))
+    };
+    config
+        .kv_row_widths()
+        .into_iter()
+        .zip(config.kv_value_row_widths())
+        .zip(config.kv_head_dimensions())
+        .filter_map(|((key, value), heads)| key.zip(value).zip(heads))
+        .fold(0u64, |bytes, ((key, value), (key_head, value_head))| {
+            bytes
+                .saturating_add(stored(precisions.k, key, key_head))
+                .saturating_add(stored(precisions.v, value, value_head))
+        })
+}
+
+/// The precisions a loaded model's stores use, and why a requested one was
+/// not used.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KvPrecisionResolution {
+    pub requested: KvPrecisions,
+    pub resolved: KvPrecisions,
+    pub fallbacks: Vec<String>,
+}
+
 /// How a graph execution keeps its KV history in place
-/// (`append-kv-history-in-place`): each store's rows, and the pooled store
-/// set its stores belong to, if any.
+/// (`append-kv-history-in-place`): each store's rows, the pooled store
+/// set its stores belong to, if any, and the precision new stores are
+/// created in (`turboquant-kv-history`).
+/// How a history's KV layout metadata and compatibility name its
+/// precisions (`turboquant-kv-history`): `None` for f32 stores, so f32
+/// histories keep the compatibility they always had.
+pub(crate) fn kv_quantization_mode(precisions: KvPrecisions) -> Option<String> {
+    (precisions != KvPrecisions::default()).then(|| {
+        format!(
+            "turboquant-kv:k={},v={}",
+            precisions.k.as_str(),
+            precisions.v.as_str()
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KvStoreSpec {
     pub(crate) capacity: u64,
     pub(crate) pool_set: Option<u64>,
+    pub(crate) precisions: KvPrecisions,
 }
 
 impl KvStoreSpec {
-    /// Stores of `capacity` rows owned by the request.
+    /// f32 stores of `capacity` rows owned by the request.
     pub(crate) fn owned(capacity: u64) -> Self {
         Self {
             capacity,
             pool_set: None,
+            precisions: KvPrecisions::default(),
         }
     }
 }
@@ -57,6 +155,9 @@ pub(crate) fn is_pooled_kv_store(id: &TensorResourceId) -> bool {
 pub(crate) struct PooledKvSet {
     pub(crate) id: u64,
     pub(crate) capacity: u64,
+    /// The precisions its stores were created in (`turboquant-kv-history`);
+    /// a set only serves requests whose stores use the same.
+    pub(crate) precisions: KvPrecisions,
     pub(crate) bytes: u64,
     last_used: u64,
 }
@@ -72,6 +173,11 @@ pub(crate) struct KvStorePoolState {
     in_use: BTreeMap<String, PooledKvSet>,
     /// The Provider every set's stores live in.
     provider: Option<ProviderBinding>,
+    /// The precisions asked for (`turboquant-kv-history`), or why the
+    /// request could not be read.
+    requested_precisions: Result<KvPrecisions, String>,
+    /// The precisions in use once resolved against the Provider.
+    resolution: Option<KvPrecisionResolution>,
 }
 
 /// The pool of one loaded model's stores, shared by its engine and its
@@ -87,11 +193,14 @@ impl Default for KvStorePool {
             .ok()
             .and_then(|bytes| bytes.trim().parse().ok())
             .unwrap_or(DEFAULT_KV_POOL_BYTES);
-        Self::with_max_bytes(max_bytes)
+        let pool = Self::with_max_bytes(max_bytes);
+        pool.0.lock().unwrap().requested_precisions = KvPrecisions::from_env();
+        pool
     }
 }
 
 impl KvStorePool {
+    /// A pool of at most `max_bytes`, whose stores are f32.
     pub(crate) fn with_max_bytes(max_bytes: u64) -> Self {
         Self(Arc::new(Mutex::new(KvStorePoolState {
             max_bytes,
@@ -100,7 +209,56 @@ impl KvStorePool {
             free: Vec::new(),
             in_use: BTreeMap::new(),
             provider: None,
+            requested_precisions: Ok(KvPrecisions::default()),
+            resolution: None,
         })))
+    }
+
+    /// Asks for `precisions` (`turboquant-kv-history`) instead of what the
+    /// environment names. Takes effect before the first resolution.
+    pub(crate) fn request_precisions(&self, precisions: KvPrecisions) {
+        let mut state = self.0.lock().unwrap();
+        state.requested_precisions = Ok(precisions);
+        state.resolution = None;
+    }
+
+    /// The precisions in use, resolved once by `resolve` from the
+    /// requested ones; an unreadable request resolves to f32 with its
+    /// reason. One loaded model keeps one resolution, so its pooled sets
+    /// all share their precisions.
+    pub(crate) fn resolve_precisions(
+        &self,
+        resolve: impl FnOnce(KvPrecisions) -> (KvPrecisions, Vec<String>),
+    ) -> KvPrecisions {
+        let mut state = self.0.lock().unwrap();
+        if let Some(resolution) = &state.resolution {
+            return resolution.resolved;
+        }
+        let resolution = match state.requested_precisions.clone() {
+            Ok(requested) => {
+                let (resolved, fallbacks) = resolve(requested);
+                KvPrecisionResolution {
+                    requested,
+                    resolved,
+                    fallbacks,
+                }
+            }
+            Err(reason) => KvPrecisionResolution {
+                fallbacks: vec![reason],
+                ..KvPrecisionResolution::default()
+            },
+        };
+        for fallback in &resolution.fallbacks {
+            eprintln!("[kv precision] {fallback}");
+        }
+        let resolved = resolution.resolved;
+        state.resolution = Some(resolution);
+        resolved
+    }
+
+    /// The resolution, once a prefill made one.
+    pub(crate) fn precision_resolution(&self) -> Option<KvPrecisionResolution> {
+        self.0.lock().unwrap().resolution.clone()
     }
 
     /// A store set of `capacity` rows (`bytes` in all) for the request
@@ -112,6 +270,7 @@ impl KvStorePool {
         &self,
         key: &str,
         capacity: u64,
+        precisions: KvPrecisions,
         bytes: u64,
         provider: ProviderBinding,
     ) -> (Option<u64>, Vec<PooledKvSet>) {
@@ -129,7 +288,7 @@ impl KvStorePool {
         let tick = state.tick;
         let mut dropped = Vec::new();
         if let Some(current) = state.in_use.remove(key) {
-            if current.capacity == capacity {
+            if current.capacity == capacity && current.precisions == precisions {
                 let id = current.id;
                 state.in_use.insert(
                     key.into(),
@@ -147,7 +306,7 @@ impl KvStorePool {
             .free
             .iter()
             .enumerate()
-            .filter(|(_, set)| set.capacity == capacity)
+            .filter(|(_, set)| set.capacity == capacity && set.precisions == precisions)
             .max_by_key(|(_, set)| set.last_used)
             .map(|(index, _)| index);
         let set = match reused {
@@ -167,6 +326,7 @@ impl KvStorePool {
                 PooledKvSet {
                     id: state.next_set,
                     capacity,
+                    precisions,
                     bytes,
                     last_used: tick,
                 }
@@ -184,17 +344,15 @@ impl KvStorePool {
         (Some(id), dropped)
     }
 
-    /// The set the request keyed `key` uses: its id and capacity.
+    /// The set the request keyed `key` uses: its id, capacity and
+    /// precisions.
     pub(crate) fn current(&self, key: &str) -> Option<KvStoreSpec> {
-        self.0
-            .lock()
-            .unwrap()
-            .in_use
-            .get(key)
-            .map(|set| KvStoreSpec {
-                capacity: set.capacity,
-                pool_set: Some(set.id),
-            })
+        let state = self.0.lock().unwrap();
+        state.in_use.get(key).map(|set| KvStoreSpec {
+            capacity: set.capacity,
+            pool_set: Some(set.id),
+            precisions: set.precisions,
+        })
     }
 
     /// Returns the request's set to the pool, then drops sets beyond the
@@ -220,6 +378,17 @@ impl KvStorePool {
     /// Bytes held by every set, free or in use.
     pub(crate) fn held_bytes(&self) -> u64 {
         self.0.lock().unwrap().held_bytes()
+    }
+
+    /// Resolves the precisions to `resolved`, as a prefill whose stores
+    /// support them would (tests).
+    #[cfg(test)]
+    pub(crate) fn resolve_precisions_to(&self, resolved: KvPrecisions) {
+        self.0.lock().unwrap().resolution = Some(KvPrecisionResolution {
+            requested: resolved,
+            resolved,
+            fallbacks: Vec::new(),
+        });
     }
 
     /// How many sets are free (tests).

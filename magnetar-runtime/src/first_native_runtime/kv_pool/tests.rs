@@ -20,24 +20,29 @@ fn capacity_buckets_are_powers_of_two_from_the_minimum() {
 #[test]
 fn a_released_set_serves_the_next_request_of_its_capacity() {
     let pool = KvStorePool::with_max_bytes(1 << 20);
-    let (a, dropped) = pool.acquire("a", 256, 100, provider());
+    let (a, dropped) = pool.acquire("a", 256, KvPrecisions::default(), 100, provider());
     assert!(dropped.is_empty());
-    let (b, _) = pool.acquire("b", 256, 100, provider());
+    let (b, _) = pool.acquire("b", 256, KvPrecisions::default(), 100, provider());
     assert_ne!(a, b, "live requests never share a set");
     assert!(pool.release("a").is_empty());
-    let (c, _) = pool.acquire("c", 256, 100, provider());
+    let (c, _) = pool.acquire("c", 256, KvPrecisions::default(), 100, provider());
     assert_eq!(c, a);
     // Another capacity takes a new set.
-    let (d, _) = pool.acquire("d", 512, 200, provider());
+    let (d, _) = pool.acquire("d", 512, KvPrecisions::default(), 200, provider());
     assert!(d.is_some() && d != a && d != b);
     assert_eq!(pool.held_bytes(), 400);
     // A key's own set is kept across its prefills.
-    assert_eq!(pool.acquire("c", 256, 100, provider()).0, c);
+    assert_eq!(
+        pool.acquire("c", 256, KvPrecisions::default(), 100, provider())
+            .0,
+        c
+    );
     assert_eq!(
         pool.current("c"),
         Some(KvStoreSpec {
             capacity: 256,
             pool_set: c,
+            precisions: KvPrecisions::default(),
         })
     );
 }
@@ -48,7 +53,11 @@ fn the_pool_keeps_at_most_four_sets_per_capacity_bucket() {
     let keys: Vec<String> = (0..6).map(|key| key.to_string()).collect();
     let sets: Vec<u64> = keys
         .iter()
-        .map(|key| pool.acquire(key, 256, 10, provider()).0.unwrap())
+        .map(|key| {
+            pool.acquire(key, 256, KvPrecisions::default(), 10, provider())
+                .0
+                .unwrap()
+        })
         .collect();
     // Six live requests hold six sets; freeing them keeps four.
     let mut dropped = Vec::new();
@@ -66,12 +75,12 @@ fn the_pool_keeps_at_most_four_sets_per_capacity_bucket() {
 #[test]
 fn the_pool_stays_within_its_bytes() {
     let pool = KvStorePool::with_max_bytes(250);
-    let (a, _) = pool.acquire("a", 256, 100, provider());
-    let (b, _) = pool.acquire("b", 512, 100, provider());
+    let (a, _) = pool.acquire("a", 256, KvPrecisions::default(), 100, provider());
+    let (b, _) = pool.acquire("b", 512, KvPrecisions::default(), 100, provider());
     pool.release("a");
     pool.release("b");
     // A third set needs room: the least recently used free one goes.
-    let (c, dropped) = pool.acquire("c", 1024, 100, provider());
+    let (c, dropped) = pool.acquire("c", 1024, KvPrecisions::default(), 100, provider());
     assert!(c.is_some());
     assert_eq!(
         dropped.iter().map(|set| set.id).collect::<Vec<_>>(),
@@ -79,7 +88,11 @@ fn the_pool_stays_within_its_bytes() {
     );
     assert_eq!(pool.held_bytes(), 200);
     // Larger than the whole pool: never pooled.
-    assert_eq!(pool.acquire("d", 2048, 300, provider()).0, None);
+    assert_eq!(
+        pool.acquire("d", 2048, KvPrecisions::default(), 300, provider())
+            .0,
+        None
+    );
     // Only free sets are drained.
     let drained = pool.drain_free();
     assert_eq!(
@@ -92,9 +105,20 @@ fn the_pool_stays_within_its_bytes() {
 #[test]
 fn a_set_never_moves_to_another_provider() {
     let pool = KvStorePool::with_max_bytes(1 << 20);
-    assert!(pool.acquire("a", 256, 10, provider()).0.is_some());
+    assert!(
+        pool.acquire("a", 256, KvPrecisions::default(), 10, provider())
+            .0
+            .is_some()
+    );
     assert_eq!(
-        pool.acquire("b", 256, 10, ProviderBinding::new("other")).0,
+        pool.acquire(
+            "b",
+            256,
+            KvPrecisions::default(),
+            10,
+            ProviderBinding::new("other")
+        )
+        .0,
         None
     );
 }
@@ -356,4 +380,44 @@ fn a_refused_admission_reclaims_the_pool_s_free_sets() {
     assert!(pool.current("c").is_some());
     let refused = attempt(high, false).expect_err("without reclaim the budget is too small");
     assert!(refused.contains("MemoryAdmissionFailed"), "{refused}");
+}
+
+/// A set serves only requests whose stores use the precisions it was
+/// created in (`turboquant-kv-history`), and reports them.
+#[test]
+fn a_set_serves_only_requests_in_its_precisions() {
+    let tq4 = KvPrecisions::uniform(KvStorePrecision::Tq4);
+    let pool = KvStorePool::with_max_bytes(1 << 20);
+    let (a, _) = pool.acquire("a", 256, tq4, 30, provider());
+    assert_eq!(pool.current("a").map(|spec| spec.precisions), Some(tq4));
+    // The same key in other precisions takes another set.
+    let (b, _) = pool.acquire("a", 256, KvPrecisions::default(), 100, provider());
+    assert!(b.is_some() && b != a);
+    assert!(pool.release("a").is_empty());
+    // A free set is not reused in other precisions...
+    let (c, _) = pool.acquire(
+        "c",
+        256,
+        KvPrecisions::uniform(KvStorePrecision::Tq3),
+        25,
+        provider(),
+    );
+    assert!(c.is_some() && c != a && c != b);
+    // ...but is in its own.
+    assert_eq!(pool.acquire("d", 256, tq4, 30, provider()).0, a);
+}
+
+/// f32 histories keep the compatibility they always had; TurboQuant ones
+/// name both precisions.
+#[test]
+fn kv_quantization_modes_name_turboquant_precisions_only() {
+    assert_eq!(kv_quantization_mode(KvPrecisions::default()), None);
+    assert_eq!(
+        kv_quantization_mode(KvPrecisions {
+            k: KvStorePrecision::Tq4,
+            v: KvStorePrecision::Tq3,
+        })
+        .as_deref(),
+        Some("turboquant-kv:k=tq4,v=tq3")
+    );
 }

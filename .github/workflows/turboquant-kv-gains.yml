@@ -1,0 +1,149 @@
+name: TurboQuant KV gains
+
+# Measures what TurboQuant KV stores (`turboquant-kv-history`) gain on the
+# arc-gpu-magnetar runner (RTX 3060, 12 GB), checkpoint by checkpoint.
+# For f32, tq4 and tq3 stores and every requested context length, the
+# `turboquant_kv_gains_on_cuda` test reports:
+# - the KV bytes per token, and how many tokens of KV history the VRAM left
+#   free after loading holds;
+# - whether the context ran;
+# - warm TTFT and TPOT, and TPOT against f32;
+# - against f32: the leading generated tokens that agree, the first token,
+#   and the largest difference of the first step's logits.
+# Each checkpoint's table goes to the run summary and to the uploaded
+# reports. Dispatch only: it downloads several GB and takes a while.
+on:
+  workflow_dispatch:
+    inputs:
+      checkpoints:
+        description: >-
+          Comma-separated checkpoints: qwen2.5-0.5b-q8_0, gemma-4-e2b-qat-q4_0,
+          mistral-7b-q4_k_m.
+        required: false
+        default: qwen2.5-0.5b-q8_0,gemma-4-e2b-qat-q4_0,mistral-7b-q4_k_m
+      contexts:
+        description: Comma-separated prompt lengths in tokens.
+        required: false
+        default: 512,4096,16384,32768
+      precisions:
+        description: Comma-separated KV precisions, f32 first.
+        required: false
+        default: f32,tq4,tq3
+      new_tokens:
+        description: Greedy tokens generated after each prompt.
+        required: false
+        default: "64"
+
+# One GPU runner: never alongside the smoke tests.
+concurrency:
+  group: gpu-runner-smoke
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gains:
+    name: gpu / turboquant kv gains
+    runs-on: arc-gpu-magnetar
+    container:
+      image: nvidia/cuda:13.5.0-cudnn-devel-ubuntu24.04
+      options: --gpus all
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends git curl build-essential ca-certificates
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout the submodules the test builds
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf
+      - name: Verify GPU is visible
+        run: |
+          set -eux
+          nvidia-smi
+          df -h "$RUNNER_TEMP"
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Build the gains test
+        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml --no-run
+      - name: Measure TurboQuant KV gains
+        timeout-minutes: 180
+        env:
+          CHECKPOINTS: ${{ inputs.checkpoints }}
+          MAGNETAR_KV_GAINS_CONTEXTS: ${{ inputs.contexts }}
+          MAGNETAR_KV_GAINS_PRECISIONS: ${{ inputs.precisions }}
+          MAGNETAR_KV_GAINS_NEW_TOKENS: ${{ inputs.new_tokens }}
+          MAGNETAR_REQUIRE_CUDA: "1"
+          # No pooled KV sets: each context's stores are freed after it, so
+          # one context's stores never count against the next.
+          MAGNETAR_KV_POOL_BYTES: "0"
+        shell: bash
+        run: |
+          set -uo pipefail
+          reports="$RUNNER_TEMP/qualification-reports/turboquant-kv-gains"
+          mkdir -p "$reports"
+          status=0
+          # label -> repository revision file sha256 (pinned; the sha256 is
+          # each file's at that revision, as Hugging Face declares it).
+          pinned() {
+            case "$1" in
+              qwen2.5-0.5b-q8_0) echo "Qwen/Qwen2.5-0.5B-Instruct-GGUF 9217f5db79a29953eb74d5343926648285ec7e67 qwen2.5-0.5b-instruct-q8_0.gguf ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e" ;;
+              gemma-4-e2b-qat-q4_0) echo "google/gemma-4-E2B-it-qat-q4_0-gguf 675cff42a74c774d6cb76f76d8eacb49b48c9b93 gemma-4-E2B_q4_0-it.gguf fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634" ;;
+              mistral-7b-q4_k_m) echo "bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6" ;;
+              *) return 1 ;;
+            esac
+          }
+          for label in $(echo "$CHECKPOINTS" | tr ',' ' '); do
+            if ! spec=$(pinned "$label"); then
+              echo "::error::unknown checkpoint $label"
+              status=1
+              continue
+            fi
+            read -r repository revision file sha256 <<< "$spec"
+            dir="$RUNNER_TEMP/kv-gains-$label"
+            mkdir -p "$dir"
+            if ! curl -fsSL "https://huggingface.co/$repository/resolve/$revision/$file" -o "$dir/model.gguf"; then
+              echo "::error::$label: download failed"
+              status=1
+              continue
+            fi
+            actual=$(sha256sum "$dir/model.gguf" | cut -d' ' -f1)
+            if [ "$actual" != "$sha256" ]; then
+              echo "::error::$label: sha256 $actual, expected $sha256"
+              status=1
+              rm -rf "$dir"
+              continue
+            fi
+            MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$dir" \
+            MAGNETAR_KV_GAINS_LABEL="$label" \
+            MAGNETAR_KV_GAINS_REPORT="$reports/$label.md" \
+              cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$reports/$label.log" || { echo "::error::$label: the gains test failed"; status=1; }
+            rm -rf "$dir"
+          done
+          exit "$status"
+      - name: Summarize the gains reports
+        # The reports the gains test rewrites after each precision, also
+        # when the step above ran out of time.
+        if: always()
+        shell: bash
+        run: |
+          for report in "$RUNNER_TEMP"/qualification-reports/turboquant-kv-gains/*.md; do
+            [ -f "$report" ] || continue
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload the gains reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: turboquant-kv-gains-${{ github.run_id }}
+          path: ${{ runner.temp }}/qualification-reports
+          if-no-files-found: warn
+          retention-days: 90

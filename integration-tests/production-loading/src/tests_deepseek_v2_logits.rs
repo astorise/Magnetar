@@ -159,3 +159,104 @@ fn the_tiny_deepseek_v2_checkpoints_match_transformers_on_the_cpu_providers() {
         }
     }
 }
+
+/// TurboQuant on the latent history (`turboquant-kv-history`,
+/// `cache-latent-attention-history`) on the Reference CPU: the GGUF
+/// checkpoints' latent rows (from the `wide` bundle) take `tq4` and `tq3`
+/// in groups of gcd(kv_lora_rank, qk_rope_head_dim), and the logits move
+/// from the f32 history's by the stores' rounding; the Hugging Face ones'
+/// groups of 4 values are too narrow, and they keep f32 with the reason
+/// recorded.
+#[test]
+fn the_tiny_deepseek_v2_checkpoints_run_with_a_turboquant_latent_history() {
+    use crate::logit_comparison::kv_precision_drift;
+    use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        let requested = KvPrecisions::uniform(precision);
+        for (variant, format, family) in VARIANTS {
+            let drift = kv_precision_drift(
+                &|| std::sync::Arc::new(ReferenceCpuProvider::new()),
+                "deepseek_v2",
+                variant,
+                format,
+                family,
+                requested,
+            );
+            if matches!(format, Format::Gguf) {
+                assert_eq!(
+                    drift.resolution.resolved, requested,
+                    "{variant}: {:?}",
+                    drift.resolution.fallbacks
+                );
+                assert!(
+                    drift.max_abs_difference > 0.0 && drift.max_abs_difference.is_finite(),
+                    "{variant} {precision:?}: {}",
+                    drift.max_abs_difference
+                );
+            } else {
+                assert_eq!(
+                    drift.resolution.resolved,
+                    KvPrecisions::default(),
+                    "{variant}"
+                );
+                assert!(
+                    drift
+                        .resolution
+                        .fallbacks
+                        .iter()
+                        .all(|reason| reason.contains("4 wide")),
+                    "{variant}: {:?}",
+                    drift.resolution.fallbacks
+                );
+                assert_eq!(drift.max_abs_difference, 0.0, "{variant}");
+            }
+            eprintln!(
+                "{} {variant}: max |logit difference| {:.3e} against f32 stores, \
+                 {}/{} leading tokens agree",
+                precision.as_str(),
+                drift.max_abs_difference,
+                drift.agreeing_tokens,
+                drift.steps
+            );
+        }
+    }
+}
+
+/// The CPU Providers of `providers/cpu` hold a TurboQuant latent history
+/// as the Runtime's Reference CPU does: with `tq4`, the GGUF checkpoints
+/// generate the same tokens with logits within 1e-3 of the Reference
+/// CPU's.
+#[test]
+fn the_cpu_providers_hold_a_turboquant_latent_history_like_the_reference_cpu() {
+    use crate::logit_comparison::generate_logits;
+    use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
+    let tq4 = KvPrecisions::uniform(KvStorePrecision::Tq4);
+    for (variant, format, family) in VARIANTS {
+        if !matches!(format, Format::Gguf) {
+            continue;
+        }
+        let (reference_steps, reference_tokens, _) = generate_logits(
+            std::sync::Arc::new(ReferenceCpuProvider::new()),
+            "deepseek_v2",
+            variant,
+            format,
+            family,
+            tq4,
+        );
+        for (provider, label) in cpu_providers() {
+            let (steps, tokens, resolution) =
+                generate_logits(provider, "deepseek_v2", variant, format, family, tq4);
+            assert_eq!(resolution.resolved, tq4, "{label} {variant}");
+            assert_eq!(tokens, reference_tokens, "{label} {variant}");
+            let difference = reference_steps
+                .iter()
+                .zip(&steps)
+                .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+                .fold(0.0_f32, f32::max);
+            assert!(difference < 1e-3, "{label} {variant}: {difference}");
+            eprintln!(
+                "{label} {variant} tq4: max |logit difference| {difference:.3e} against the Reference CPU"
+            );
+        }
+    }
+}
