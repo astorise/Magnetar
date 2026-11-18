@@ -4,7 +4,8 @@
 //! `DeepseekV2ForCausalLM` in float32, on tiny random checkpoints
 //! (`fixtures/deepseek_v2/`, see its README for how they were made). Each
 //! has a dense first layer, then routed experts beside two ungated shared
-//! experts, and multi-head latent attention in its expanded form.
+//! experts, and multi-head latent attention over a latent history: expanded
+//! in the prefill, absorbed in the decode steps.
 //!
 //! The `gguf-*` checkpoints are quantized `deepseek2` GGUF files, compared
 //! with `transformers` run on their dequantized weights: they test the GGUF
@@ -95,12 +96,13 @@ fn the_tiny_deepseek_v2_checkpoints_match_transformers_with_resident_values() {
     }
 }
 
-/// A latent-attention prefill attends over the expanded keys and values of
-/// its own rows while its history holds the latent rows, so a later pass
-/// could not read the earlier ones: the model runs every prompt in one pass
-/// (`chunk-long-prefills`), and the logits still match the references.
+/// A latent-attention prefill attends over the latent history's rows, each
+/// head's keys and values expanded from them (`latent_kv_width`,
+/// `chunk-latent-prefills`), so a long prompt runs in passes of the chunk
+/// length that read the earlier passes' rows (`chunk-long-prefills`), and
+/// the logits still match the references.
 #[test]
-fn a_latent_attention_prefill_runs_in_one_pass() {
+fn a_latent_attention_prefill_runs_in_passes() {
     for (variant, format, family) in VARIANTS {
         let (difference, chunk) = crate::logit_comparison::compare_chunked_on(
             std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
@@ -111,8 +113,8 @@ fn a_latent_attention_prefill_runs_in_one_pass() {
             family,
             4,
         );
-        assert_eq!(chunk, 0, "{variant}: the prefill was chunked");
-        eprintln!("{variant}, chunking declined: max |logit difference| {difference:.3e}");
+        assert_eq!(chunk, 4, "{variant}: the prefill was not chunked");
+        eprintln!("{variant}, passes of 4 rows: max |logit difference| {difference:.3e}");
     }
 }
 

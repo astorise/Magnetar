@@ -9,7 +9,7 @@
 - [x] 2.1 Unit: chunk parsing, passes, stored rows, `prefill_continues_history` (a detached V fails it).
 - [x] 2.2 Production on the Reference CPU (`a_production_model_prefills_long_prompts_in_chunks_of_one_graph`): chunks of 4 give the one-pass tokens and first logits (within 1e-5), every long prompt runs the chunk's graph, a prompt of exactly the chunk's length is unpooled.
 - [x] 2.3 Tiny Gemma 4 checkpoints (sliding and full layers, shared KV, per-layer inputs, experts) prefilled in chunks of 3 match `transformers` within 1e-3 on the Reference CPU and both CPU Providers (largest difference 1.1e-4); on CUDA too, largest difference 5.2e-5 (run 44251614646).
-- [x] 2.4 Tiny DeepSeek-V2 checkpoints (latent attention) decline chunking and still match `transformers`.
+- [x] 2.4 Tiny DeepSeek-V2 checkpoints (latent attention) decline chunking and still match `transformers`. Since `chunk-latent-prefills`, their prefill attends over the latent history and runs in chunks.
 
 ## 3. GPU qualification
 

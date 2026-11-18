@@ -1463,6 +1463,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         .id
         .features
         .insert(crate::operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE.to_string());
+    // Honours `latent_kv_width` (`chunk-latent-prefills`).
+    attention
+        .id
+        .features
+        .insert(crate::operator::ATTENTION_LATENT_KV_FEATURE.to_string());
     // Reads TurboQuant stores: they hold f32 values (`turboquant-kv-history`).
     attention
         .id
@@ -2876,6 +2881,32 @@ impl ReferenceCpuExecutor {
                         leading_rows(&k, key_count).map_err(KernelError::from)?,
                         leading_rows(&v, key_count).map_err(KernelError::from)?,
                     ),
+                };
+                // `chunk-latent-prefills`: K and V are latent rows, each
+                // head's keys and values expanded by the fourth and fifth
+                // inputs.
+                let (k, v) = match invocation.attributes.get("latent_kv_width") {
+                    None => (k, v),
+                    Some(OperatorAttributeValue::Integer(width)) if *width > 0 => {
+                        let w_k = self.input_tensor(invocation, 3)?;
+                        let w_v = self.input_tensor(invocation, 4)?;
+                        (
+                            crate::operator_semantics::latent_keys(
+                                &k,
+                                &w_k,
+                                *width as u64,
+                                head_count,
+                            )
+                            .map_err(KernelError::from)?,
+                            crate::operator_semantics::latent_values(&v, &w_v, *width as u64)
+                                .map_err(KernelError::from)?,
+                        )
+                    }
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "latent_kv_width must be a positive integer".into(),
+                        });
+                    }
                 };
                 // `express-latent-attention-forms`: V rows and the output
                 // may be narrower or wider than Q/K rows.

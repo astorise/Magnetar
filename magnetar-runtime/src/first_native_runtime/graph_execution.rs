@@ -581,25 +581,31 @@ pub(super) fn dispatch_first_native_graph_node(
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "attention" => {
-            if inputs.len() != 3 {
+            // Five inputs: latent K and V and their key and value
+            // projections (`latent_kv_width`, `chunk-latent-prefills`).
+            if inputs.len() != 3 && inputs.len() != 5 {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 3 attention inputs"),
+                    reason: format!("graph node '{node_id}' expects 3 or 5 attention inputs"),
                 });
             }
             let q = inputs.remove(0);
             let k = inputs.remove(0);
             let v = inputs.remove(0);
+            let latent_weights = (inputs.len() == 2).then(|| {
+                let w_k = inputs.remove(0);
+                let w_v = inputs.remove(0);
+                [w_k, w_v]
+            });
             let key_count = node
                 .inputs
                 .get(1)
                 .and_then(|edge| ctx.bounded_kv_edges.get(edge))
                 .copied();
-            dispatch_qwen_attention(
+            super::dispatch::dispatch_attention_with_latent_weights(
                 ctx,
                 node_id,
-                q,
-                k,
-                v,
+                [q, k, v],
+                latent_weights,
                 architecture,
                 &node.attributes,
                 Some(output_target),
