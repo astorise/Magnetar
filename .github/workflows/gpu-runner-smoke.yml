@@ -1855,6 +1855,31 @@ jobs:
             echo "::error::DeepSeek-V2-Lite-Chat Q8_0 tq4: the continuation no longer starts with 'Paris'"
             exit 1
           }
+      - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF latent decode at long contexts
+        # cache-latent-attention-history task 6.7: the gains test across both
+        # GPUs, the latent history f32, tq4 with its default exact head and
+        # tq4 without, at 1,024 to 16,384 tokens: TPOT and the agreement
+        # with f32 of the absorbed decode on the history (grouped f32 heads,
+        # tq4 on its codes). Diagnostic: the report is in the summary.
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4,tq4@0"
+          MAGNETAR_KV_GAINS_CONTEXTS: "1024,4096,16384"
+          MAGNETAR_KV_GAINS_LABEL: deepseek-v2-lite-chat-q8_0
+        shell: bash
+        run: |
+          set -o pipefail
+          report="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-gguf"
+          mkdir -p "$report"
+          MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR" \
+          MAGNETAR_KV_GAINS_REPORT="$report/gains.md" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains.log"
+          cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
       - name: GPU peer-to-peer readiness, again (diagnostic)
         # The readiness printed at the start, repeated where the job's log
         # tail keeps it.
