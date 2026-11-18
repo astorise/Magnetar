@@ -132,3 +132,22 @@ tokens and from 6.57 to 6.16 ms at 16,384 (run 44302848278 against
 44289082020). Mistral 7B's (128-wide heads, 4 per KV head, already at
 194 GB/s) does not move. Shared-memory loads per multiply-add bound part
 of the 64-wide case only; they are not the whole bound.
+
+Run 44312374879 (providers/cuda de9dffc) tiles the grouped code Kernel,
+the default: weights key-major and read as float4s (four heads per
+load), rotated queries read as float4s, and 64-wide value heads spread
+over every thread (four heads per thread); results bit-identical, every
+conformance test passing. One decode step's attention:
+
+| us | 4,096 keys | 16,384 | 32,768 |
+|---|---|---|---|
+| Qwen2.5-0.5B `tq4`, before / tiled | 41.5 / 32.5 | 137.6 / 107.3 | 235.7 / 183.6 |
+| Qwen2.5-0.5B `tq3`, before / tiled | 41.5 / 33.6 | 106.0 / 89.8 | 229.9 / 180.3 |
+| Mistral 7B `tq4`, before / tiled | 154.7 / 108.1 | 512.0 / 357.6 | 987.3 / 666.4 |
+| Mistral 7B `tq3`, before / tiled | 170.4 / 126.8 | 563.7 / 417.1 | 1,127.8 / 802.2 |
+| f32 (tiled), Qwen2.5-0.5B / Mistral 7B | 39.7 / 185.2 | 120.2 / 686.0 | 224.0 / 1,386.2 |
+
+The code Kernel is 22% faster for Qwen2.5-0.5B and 29% to 33% for
+Mistral 7B; it now takes 0.82x and 0.48x f32's time at 32,768 keys. It
+still reads 26 and 54 GB/s of the bytes it must, against 150 and
+194 GB/s for f32: the next bound to find.
