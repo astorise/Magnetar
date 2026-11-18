@@ -151,3 +151,30 @@ The code Kernel is 22% faster for Qwen2.5-0.5B and 29% to 33% for
 Mistral 7B; it now takes 0.82x and 0.48x f32's time at 32,768 keys. It
 still reads 26 and 54 GB/s of the bytes it must, against 150 and
 194 GB/s for f32: the next bound to find.
+
+TPOT with both tiled Kernels (run 44314151729) against the f32-tiled run
+before the code Kernel's tiling (44302848278); greedy decoding of 64
+tokens on one RTX 3060:
+
+| TPOT, ms | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|
+| Mistral 7B f32 | 23.27 | 41.01 | does not fit |
+| Mistral 7B `tq4` (head), before / tiled | 23.11 / 22.02 | 35.51 / 29.99 | 51.85 / 41.26 |
+| Mistral 7B `tq4` (no head), before / tiled | 22.37 / 20.82 | 34.66 / 29.46 | 50.92 / 40.70 |
+| Mistral 7B `tq3` (head), before / tiled | 23.53 / 22.66 | 37.62 / 32.50 | 56.04 / 45.88 |
+| Qwen2.5-0.5B f32 | 4.24 | 6.15 | 8.68 |
+| Qwen2.5-0.5B `tq4` (head), before / tiled | 4.74 / 4.74 | 6.74 / 6.01 | 9.00 / 7.89 |
+| Qwen2.5-0.5B `tq4` (no head), before / tiled | 4.64 / 4.38 | 6.62 / 5.95 | 8.99 / 7.80 |
+| Qwen2.5-0.5B `tq3` (head), before / tiled | 4.76 / 4.66 | 6.55 / 6.04 | 9.15 / 8.02 |
+
+Mistral 7B now decodes 1.37x faster than f32 at 16,384 tokens in `tq4`
+(1.26x in `tq3`), and 20% faster than before at 32,768; Qwen2.5-0.5B
+1.10x faster than f32 at 32,768 tokens. The generated tokens and the
+first step's logits are those of the run before (the Kernels' sums are
+unchanged), "Paris" answers are unchanged, chunked prefills stay
+bit-identical.
+
+Past the head, the head still costs up to 8% at 4,096 tokens (Qwen2.5-
+0.5B 4.74 against 4.38 ms; Mistral 7B 22.02 against 20.82) and about 1%
+at 32,768: its chunks score each exact key with one thread reading the
+key's f32 row and the unrotated queries from global memory.

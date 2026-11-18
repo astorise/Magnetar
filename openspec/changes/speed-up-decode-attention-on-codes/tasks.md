@@ -13,4 +13,5 @@
 
 - [x] 3.1 The f32 grouped decode Kernel with several multiply-adds per shared load (decision 5); conformance; `decode_attention_times` (run 44302848278): 11-12% faster for 64-wide heads (f32 TPOT -6% to -7% at 16,384 and 32,768 tokens on Qwen2.5-0.5B), unchanged for 128-wide.
 - [x] 3.2 The same on the grouped code Kernel (providers/cuda de9dffc): 22% faster for Qwen2.5-0.5B, 29-33% for Mistral 7B, at 4,096 to 32,768 keys (run 44312374879).
-- [ ] 3.3 TPOT at 512 to 32,768 tokens with both tiled Kernels (Qwen2.5-0.5B, Mistral 7B).
+- [x] 3.3 TPOT at 512 to 32,768 tokens with both tiled Kernels (run 44314151729): Mistral 7B `tq4` 1.37x f32 at 16,384 tokens, 20% faster than before at 32,768; Qwen2.5-0.5B `tq4` 1.10x f32 at 32,768; outputs unchanged.
+- [ ] 3.4 The exact head's chunks in the code Kernel: up to 8% of TPOT at 4,096 tokens.
