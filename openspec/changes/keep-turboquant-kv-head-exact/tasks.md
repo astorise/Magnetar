@@ -10,8 +10,8 @@
 
 ## 3. CUDA
 
-- [ ] 3.1 The head buffer, `tq_exact_write_kernel`.
-- [ ] 3.2 Decode by regime with the capture bound; `tq_head_partials_kernel`; the scratch reads the head.
+- [ ] 3.1 The head buffer; `tq_kv_write_kernel` copies the head's rows into it.
+- [ ] 3.2 Decode by regime with the capture bound; past the heads, the code split Kernels read the heads' keys (design decision 4); prefill on the heads or through a scratch that reads them.
 - [ ] 3.3 Conformance against the CPU semantics: histories shorter and longer than `E`, grouped and per-head decode, captured steps crossing `E`.
 
 ## 4. Qualification

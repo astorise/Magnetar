@@ -33,27 +33,37 @@ entirely in the head: they apply only to rows from `E` on.
 
 ### 3. CUDA storage and writes
 
-`CudaTqStore` gains `exact: [E][width]` f32. `kv-write` copies the rows
-below `E` there (`tq_exact_write_kernel`, which reads the captured row
-offset like `tq_kv_write_kernel`) and quantizes the others (the codes of
-rows below `E` are never read).
+`CudaTqStore` gains `exact: [E][width]` f32 (`E` at most the capacity).
+`tq_kv_write_kernel` copies a row below `E` there as it is, at the
+captured row offset like any row, and quantizes the others (the codes of
+rows below `E` are never written or read): one Kernel per write, as
+before.
 
 ### 4. CUDA decode by regime
 
-- **`L <= E`**: the f32 split-KV attention on the head, `key_count = L`.
-  Inside a step capture it declares `E - L` as its largest replay offset:
-  the first step past `E` leaves the captured bounds, runs per node, and a
+- **`L <= E`**: the f32 decode attention on the heads, `key_count = L`,
+  exactly as for f32 stores. Inside a step capture it declares `E - L` as
+  its largest replay offset (the heads' rows less the key count): the
+  first step past `E` leaves the captured bounds, runs per node, and a
   later step is captured in the other regime. A history crosses `E` once.
-- **`L > E`**: the f32 split kernel scores the head's chunks, then
-  `tq_head_partials_kernel` moves its partials into the codes' space
-  (subtracts the value offsets weighted by the chunk's sum and rotates);
-  the code kernel scores chunks from `E / ATTENTION_CHUNK_KEYS` on into the
-  same partials buffer; one combine and one inverse rotation follow. `E`
-  is a multiple of the chunk length.
+- **`L > E`**: the code split Kernels read a chunk's keys below `E` (a
+  prefix of the chunk, which a sliding window may start inside the head)
+  from the heads: such a key is scored against the query as it is
+  (`q . k`), and its normalized weight times its value is summed
+  unrotated, apart from the codes' rotated sum. Once per block that
+  unrotated sum, less the value offsets times its weights' sum, is
+  rotated (`Pi (sum_j w_j (v_j - o_v))`) and added to the block's
+  partial, which is then in the codes' domain: the combine and the
+  inverse rotation (which adds the offsets back) are unchanged. This
+  replaces a separate head pass and partial move: no extra Kernel, one
+  Walsh-Hadamard transform per block that reads the head, and no
+  constraint tying `E` to the chunk length.
 
 ### 5. Prefill reads
 
-The dequantized scratch takes rows below `E` from the head.
+A prefill whose rows the heads hold attends on them directly, as on f32
+stores; a longer one reads the dequantized scratch, which takes rows
+below `E` from the heads.
 
 ### 6. Configuration
 
@@ -68,7 +78,7 @@ none, with the reason recorded, and every row is quantized.
 
 ## Risks
 
-- Decode past `E` runs one more Kernel pair than today (the head's split
-  and partial move): measured against the codes-only decode at 4,096 to
-  32,768 tokens.
+- Decode past `E` reads `E` f32 rows per KV head where the codes-only
+  decode reads codes, and rotates one sum per block that reads them:
+  measured against the codes-only decode at 4,096 to 32,768 tokens.
 - Memory: `E` f32 rows per store, reported with the KV bytes per token.

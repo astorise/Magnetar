@@ -1653,18 +1653,21 @@ jobs:
         # so the kv group reports them too: KV bytes per token, the tokens
         # the free VRAM holds, which contexts run, TTFT, TPOT and the
         # agreement with f32, in the run summary (next step). Qwen2.5-0.5B
-        # up to 32,768 tokens; Mistral 7B Q4_K_M from 4,096, whose f32
+        # up to 32,768 tokens; Mistral 7B Q4_K_M from 512, whose f32
         # history at 32,768 tokens (8 GiB) does not fit beside its weights
         # on a 12 GB GPU. Prompts longer than 2,048 tokens are prefilled in
         # passes of 2,048 rows (chunk-long-prefills), so the activations no
         # longer bound the context. Gemma 4 E2B is not measured here: its prefill took
         # 19 s at 4,096 tokens and did not finish 16,384 within the hour
-        # (run 44145395903).
+        # (run 44145395903). tq4 runs with its default exact head of
+        # 1,024 rows and with none (keep-turboquant-kv-head-exact), so the
+        # report shows what the head costs and saves at each context.
         if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
         timeout-minutes: 90
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4,tq4@0,tq3"
         shell: bash
         run: |
           set -uo pipefail
@@ -1683,7 +1686,7 @@ jobs:
             rm -rf "$dir"
           done <<'CHECKPOINTS'
           qwen2.5-0.5b-q8_0 512,4096,16384,32768 Qwen/Qwen2.5-0.5B-Instruct-GGUF 9217f5db79a29953eb74d5343926648285ec7e67 qwen2.5-0.5b-instruct-q8_0.gguf ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e
-          mistral-7b-q4_k_m 4096,16384,32768 bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6
+          mistral-7b-q4_k_m 512,4096,16384,32768 bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6
           CHECKPOINTS
           exit "$status"
       - name: TurboQuant KV gains summary
