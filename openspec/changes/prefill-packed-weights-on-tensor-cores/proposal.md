@@ -10,13 +10,15 @@ about 93% of a 7B prefill's arithmetic at 4,096 tokens.
 
 ## What Changes
 
-- **Split weight on Tensor Cores.** For more than 64 rows, a packed weight
-  dequantized for the call is split, like the activations already are,
-  into its bfloat16 hi and lo terms. `matmul_tcp_split_kernel` multiplies
-  them on Tensor Cores with f32 accumulation: `a_hi·b_hi + a_lo·b_hi +
-  a_hi·b_lo`, dropping only the product of both low terms, about 2^-18 of
-  each product. Bias and residual addends are fused; a gated matmul over
-  packed weights takes it through its two matmuls.
+- **Split weight on Tensor Cores, at f32 precision.** For more than 64
+  rows, a packed weight dequantized for the call and the activations are
+  each split into three bfloat16 terms (hi + mid + lo, about 24
+  significant bits). `matmul_tcp_split3_kernel` multiplies them on Tensor
+  Cores with f32 accumulation, every product of terms down to 2^-24 of the
+  whole: `lo·hi + mid·mid + hi·lo + mid·hi + hi·mid + hi·hi`. The existing
+  f32 conformance tolerances hold unchanged. Bias and residual addends are
+  fused; a gated matmul over packed weights takes it through its two
+  matmuls.
 - Every other case is unchanged: up to 64 rows (packed row Kernels), no
   Tensor Cores (f32 Kernels), unaligned dimensions.
 
@@ -29,7 +31,7 @@ about 93% of a 7B prefill's arithmetic at 4,096 tokens.
 
 ## Impact
 
-- `providers/cuda`: `matmul_tcp_split_kernel`, the long packed matmul path,
+- `providers/cuda`: `tc_split3_kernel`, `matmul_tcp_split3_kernel`, the long packed matmul path,
   conformance.
 - No Runtime, Component or WIT change.
 
