@@ -178,3 +178,12 @@ Past the head, the head still costs up to 8% at 4,096 tokens (Qwen2.5-
 0.5B 4.74 against 4.38 ms; Mistral 7B 22.02 against 20.82) and about 1%
 at 32,768: its chunks score each exact key with one thread reading the
 key's f32 row and the unrotated queries from global memory.
+
+A warp per exact key (providers/cuda 292d127, lanes over the dimensions,
+sums across the warp) made the grouped code Kernel 47% to 76% slower even
+without an exact head (run 44322489467: Qwen2.5-0.5B `tq4` at 32,768 keys
+314.3 against 183.6 us, Mistral 7B 1,175.7 against 666.4 us; `tq4` TPOT
+10.93 against 7.89 ms), while the unchanged staged Kernel and the f32
+Kernel kept their times on the same run. Its registers went from 72 to
+78, with no local memory; the cause is not identified. It is reverted:
+the exact head's chunks keep a thread per key.
