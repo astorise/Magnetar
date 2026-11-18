@@ -13,7 +13,8 @@
 //! error.
 
 use crate::logit_comparison::{
-    Format, compare_on, compare_with_reference, cpu_providers, generate_logits, kv_precision_drift,
+    Format, compare_chunked_on, compare_on, compare_with_reference, cpu_providers, generate_logits,
+    kv_precision_drift,
 };
 use magnetar_integration_resident_provider::ResidentReferenceCpuProvider;
 
@@ -110,6 +111,47 @@ fn the_tiny_gemma4_checkpoints_match_transformers_on_cuda() {
             family,
         );
         eprintln!("cuda {variant}: max |logit difference| {difference:.3e}");
+        // Prefilled in passes of 3 rows (`chunk-long-prefills`): the CUDA
+        // attention Kernels over a history longer than their query rows.
+        let (difference, chunk) = compare_chunked_on(
+            std::sync::Arc::new(magnetar_provider_cuda::CudaProvider::new()),
+            "magnetar-cuda",
+            "gemma4",
+            variant,
+            format,
+            family,
+            3,
+        );
+        assert_eq!(chunk, 3, "cuda {variant}: the prefill ran in one pass");
+        eprintln!("cuda {variant} in chunks of 3: max |logit difference| {difference:.3e}");
+    }
+}
+
+/// Every checkpoint above with its 8-token prompt prefilled in passes of 3
+/// rows (`chunk-long-prefills`): each pass continues the KV history the
+/// passes before it wrote (sliding and full layers, shared KV) from its own
+/// position, and the last pass is padded. The logits still match the
+/// references, on the Reference CPU and both CPU Providers.
+#[test]
+fn the_tiny_gemma4_checkpoints_match_transformers_when_prefilled_in_chunks() {
+    let reference: (std::sync::Arc<dyn magnetar_runtime::Provider>, &str) = (
+        std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+        "magnetar-reference-cpu",
+    );
+    for (provider, label) in std::iter::once(reference).chain(cpu_providers()) {
+        for (variant, format, family) in VARIANTS {
+            let (difference, chunk) = compare_chunked_on(
+                provider.clone(),
+                label,
+                "gemma4",
+                variant,
+                format,
+                family,
+                3,
+            );
+            assert_eq!(chunk, 3, "{label} {variant}: the prefill ran in one pass");
+            eprintln!("{label} {variant} in chunks of 3: max |logit difference| {difference:.3e}");
+        }
     }
 }
 

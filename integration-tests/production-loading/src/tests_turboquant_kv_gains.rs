@@ -59,6 +59,9 @@ struct PrecisionRuns {
     precision: KvStorePrecision,
     kv_bytes_per_token: u64,
     free_bytes_after_load: u64,
+    /// The rows of each prefill pass, `0` for one pass
+    /// (`chunk-long-prefills`).
+    prefill_chunk: u64,
     measures: Vec<Measure>,
 }
 
@@ -273,11 +276,13 @@ fn turboquant_kv_gains_on_cuda() {
             resolution.fallbacks
         );
         let kv_bytes_per_token = model.kv_bytes_per_token();
+        let prefill_chunk = model.prefill_chunk();
         let _ = model.unload();
         runs.push(PrecisionRuns {
             precision,
             kv_bytes_per_token,
             free_bytes_after_load,
+            prefill_chunk,
             measures,
         });
         // The report so far, so a run stopped by its time limit keeps it.
@@ -300,10 +305,14 @@ fn turboquant_kv_gains_on_cuda() {
 /// The gains of every precision against f32, as a Markdown report.
 fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> String {
     let baseline = &runs[0];
+    let prefill = match baseline.prefill_chunk {
+        0 => "every prompt prefilled in one pass".to_string(),
+        chunk => format!("longer prompts prefilled in passes of {chunk} rows"),
+    };
     let mut report = format!(
         "### TurboQuant KV gains: {label}\n\n\
          Greedy decoding of {new_tokens} tokens after a prompt of each context length, one RTX 3060; \
-         TTFT warm up to {MAX_WARMED_CONTEXT} tokens.\n\n\
+         TTFT warm up to {MAX_WARMED_CONTEXT} tokens; {prefill}.\n\n\
          | KV precision | KV bytes/token | vs f32 | Tokens of KV in the free VRAM after load |\n\
          |---|---|---|---|\n"
     );

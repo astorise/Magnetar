@@ -82,8 +82,56 @@ pub(crate) fn compare_on(
     format: Format,
     family: &str,
 ) -> f32 {
+    compare_configured(
+        provider,
+        provider_label,
+        family_directory,
+        variant,
+        format,
+        family,
+        |_| {},
+    )
+    .0
+}
+
+/// [`compare_on`] with the prompt prefilled in passes of `chunk` rows
+/// (`chunk-long-prefills`). Returns the largest logit difference and the
+/// chunk length the model kept: `0` when it runs every prompt in one pass.
+pub(crate) fn compare_chunked_on(
+    provider: Arc<dyn Provider>,
+    provider_label: &str,
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+    chunk: u64,
+) -> (f32, u64) {
+    let (difference, model) = compare_configured(
+        provider,
+        provider_label,
+        family_directory,
+        variant,
+        format,
+        family,
+        |model| model.set_prefill_chunk(chunk),
+    );
+    (difference, model.prefill_chunk())
+}
+
+/// [`compare_on`] on a model `configure` adjusted before generating; returns
+/// the model with the largest logit difference.
+fn compare_configured(
+    provider: Arc<dyn Provider>,
+    provider_label: &str,
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+    configure: impl FnOnce(&mut ProductionLoadedModel),
+) -> (f32, ProductionLoadedModel) {
     let (mut model, reference) =
         load_checkpoint(provider, family_directory, variant, format, family);
+    configure(&mut model);
     let mut recorder = LogitRecorder::default();
     let outcome = model
         .generate_streaming_with_logits(
@@ -118,7 +166,7 @@ pub(crate) fn compare_on(
         reference.generated_token_ids,
         comparison.failures
     );
-    comparison.max_abs_difference
+    (comparison.max_abs_difference, model)
 }
 
 /// The reference's prompt, greedy, for as many tokens as it holds.

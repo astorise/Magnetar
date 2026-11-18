@@ -95,6 +95,27 @@ fn the_tiny_deepseek_v2_checkpoints_match_transformers_with_resident_values() {
     }
 }
 
+/// A latent-attention prefill attends over the expanded keys and values of
+/// its own rows while its history holds the latent rows, so a later pass
+/// could not read the earlier ones: the model runs every prompt in one pass
+/// (`chunk-long-prefills`), and the logits still match the references.
+#[test]
+fn a_latent_attention_prefill_runs_in_one_pass() {
+    for (variant, format, family) in VARIANTS {
+        let (difference, chunk) = crate::logit_comparison::compare_chunked_on(
+            std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+            "magnetar-reference-cpu",
+            "deepseek_v2",
+            variant,
+            format,
+            family,
+            4,
+        );
+        assert_eq!(chunk, 0, "{variant}: the prefill was chunked");
+        eprintln!("{variant}, chunking declined: max |logit difference| {difference:.3e}");
+    }
+}
+
 /// Every checkpoint of this file, with its format and declared family.
 const VARIANTS: [(&str, Format, &str); 6] = [
     ("lite", Format::HuggingFace, "deepseek_v2"),

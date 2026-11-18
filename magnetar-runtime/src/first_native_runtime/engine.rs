@@ -62,6 +62,10 @@ pub(crate) struct ComponentGraphCache {
     /// The prompt buckets of a bucketed prefill (`replay-bucketed-prefill`),
     /// ascending; empty when prefills run at the prompt's exact length.
     pub(super) prefill_buckets: Arc<Mutex<Vec<u64>>>,
+    /// The chunk length of a chunked prefill (`chunk-long-prefills`): a
+    /// longer prompt runs in passes of this many rows. `0` runs every
+    /// prompt in one pass.
+    pub(super) prefill_chunk: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// One graph length's graphs.
@@ -720,6 +724,12 @@ impl ComponentGraphCache {
         if self.tensor_parallel() {
             return prompt_tokens;
         }
+        // A prompt longer than the chunk runs in passes of the chunk's
+        // graph (`chunk-long-prefills`).
+        let chunk = self.prefill_chunk();
+        if chunk > 0 && prompt_tokens > chunk {
+            return chunk;
+        }
         crate::first_native_runtime::prefill_buckets::prefill_bucket(
             &self.prefill_buckets.lock().unwrap(),
             prompt_tokens,
@@ -727,9 +737,34 @@ impl ComponentGraphCache {
         .unwrap_or(prompt_tokens)
     }
 
-    /// Whether a prefill graph of `graph_length` rows is a bucket's.
+    /// Whether a prefill graph of `graph_length` rows is a bucket's or the
+    /// chunk's: one whose last rows may be padding.
     pub(crate) fn is_prefill_bucket(&self, graph_length: u64) -> bool {
+        !self.tensor_parallel()
+            && (self.prefill_buckets.lock().unwrap().contains(&graph_length)
+                || self.prefill_chunk() == graph_length)
+    }
+
+    /// Whether `graph_length` is one of the prompt buckets
+    /// (`replay-bucketed-prefill`), the chunk's length aside: only a
+    /// bucket's prefills are pooled and recorded.
+    pub(crate) fn is_bucket_length(&self, graph_length: u64) -> bool {
         !self.tensor_parallel() && self.prefill_buckets.lock().unwrap().contains(&graph_length)
+    }
+
+    /// The chunk length of a chunked prefill (`chunk-long-prefills`), `0`
+    /// when every prompt runs in one pass.
+    pub(crate) fn prefill_chunk(&self) -> u64 {
+        self.prefill_chunk
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sets the chunk length of later prefills; `0` turns chunking off.
+    /// Forgets every cached graph, like [`Self::set_prefill_buckets`].
+    pub(crate) fn set_prefill_chunk(&self, chunk: u64) {
+        self.prefill_chunk
+            .store(chunk, std::sync::atomic::Ordering::Relaxed);
+        self.entries.lock().unwrap().clear();
     }
 
     /// Sets the prompt buckets; empty turns bucketing off. Forgets every
@@ -1694,15 +1729,30 @@ impl E2eRuntimeModelExecutionEngine {
             // last row is a newly admitted token's distribution.
             // Every row this request's KV history can reach: its prompt and
             // every token it may generate (`append-kv-history-in-place`).
-            // A bucketed prefill also writes its padding rows.
+            // A bucketed prefill also writes its padding rows, and so does
+            // the last pass of a chunked one (`chunk-long-prefills`).
+            let chunked = generated_tokens.is_empty() && graph_length < prompt_token_count;
+            // A bucket's prefill: padded, or of a bucket's length exactly.
+            // A prompt of exactly the chunk's length runs the chunk's graph
+            // in one pass, unpooled and unrecorded.
+            let bucketed = !chunked
+                && (graph_length != prompt_token_count
+                    || (component_graphs.logits_row
+                        && self
+                            .graph_cache
+                            .as_ref()
+                            .is_some_and(|cache| cache.is_bucket_length(graph_length))));
             let rows_needed = (request.input_token_ids.len() as u64)
                 .saturating_add(request.max_new_tokens as u64)
-                .max(graph_length)
+                .max(if chunked {
+                    super::prefill_chunks::chunked_rows(prompt_token_count, graph_length)
+                } else {
+                    graph_length
+                })
                 .max(1);
             let kv_stores = if self.copy_based_kv {
                 None
             } else if generated_tokens.is_empty() {
-                let bucketed = graph_length != prompt_token_count || component_graphs.logits_row;
                 Some(self.prefill_kv_stores(
                     runtime,
                     request,
@@ -1726,10 +1776,22 @@ impl E2eRuntimeModelExecutionEngine {
                     execution_plan,
                 )?;
             }
-            let (dispatch, mut bindings, layer_kv, resolved_provider) = if generated_tokens
-                .is_empty()
-            {
-                let bucketed = graph_length != prompt_token_count || component_graphs.logits_row;
+            let (dispatch, mut bindings, layer_kv, resolved_provider) = if chunked {
+                let kv_stores = kv_stores.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                    reason: "a chunked prefill continues KV history kept in place".into(),
+                })?;
+                self.execute_chunked_prefill(
+                    runtime,
+                    request,
+                    &kv_state,
+                    execution_plan,
+                    &component_graphs,
+                    model_instance,
+                    graph_length,
+                    &mut node_events,
+                    kv_stores,
+                )?
+            } else if generated_tokens.is_empty() {
                 let (mut output, selected) = self.execute_prefill_graph(
                     runtime,
                     request,
