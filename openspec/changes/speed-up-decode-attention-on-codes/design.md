@@ -71,3 +71,45 @@ per query head, `chunks` counted over the stores' capacity.
   today's.
 - Summation order changes: results move within f32 rounding; the
   conformance tolerances are unchanged.
+
+## Evidence
+
+One RTX 3060. Run 44299614540 (providers/cuda 34e39e6): the TurboQuant
+conformance tests pass under the three schedules (unstaged, staged with a
+chunk per block, staged and split), with 2,000- and 4,100-key histories,
+and a captured split step replayed up to 1,001 keys matches the CPU.
+`decode_attention_times`, one decode step's attention:
+
+| `tq4`, us | Unstaged | Staged, chunk per block | Staged and split |
+|---|---|---|---|
+| Qwen2.5-0.5B, 4,096 keys | 41.3 | 45.3 | 57.9 |
+| Qwen2.5-0.5B, 16,384 keys | 137.3 | 128.2 | 133.9 |
+| Qwen2.5-0.5B, 32,768 keys | 225.5 | 215.7 | 232.6 |
+| Mistral 7B, 4,096 keys | 154.7 | 170.5 | 169.8 |
+| Mistral 7B, 16,384 keys | 515.1 | 536.2 | 491.3 |
+| Mistral 7B, 32,768 keys | 1,015.8 | 1,037.8 | 971.5 |
+
+`tq3` behaves alike (Mistral 7B at 32,768 keys: 1,113.3, 983.4 and
+947.6 us). Neither staging nor the split changes the Kernel's speed by
+more than about 10% either way, and the split is slower up to 4,096 keys,
+where fewer blocks each walk their chunks one after another. The
+unstaged Kernels stay the default.
+
+What bounds the Kernels instead: at 32,768 keys the f32 grouped Kernel and
+the code Kernels cost about the same per (key, KV head) pair (Qwen2.5-0.5B
+3.9 and 3.4 ns, Mistral 7B 5.3 and 3.9 ns), though the codes are 7 to 8
+times fewer bytes. Both do the same multiply-adds per pair (group x head
+width, for the scores and for the values), and both read about one
+shared-memory operand per multiply-add (a query or score value, a K or V
+value or centroid). A suspected bound, shared to both: shared-memory loads
+per multiply-add. The next step tests it with Kernels that keep the
+queries and the weights in registers across several keys and coordinates
+(decision 5).
+
+### 5. Register tiling (next)
+
+A thread scores several keys per query value it loads, and sums several
+value coordinates per weight it loads (weights stored key-major, the
+group's heads contiguous), so a shared-memory load feeds several
+multiply-adds. First on the f32 grouped decode Kernel, whose bytes the
+gain would show directly, then on the code Kernels.
