@@ -187,3 +187,14 @@ without an exact head (run 44322489467: Qwen2.5-0.5B `tq4` at 32,768 keys
 Kernel kept their times on the same run. Its registers went from 72 to
 78, with no local memory; the cause is not identified. It is reverted:
 the exact head's chunks keep a thread per key.
+
+Run 44347997769 (providers/cuda 9c0dae8, the revert): the grouped code
+Kernel is back to its times (Qwen2.5-0.5B `tq4` at 32,768 keys 174.8 us,
+Mistral 7B 677.4 us; 72 registers). With the default schedule, a
+1,024-row exact head costs, at 4,096 keys, 45.7 against 32.5 us
+(Qwen2.5-0.5B) and 145.0 against 108.4 us (Mistral 7B), and 1% to 2% from
+16,384 keys on. Most of that is bytes: the head's 1,024 rows are f32, for
+Mistral 7B 8.4 MB of K and V per layer against about 1.1 MB for the same
+rows on `tq4` codes, read at the f32 Kernel's own rate (its whole decode
+over 1,024 keys takes 56.5 us). A 16-bit head would halve them, at the
+cost of the head's exactness (a separate change).
