@@ -188,3 +188,22 @@ MLP (`bound-one-pass-prefill-memory`). With the tiled prefill attention for
 192-dimension keys and 128-dimension values (providers/cuda 758b8ba) and the
 balanced placement together, TTFT at 1,024 tokens is 5,989.3 against
 6,975.8 ms; the run does not separate the two.
+
+The latent decode Kernels with four threads per key (512 per block, each
+taking every fourth float4 of a row, or every fourth group of codes; one
+value coordinate per thread; providers/cuda 27e1b9e), run 44396512952,
+against 128 threads (one per key; run 44382825307), in us:
+
+| Keys | f32 before | f32 | codes before | codes | codes, 1,024-row head |
+|---|---|---|---|---|---|
+| 1,024 | 101.2 | 39.3 | 107.0 | 79.7 | 40.8 |
+| 4,096 | 178.2 | 150.0 | 158.1 | 209.9 | 222.2 |
+| 16,384 | 797.4 | 555.1 | 567.4 | 658.0 | 647.2 |
+| 32,768 | 1,500.3 | 1,124.6 | 1,032.6 | 1,305.0 | 1,188.8 |
+
+DeepSeek-V2-Lite's TPOT with an `f32` history falls to 13.42 ms at 1,024
+tokens (15.02); with `tq4` it rises at 4,096 tokens (19.94 against 17.48 ms)
+and 16,384 (34.20 against 29.26), as the decode on codes does: the four
+threads of a key read rotated queries 64 floats apart, in one shared-memory
+bank. providers/cuda 417616d splits each group's eight-value blocks among
+them instead.
