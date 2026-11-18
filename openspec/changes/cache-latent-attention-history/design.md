@@ -103,3 +103,29 @@ and digest change, and the KV compatibility key carries both.
 - **Numerics.** The absorbed scores sum in another order than the expanded
   ones; the tiny checkpoints' tolerances against `transformers` hold or the
   difference is reported.
+
+## Evidence: latent decode on codes
+
+One RTX 3060; one decode step's absorbed attention at DeepSeek-V2-Lite's
+shapes (16 query heads over one history of 576-value rows, the values
+each row's leading 512, `tq4` in groups of 64), `latent_decode_attention_times`:
+
+| us | 1,024 keys | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|---|
+| f32 history | 101.6 | 318.7 | 3,030.1 | 6,886.6 |
+| `tq4` through dequantized scratch (before) | 149.7 | 513.1 | 3,688.3 | 8,105.5 |
+| `tq4` on its codes | 105.6 | 154.8 | 525.4 | 921.5 |
+| `tq4` on its codes, 1,024-row exact head | 108.6 | 300.9 | 616.7 | 904.4 |
+
+(Run 44352387517, providers/cuda 472bf54; run 44351792640 measured the
+first two rows the same.) The decode steps read each row's leading values
+in place (providers/cuda c8abbd1) instead of gathering the history at
+every step. On its codes (`tq_latent_attention_split_kernel`: a block per
+chunk and eight query heads, each code decoded once for them, the values
+summed in each group's rotated domain with the group's norm) a `tq4`
+latent decode is 8.8x faster than through dequantized scratch at 32,768
+keys and 7.5x faster than the f32 history's, whose per-head Kernel reads
+the history once for each of the 16 heads (11 GB/s). Conformance:
+`turboquant_latent_decode_on_codes_matches_the_cpu` (`tq4` and `tq3`, 33
+to 1,100 keys, exact heads, a sliding window) and
+`batched_matmul_and_strided_values_match_the_cpu` pass.
