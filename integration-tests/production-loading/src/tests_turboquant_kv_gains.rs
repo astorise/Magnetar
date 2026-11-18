@@ -1,8 +1,9 @@
 //! TurboQuant KV gains on CUDA (`turboquant-kv-history`), run by
 //! `.github/workflows/turboquant-kv-gains.yml`. One real GGUF checkpoint is
-//! loaded once per KV precision (f32, then each TurboQuant one) and
-//! generates greedily at several context lengths. For each precision and
-//! context the test reports:
+//! loaded once per KV precision (f32, then each TurboQuant one, with or
+//! without an exact head: `keep-turboquant-kv-head-exact`) and generates
+//! greedily at several context lengths. For each precision and context the
+//! test reports:
 //!
 //! - the KV bytes per token, and how many tokens of KV history the VRAM
 //!   left free after loading holds;
@@ -56,7 +57,7 @@ struct Measure {
 
 /// One precision's runs.
 struct PrecisionRuns {
-    precision: KvStorePrecision,
+    precision: KvPrecisions,
     kv_bytes_per_token: u64,
     free_bytes_after_load: u64,
     /// The rows of each prefill pass, `0` for one pass
@@ -67,6 +68,31 @@ struct PrecisionRuns {
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
+}
+
+/// A precision of `MAGNETAR_KV_GAINS_PRECISIONS`: `f32`, `tq4` or `tq3`
+/// with the Runtime's default exact head, or `tq4@ROWS` / `tq3@ROWS` with
+/// an exact head of `ROWS` rows (`@0` for none).
+fn parse_precisions(value: &str) -> KvPrecisions {
+    let (precision, exact_rows) = match value.trim().split_once('@') {
+        Some((precision, rows)) => (precision, Some(rows.parse().expect("a row count"))),
+        None => (value.trim(), None),
+    };
+    let precisions =
+        KvPrecisions::uniform(KvStorePrecision::parse(precision).expect("f32, tq4 or tq3"));
+    match exact_rows {
+        Some(rows) => precisions.with_exact_rows(rows),
+        None => precisions,
+    }
+}
+
+/// How the report names `precisions`.
+fn precision_label(precisions: &KvPrecisions) -> String {
+    match (precisions.k, precisions.exact_rows) {
+        (KvStorePrecision::F32, _) => "f32".into(),
+        (precision, 0) => format!("{}, no exact head", precision.as_str()),
+        (precision, rows) => format!("{}, exact head {rows}", precision.as_str()),
+    }
 }
 
 #[test]
@@ -93,13 +119,13 @@ fn turboquant_kv_gains_on_cuda() {
     let new_tokens: usize = env_or("MAGNETAR_KV_GAINS_NEW_TOKENS", "64")
         .parse()
         .expect("a token count");
-    let precisions: Vec<KvStorePrecision> = env_or("MAGNETAR_KV_GAINS_PRECISIONS", "f32,tq4,tq3")
+    let precisions: Vec<KvPrecisions> = env_or("MAGNETAR_KV_GAINS_PRECISIONS", "f32,tq4,tq3")
         .split(',')
-        .map(|value| KvStorePrecision::parse(value).expect("f32, tq4 or tq3"))
+        .map(parse_precisions)
         .collect();
     assert_eq!(
         precisions.first(),
-        Some(&KvStorePrecision::F32),
+        Some(&KvPrecisions::default()),
         "f32 runs first: every other precision is compared with it"
     );
 
@@ -169,7 +195,7 @@ fn turboquant_kv_gains_on_cuda() {
             Some(component),
         )
         .expect("the checkpoint loads");
-        model.request_kv_precisions(KvPrecisions::uniform(precision));
+        model.request_kv_precisions(precision);
         let free_bytes_after_load = provider
             .context()
             .and_then(|context| context.mem_get_info().ok())
@@ -225,14 +251,14 @@ fn turboquant_kv_gains_on_cuda() {
             match &outcome {
                 Ok(_) => eprintln!(
                     "[kv gains] {label} {} context {context}: ran, TTFT {:.1} ms, {} tokens, {:.0} s",
-                    precision.as_str(),
+                    precision_label(&precision),
                     token_times.first().copied().unwrap_or(0.0),
                     token_times.len(),
                     context_started.elapsed().as_secs_f64()
                 ),
                 Err(error) => eprintln!(
                     "[kv gains] {label} {} context {context}: failed after {:.0} s: {error}",
-                    precision.as_str(),
+                    precision_label(&precision),
                     context_started.elapsed().as_secs_f64()
                 ),
             }
@@ -270,9 +296,9 @@ fn turboquant_kv_gains_on_cuda() {
             .expect("a prefill resolved the KV precisions");
         assert_eq!(
             resolution.resolved,
-            KvPrecisions::uniform(precision),
+            precision,
             "{label}: {} stores were asked for: {:?}",
-            precision.as_str(),
+            precision_label(&precision),
             resolution.fallbacks
         );
         let kv_bytes_per_token = model.kv_bytes_per_token();
@@ -312,7 +338,9 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
     let mut report = format!(
         "### TurboQuant KV gains: {label}\n\n\
          Greedy decoding of {new_tokens} tokens after a prompt of each context length, one RTX 3060; \
-         TTFT warm up to {MAX_WARMED_CONTEXT} tokens; {prefill}.\n\n\
+         TTFT warm up to {MAX_WARMED_CONTEXT} tokens; {prefill}. An exact head keeps a store's \
+         first rows at f32 (`keep-turboquant-kv-head-exact`): the bytes per token and the tokens \
+         the free VRAM holds count every row at its TurboQuant size.\n\n\
          | KV precision | KV bytes/token | vs f32 | Tokens of KV in the free VRAM after load |\n\
          |---|---|---|---|\n"
     );
@@ -320,7 +348,7 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
         let ratio = baseline.kv_bytes_per_token as f64 / run.kv_bytes_per_token.max(1) as f64;
         report.push_str(&format!(
             "| {} | {} | {ratio:.2}x smaller | {} |\n",
-            run.precision.as_str(),
+            precision_label(&run.precision),
             run.kv_bytes_per_token,
             run.free_bytes_after_load / run.kv_bytes_per_token.max(1)
         ));
@@ -367,7 +395,7 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
                 };
                 report.push_str(&format!(
                     "| {} | {} | yes | {:.1} | {:.2} | {speed} | {agree} | {first} | {logit} |\n",
-                    run.precision.as_str(),
+                    precision_label(&run.precision),
                     measure.context,
                     measure.ttft_ms,
                     measure.tpot_ms,
@@ -377,7 +405,7 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
             let reason: String = error.chars().take(80).collect();
             report.push_str(&format!(
                 "| {} | {} | no: {} | - | - | - | - | - | - |\n",
-                run.precision.as_str(),
+                precision_label(&run.precision),
                 measure.context,
                 reason.replace('|', "/")
             ));

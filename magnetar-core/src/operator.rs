@@ -344,6 +344,11 @@ pub const KV_WRITE_TURBOQUANT_FEATURE: &str = "turboquant-kv-store";
 /// reads K and V from TurboQuant KV stores (`turboquant-kv-history`).
 pub const ATTENTION_TURBOQUANT_KV_FEATURE: &str = "turboquant-kv-read";
 
+/// The `kv-write` Kernel feature a Provider advertises when it creates
+/// TurboQuant KV stores whose first rows stay exact
+/// (`keep-turboquant-kv-head-exact`).
+pub const KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE: &str = "turboquant-kv-exact-head";
+
 /// The Kernel features an `operator` node with these `attributes` and
 /// `input_count` inputs needs beyond the Operator's baseline form: the
 /// optional attributes and operand forms a Kernel could otherwise ignore

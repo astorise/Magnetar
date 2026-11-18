@@ -25,21 +25,48 @@ pub(crate) const KV_PRECISION_K_ENV: &str = "MAGNETAR_KV_PRECISION_K";
 /// Overrides [`KV_PRECISION_ENV`] for V.
 pub(crate) const KV_PRECISION_V_ENV: &str = "MAGNETAR_KV_PRECISION_V";
 
+/// Reads the rows a TurboQuant store keeps exact
+/// (`keep-turboquant-kv-head-exact`); [`DEFAULT_KV_EXACT_ROWS`] when unset.
+pub(crate) const KV_EXACT_ROWS_ENV: &str = "MAGNETAR_KV_EXACT_ROWS";
+
+/// The rows a TurboQuant store keeps exact when nothing else is asked
+/// (`keep-turboquant-kv-head-exact`).
+pub const DEFAULT_KV_EXACT_ROWS: u64 = 1024;
+
 /// The storage precision of the K and of the V stores
-/// (`turboquant-kv-history`).
+/// (`turboquant-kv-history`), and how many first rows a TurboQuant store
+/// keeps exact (`keep-turboquant-kv-head-exact`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvPrecisions {
     pub k: KvStorePrecision,
     pub v: KvStorePrecision,
+    /// The first rows a TurboQuant store keeps exact; 0 for none, and
+    /// always 0 when both roles are f32.
+    pub exact_rows: u64,
 }
 
 impl KvPrecisions {
-    /// Both roles in `precision`.
+    /// Both roles in `precision`, a TurboQuant one with the default exact
+    /// head ([`DEFAULT_KV_EXACT_ROWS`]).
     pub fn uniform(precision: KvStorePrecision) -> Self {
         Self {
             k: precision,
             v: precision,
+            exact_rows: 0,
         }
+        .with_exact_rows(DEFAULT_KV_EXACT_ROWS)
+    }
+
+    /// These precisions with `exact_rows` first rows kept exact in
+    /// TurboQuant stores; none when both roles are f32.
+    pub fn with_exact_rows(mut self, exact_rows: u64) -> Self {
+        self.exact_rows = if self.quantized() { exact_rows } else { 0 };
+        self
+    }
+
+    /// Whether a role is stored in a TurboQuant precision.
+    pub fn quantized(&self) -> bool {
+        self.k != KvStorePrecision::F32 || self.v != KvStorePrecision::F32
     }
 
     pub(super) fn for_role(&self, role: KvRole) -> KvStorePrecision {
@@ -61,10 +88,19 @@ impl KvPrecisions {
             }
         };
         let both = read(KV_PRECISION_ENV)?.unwrap_or_default();
+        let exact_rows = match std::env::var(KV_EXACT_ROWS_ENV) {
+            Err(_) => DEFAULT_KV_EXACT_ROWS,
+            Ok(value) => value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{KV_EXACT_ROWS_ENV}='{value}' is not a row count"))?,
+        };
         Ok(Self {
             k: read(KV_PRECISION_K_ENV)?.unwrap_or(both),
             v: read(KV_PRECISION_V_ENV)?.unwrap_or(both),
-        })
+            exact_rows: 0,
+        }
+        .with_exact_rows(exact_rows))
     }
 }
 
@@ -107,13 +143,46 @@ pub struct KvPrecisionResolution {
 /// precisions (`turboquant-kv-history`): `None` for f32 stores, so f32
 /// histories keep the compatibility they always had.
 pub(crate) fn kv_quantization_mode(precisions: KvPrecisions) -> Option<String> {
-    (precisions != KvPrecisions::default()).then(|| {
-        format!(
+    precisions.quantized().then(|| {
+        let mode = format!(
             "turboquant-kv:k={},v={}",
             precisions.k.as_str(),
             precisions.v.as_str()
-        )
+        );
+        // A history without an exact head keeps the mode it always had.
+        match precisions.exact_rows {
+            0 => mode,
+            rows => format!("{mode},exact={rows}"),
+        }
     })
+}
+
+/// The bytes the exact heads of one store set of `capacity` rows take
+/// (`keep-turboquant-kv-head-exact`): the first `exact_rows` rows of every
+/// TurboQuant store, as `f32`.
+pub(crate) fn kv_exact_head_bytes(
+    config: &FirstNativeModelConfig,
+    precisions: KvPrecisions,
+    capacity: u64,
+) -> u64 {
+    let rows = precisions.exact_rows.min(capacity);
+    let head = |precision: KvStorePrecision, width: u64| {
+        if precision == KvStorePrecision::F32 {
+            0
+        } else {
+            rows.saturating_mul(width).saturating_mul(4)
+        }
+    };
+    config
+        .kv_row_widths()
+        .into_iter()
+        .zip(config.kv_value_row_widths())
+        .filter_map(|(key, value)| key.zip(value))
+        .fold(0u64, |bytes, (key, value)| {
+            bytes
+                .saturating_add(head(precisions.k, key))
+                .saturating_add(head(precisions.v, value))
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

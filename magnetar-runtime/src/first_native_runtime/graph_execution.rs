@@ -1560,10 +1560,14 @@ pub(super) fn execute_first_native_graph_nodes(
                                 KvRole::K => key,
                                 KvRole::V => value,
                             });
+                        // Its first rows kept exact
+                        // (`keep-turboquant-kv-head-exact`).
+                        let exact_rows = spec.precisions.exact_rows;
                         let compact = match head_dimension {
-                            Some(head) if precision != KvStorePrecision::F32 => {
-                                Some((head, precision.stored_bytes(capacity, width, head)))
-                            }
+                            Some(head) if precision != KvStorePrecision::F32 => Some((
+                                head,
+                                precision.stored_bytes_with_head(capacity, width, head, exact_rows),
+                            )),
                             _ => None,
                         };
                         let zeroed = if let Some((head, stored_bytes)) = compact {
@@ -1594,7 +1598,13 @@ pub(super) fn execute_first_native_graph_nodes(
                                 })?;
                             let created = dispatch_ctx
                                 .provider
-                                .write_zeroed_kv_store(&store, &[capacity, width], precision, head)
+                                .write_zeroed_kv_store_with_exact_head(
+                                    &store,
+                                    &[capacity, width],
+                                    precision,
+                                    head,
+                                    exact_rows,
+                                )
                                 .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
                                     reason: error.to_string(),
                                 })?;

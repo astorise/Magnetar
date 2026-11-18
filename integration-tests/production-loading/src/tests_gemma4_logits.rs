@@ -171,11 +171,13 @@ fn the_tiny_gemma4_checkpoints_match_transformers_on_the_cpu_providers() {
 /// Every checkpoint above with TurboQuant KV stores on the Reference CPU
 /// (`turboquant-kv-history`): its 16- and 32-wide heads take `tq4` and
 /// `tq3`, and the logits move from the f32 history's by the stores'
-/// rounding, never by nothing.
+/// rounding, never by nothing. Every row is quantized: these histories are
+/// shorter than the default exact head (`keep-turboquant-kv-head-exact`).
 #[test]
 fn the_tiny_gemma4_checkpoints_run_with_turboquant_kv_stores() {
     use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
     for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        let requested = KvPrecisions::uniform(precision).with_exact_rows(0);
         for (variant, format, family) in VARIANTS {
             let drift = kv_precision_drift(
                 &|| std::sync::Arc::new(ReferenceCpuProvider::new()),
@@ -183,11 +185,10 @@ fn the_tiny_gemma4_checkpoints_run_with_turboquant_kv_stores() {
                 variant,
                 format,
                 family,
-                KvPrecisions::uniform(precision),
+                requested,
             );
             assert_eq!(
-                drift.resolution.resolved,
-                KvPrecisions::uniform(precision),
+                drift.resolution.resolved, requested,
                 "{variant}: {:?}",
                 drift.resolution.fallbacks
             );
@@ -208,37 +209,94 @@ fn the_tiny_gemma4_checkpoints_run_with_turboquant_kv_stores() {
     }
 }
 
+/// The tiny histories (8 prompt rows and 12 steps) against an exact head
+/// (`keep-turboquant-kv-head-exact`) on the Reference CPU: under the
+/// default head every row is exact, and the logits are the f32 history's,
+/// bit for bit; under a head of 4 rows the later rows are quantized, and
+/// the logits move by their rounding.
+#[test]
+fn the_tiny_gemma4_checkpoints_keep_an_exact_turboquant_kv_head() {
+    use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        for (variant, format, family) in VARIANTS {
+            let drift = |requested: KvPrecisions| {
+                let drift = kv_precision_drift(
+                    &|| std::sync::Arc::new(ReferenceCpuProvider::new()),
+                    "gemma4",
+                    variant,
+                    format,
+                    family,
+                    requested,
+                );
+                assert_eq!(
+                    drift.resolution.resolved, requested,
+                    "{variant}: {:?}",
+                    drift.resolution.fallbacks
+                );
+                drift
+            };
+            let whole = drift(KvPrecisions::uniform(precision));
+            assert_eq!(whole.resolution.resolved.exact_rows, 1024, "{variant}");
+            assert_eq!(whole.max_abs_difference, 0.0, "{variant} {precision:?}");
+            assert_eq!(
+                whole.agreeing_tokens, whole.steps,
+                "{variant} {precision:?}"
+            );
+            let partial = drift(KvPrecisions::uniform(precision).with_exact_rows(4));
+            assert!(
+                partial.max_abs_difference > 0.0 && partial.max_abs_difference.is_finite(),
+                "{variant} {precision:?}: {}",
+                partial.max_abs_difference
+            );
+            eprintln!(
+                "{} {variant}, exact head of 4 rows: max |logit difference| {:.3e} against \
+                 f32 stores, {}/{} leading tokens agree",
+                precision.as_str(),
+                partial.max_abs_difference,
+                partial.agreeing_tokens,
+                partial.steps
+            );
+        }
+    }
+}
+
 /// The CPU Providers of `providers/cpu` hold TurboQuant stores as the
-/// Runtime's Reference CPU does: with `tq4` K and V, every checkpoint
-/// above generates the same tokens with logits within 1e-3 of the
-/// Reference CPU's (`turboquant-kv-history`).
+/// Runtime's Reference CPU does: with `tq4` K and V, every row quantized
+/// or the first 4 kept exact (`keep-turboquant-kv-head-exact`), every
+/// checkpoint above generates the same tokens with logits within 1e-3 of
+/// the Reference CPU's (`turboquant-kv-history`).
 #[test]
 fn the_cpu_providers_hold_turboquant_kv_stores_like_the_reference_cpu() {
     use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
-    let tq4 = KvPrecisions::uniform(KvStorePrecision::Tq4);
     for (variant, format, family) in VARIANTS {
-        let (reference_steps, reference_tokens, _) = generate_logits(
-            std::sync::Arc::new(ReferenceCpuProvider::new()),
-            "gemma4",
-            variant,
-            format,
-            family,
-            tq4,
-        );
-        for (provider, label) in cpu_providers() {
-            let (steps, tokens, resolution) =
-                generate_logits(provider, "gemma4", variant, format, family, tq4);
-            assert_eq!(resolution.resolved, tq4, "{label} {variant}");
-            assert_eq!(tokens, reference_tokens, "{label} {variant}");
-            let difference = reference_steps
-                .iter()
-                .zip(&steps)
-                .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
-                .fold(0.0_f32, f32::max);
-            assert!(difference < 1e-3, "{label} {variant}: {difference}");
-            eprintln!(
-                "{label} {variant} tq4: max |logit difference| {difference:.3e} against the Reference CPU"
+        for tq4 in [0, 4].map(|exact_rows| {
+            KvPrecisions::uniform(KvStorePrecision::Tq4).with_exact_rows(exact_rows)
+        }) {
+            let (reference_steps, reference_tokens, _) = generate_logits(
+                std::sync::Arc::new(ReferenceCpuProvider::new()),
+                "gemma4",
+                variant,
+                format,
+                family,
+                tq4,
             );
+            for (provider, label) in cpu_providers() {
+                let (steps, tokens, resolution) =
+                    generate_logits(provider, "gemma4", variant, format, family, tq4);
+                assert_eq!(resolution.resolved, tq4, "{label} {variant}");
+                assert_eq!(tokens, reference_tokens, "{label} {variant}");
+                let difference = reference_steps
+                    .iter()
+                    .zip(&steps)
+                    .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+                    .fold(0.0_f32, f32::max);
+                assert!(difference < 1e-3, "{label} {variant}: {difference}");
+                eprintln!(
+                    "{label} {variant} tq4, exact head of {} rows: max |logit difference| \
+                 {difference:.3e} against the Reference CPU",
+                    tq4.exact_rows
+                );
+            }
         }
     }
 }

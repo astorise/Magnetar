@@ -1449,10 +1449,32 @@ impl E2eRuntimeModelExecutionEngine {
                     }
                     precision
                 };
-            let resolved = KvPrecisions {
+            let mut resolved = KvPrecisions {
                 k: resolve_role("K", requested.k, |(key, _)| *key),
                 v: resolve_role("V", requested.v, |(_, value)| *value),
+                exact_rows: 0,
             };
+            // An exact head (`keep-turboquant-kv-head-exact`) only where a
+            // TurboQuant store is, and the Provider keeps one.
+            if requested.exact_rows > 0 && resolved.quantized() {
+                let advertised = provider.is_some_and(|provider| {
+                    provider_kernels_declare(
+                        runtime,
+                        provider,
+                        "kv-write",
+                        crate::operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE,
+                    )
+                });
+                if advertised {
+                    resolved.exact_rows = requested.exact_rows;
+                } else {
+                    fallbacks.push(format!(
+                        "exact head of {} rows requested, but the Provider does not advertise \
+                         exact heads on kv-write; every row quantized",
+                        requested.exact_rows
+                    ));
+                }
+            }
             (resolved, fallbacks)
         })
     }
@@ -1501,7 +1523,13 @@ impl E2eRuntimeModelExecutionEngine {
     /// `express-latent-attention-forms`).
     /// At their stored size in `precisions` (`turboquant-kv-history`).
     fn kv_set_bytes(&self, capacity: u64, precisions: KvPrecisions) -> u64 {
-        kv_bytes_per_token(&self.fixture.config, precisions).saturating_mul(capacity)
+        kv_bytes_per_token(&self.fixture.config, precisions)
+            .saturating_mul(capacity)
+            .saturating_add(super::kv_pool::kv_exact_head_bytes(
+                &self.fixture.config,
+                precisions,
+                capacity,
+            ))
     }
 
     /// Releases the stores of sets the pool dropped.

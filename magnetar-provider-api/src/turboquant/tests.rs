@@ -178,3 +178,46 @@ fn stored_sizes() {
     }
     assert_eq!(KvStorePrecision::parse("q4"), None);
 }
+
+/// A store with an exact head (`keep-turboquant-kv-head-exact`) keeps the
+/// rows below the head's end unchanged and stores the others as their
+/// round trip with the offsets the write at row 0 set, across writes that
+/// straddle the head's end.
+#[test]
+fn an_exact_head_keeps_its_rows_unchanged() {
+    let (d, heads) = (16usize, 2usize);
+    let width = d * heads;
+    let rows: Vec<f32> = (0..6)
+        .flat_map(|row| pseudo_random_row(width, row as u64 + 3))
+        .collect();
+    // The same writes without a head: the offsets come from the first.
+    let mut codes_only = TurboQuantStoreState::new(KvStorePrecision::Tq4, d as u64, width as u64);
+    let mut rounded = codes_only.write(&rows[..4 * width], 0).unwrap();
+    rounded.extend(codes_only.write(&rows[4 * width..], 4).unwrap());
+    let mut store =
+        TurboQuantStoreState::new(KvStorePrecision::Tq4, d as u64, width as u64).with_exact_rows(3);
+    // Rows 0..4, then 4..6: the head ends inside the first write.
+    let mut stored = store.write(&rows[..4 * width], 0).unwrap();
+    stored.extend(store.write(&rows[4 * width..], 4).unwrap());
+    assert_eq!(store.offsets, codes_only.offsets);
+    assert_eq!(&stored[..3 * width], &rows[..3 * width]);
+    assert_eq!(&stored[3 * width..], &rounded[3 * width..]);
+    assert_ne!(&stored[3 * width..], &rows[3 * width..]);
+    // An f32 store has no separate head; a TurboQuant one adds its rows.
+    assert_eq!(
+        KvStorePrecision::F32.stored_bytes_with_head(8, 64, 16, 4),
+        KvStorePrecision::F32.stored_bytes(8, 64, 16)
+    );
+    assert_eq!(
+        KvStorePrecision::Tq4.stored_bytes_with_head(8, 64, 16, 4),
+        KvStorePrecision::Tq4
+            .stored_bytes(8, 64, 16)
+            .map(|codes| codes + 4 * 64 * 4)
+    );
+    assert_eq!(
+        KvStorePrecision::Tq4.stored_bytes_with_head(2, 64, 16, 4),
+        KvStorePrecision::Tq4
+            .stored_bytes(2, 64, 16)
+            .map(|codes| codes + 2 * 64 * 4)
+    );
+}

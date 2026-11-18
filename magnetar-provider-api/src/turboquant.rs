@@ -97,6 +97,27 @@ impl KvStorePrecision {
             .checked_mul(width / head_dimension)?
             .checked_mul(self.head_row_bytes(head_dimension))
     }
+
+    /// [`Self::stored_bytes`] of a store whose first `exact_rows` rows stay
+    /// exact (`keep-turboquant-kv-head-exact`): the codes of every row plus
+    /// those rows as `f32`. An `f32` store has no separate head.
+    pub fn stored_bytes_with_head(
+        self,
+        capacity: u64,
+        width: u64,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Option<u64> {
+        let codes = self.stored_bytes(capacity, width, head_dimension)?;
+        if self.bits().is_none() {
+            return Some(codes);
+        }
+        exact_rows
+            .min(capacity)
+            .checked_mul(width)?
+            .checked_mul(4)?
+            .checked_add(codes)
+    }
 }
 
 /// The `b`-bit codebook for coordinates of unit vectors in `R^d`.
@@ -431,28 +452,40 @@ pub fn kv_store_round_trip_with_offsets(
 }
 
 /// What a Provider that keeps a TurboQuant store's rows as their round trip
-/// (the CPU Providers) knows of the store: its precision, head width and
-/// offsets.
+/// (the CPU Providers) knows of the store: its precision, head width,
+/// offsets and exact head.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurboQuantStoreState {
     pub precision: KvStorePrecision,
     pub head_dimension: u64,
     /// See [`turboquant_store_offsets`]; zeros until the write at row 0.
     pub offsets: Vec<f32>,
+    /// The rows below this index stay exact
+    /// (`keep-turboquant-kv-head-exact`); 0 for none.
+    pub exact_rows: u64,
 }
 
 impl TurboQuantStoreState {
-    /// A store of `width`-wide rows, its offsets zero.
+    /// A store of `width`-wide rows, its offsets zero, without an exact
+    /// head.
     pub fn new(precision: KvStorePrecision, head_dimension: u64, width: u64) -> Self {
         Self {
             precision,
             head_dimension,
             offsets: vec![0.0; width as usize],
+            exact_rows: 0,
         }
     }
 
-    /// `rows` written at `row_offset`, as the store holds them. A write at
-    /// row 0 starts the history: it first sets the offsets from its rows.
+    /// This store with its first `exact_rows` rows kept exact.
+    pub fn with_exact_rows(mut self, exact_rows: u64) -> Self {
+        self.exact_rows = exact_rows;
+        self
+    }
+
+    /// `rows` written at `row_offset`, as the store holds them: a row below
+    /// the exact head's end unchanged, any other as its round trip. A write
+    /// at row 0 starts the history: it first sets the offsets from its rows.
     /// `None` when the rows are not whole rows of the store.
     pub fn write(&mut self, rows: &[f32], row_offset: u64) -> Option<Vec<f32>> {
         let width = self.offsets.len();
@@ -462,7 +495,19 @@ impl TurboQuantStoreState {
         if row_offset == 0 && !rows.is_empty() {
             self.offsets = turboquant_store_offsets(rows, width);
         }
-        kv_store_round_trip_with_offsets(rows, self.head_dimension, self.precision, &self.offsets)
+        let mut stored = kv_store_round_trip_with_offsets(
+            rows,
+            self.head_dimension,
+            self.precision,
+            &self.offsets,
+        )?;
+        let exact = self
+            .exact_rows
+            .saturating_sub(row_offset)
+            .min((rows.len() / width) as u64);
+        let exact_values = exact as usize * width;
+        stored[..exact_values].copy_from_slice(&rows[..exact_values]);
+        Some(stored)
     }
 }
 

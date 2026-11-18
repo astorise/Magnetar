@@ -416,8 +416,21 @@ fn kv_quantization_modes_name_turboquant_precisions_only() {
         kv_quantization_mode(KvPrecisions {
             k: KvStorePrecision::Tq4,
             v: KvStorePrecision::Tq3,
+            exact_rows: 0,
         })
         .as_deref(),
         Some("turboquant-kv:k=tq4,v=tq3")
+    );
+    // An exact head is part of the compatibility: a history with one is
+    // read differently from one without (`keep-turboquant-kv-head-exact`).
+    assert_eq!(
+        kv_quantization_mode(KvPrecisions::uniform(KvStorePrecision::Tq4)).as_deref(),
+        Some("turboquant-kv:k=tq4,v=tq4,exact=1024")
+    );
+    // An f32 history has no head to keep exact.
+    assert_eq!(KvPrecisions::uniform(KvStorePrecision::F32).exact_rows, 0);
+    assert_eq!(
+        KvPrecisions::uniform(KvStorePrecision::F32).with_exact_rows(64),
+        KvPrecisions::default()
     );
 }
