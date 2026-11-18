@@ -129,3 +129,20 @@ the history once for each of the 16 heads (11 GB/s). Conformance:
 `turboquant_latent_decode_on_codes_matches_the_cpu` (`tq4` and `tq3`, 33
 to 1,100 keys, exact heads, a sliding window) and
 `batched_matmul_and_strided_values_match_the_cpu` pass.
+
+Run 44355981594 (providers/cuda 8947b7f): the f32 latent decode takes a
+block per chunk and eight query heads (`latent_attention_split_kernel`),
+reading each row once for them all, the values in place:
+
+| us | 1,024 keys | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|---|
+| f32 history, per-head Kernel (before) | 101.6 | 318.7 | 3,030.1 | 6,886.6 |
+| f32 history, eight heads per block | 101.2 | 163.6 | 810.4 | 1,499.6 |
+| `tq4` on its codes | 107.9 | 155.2 | 560.6 | 1,046.2 |
+| `tq4` on its codes, 1,024-row exact head | 105.3 | 295.0 | 605.0 | 1,122.8 |
+
+The f32 latent decode is 4.6x faster at 32,768 keys (50 GB/s against
+11); `tq4` on its codes stays 1.4x faster than it there. At 1,024 keys
+both take about 100 us: 8 chunks and 2 head blocks give 16 blocks for 28
+multiprocessors. `latent_decode_matches_the_cpu` (33 to 1,100 keys, a
+sliding window) passes.

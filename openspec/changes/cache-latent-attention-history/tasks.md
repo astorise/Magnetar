@@ -33,4 +33,5 @@
 - [x] 6.3 The tiny GGUF checkpoints (the `wide` bundle) run with `tq4` and `tq3` latent histories on the Reference CPU, and both CPU Providers match it exactly; the Hugging Face ones keep f32 (groups of 4).
 - [x] 6.4 DeepSeek-V2-Lite-Chat with a `tq4` latent history continues with " Paris.": its 64 greedy tokens equal the f32 run's, TPOT 20.49 ms (run 44183609847).
 - [x] 6.5 CUDA: a decode step over a `tq4`/`tq3` latent history runs on its codes (`tq_latent_attention_split_kernel`), and decode steps read the values in place: 921.5 against 8,105.5 us through dequantized scratch at 32,768 keys (design, Evidence: latent decode on codes).
-- [ ] 6.6 The f32 latent decode reads the history once per query head (6,886.6 us at 32,768 keys): a block serving several query heads, as on codes.
+- [x] 6.6 The f32 latent decode reads the history once per query head (6,886.6 us at 32,768 keys): a block serving eight query heads (`latent_attention_split_kernel`), 1,499.6 us (run 44355981594).
+- [ ] 6.7 DeepSeek-V2-Lite's TPOT at long contexts (4,096 to 16,384 tokens) with f32 and `tq4` latent histories.
