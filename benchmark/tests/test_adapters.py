@@ -88,14 +88,25 @@ class AdapterTests(unittest.TestCase):
             root = Path(tmp)
             def fake(command, cwd, env):
                 self.assertEqual(env["MAGNETAR_QUALIFICATION_REQUIRE_CUDA"], "1")
+                self.assertEqual(env["MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS"], "2")
                 report = {"manifest": {"provider": {"name": "cuda"}, "checkpoint": {}, "dtype": "f32"},
                           "samples": [{"phase": "warmup", "metrics": {}},
                                       {"phase": "measured", "metrics": {"generated_tokens": 4}}]}
                 Path(env["MAGNETAR_QUALIFICATION_REPORT_DIR"], "campaign.json").write_text(json.dumps(report))
                 return "out", "err", 3.0
             with patch.object(magnetar, "timed_command", side_effect=fake):
-                result = magnetar.run(args(device="gpu", model_path=tmp, runs=1), root / "raw")
+                result = magnetar.run(args(device="gpu", model_path=tmp, runs=1, tokens=2), root / "raw")
             self.assertEqual(result["samples"], [{"generated_tokens": 4}])
+
+    def test_magnetar_rejects_one_token_before_starting_campaign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for device in ("cpu", "gpu"):
+                raw_dir = Path(tmp) / device
+                with self.subTest(device=device), patch.object(magnetar, "timed_command") as command:
+                    with self.assertRaisesRegex(ValueError, "--tokens >= 2"):
+                        magnetar.run(args(device=device, model_path=tmp, tokens=1), raw_dir)
+                    command.assert_not_called()
+                    self.assertFalse(raw_dir.exists())
 
 
 if __name__ == "__main__":

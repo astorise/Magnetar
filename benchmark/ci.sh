@@ -9,6 +9,10 @@ if [[ ! "$BENCH_TOKENS" =~ ^[1-9][0-9]*$ || ! "$BENCH_RUNS" =~ ^[1-9][0-9]*$ ]];
   echo 'Tokens and runs must be positive integers' >&2
   exit 1
 fi
+if [[ "$BENCH_ENGINE" == magnetar && "$BENCH_TOKENS" == 1 ]]; then
+  echo 'Magnetar qualification requires tokens >= 2 to measure decode latency' >&2
+  exit 1
+fi
 
 work="$RUNNER_TEMP/benchmark-work"
 results="$RUNNER_TEMP/benchmark-results"

@@ -10,7 +10,9 @@ Le scénario de base est une requête à la fois, le texte brut
 `The capital of France is`, une génération gloutonne, 16 tokens au maximum,
 un échauffement et cinq répétitions mesurées. Les moteurs peuvent s'arrêter
 avant la limite ; les comptes réellement retournés sont conservés. Les
-adaptateurs utilisent les interfaces réellement disponibles : les unités,
+campagnes Magnetar exigent une limite d'au moins deux tokens afin de mesurer
+la latence de décodage entre les tokens. Les adaptateurs utilisent les
+interfaces réellement disponibles : les unités,
 frontières de mesure et conditions d'exécution ne sont pas toutes identiques.
 Il ne faut pas classer les moteurs à partir de valeurs de noms différents.
 

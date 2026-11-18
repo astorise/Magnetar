@@ -7,6 +7,8 @@ from common import ROOT, timed_command
 
 
 def run(args, raw_dir):
+    if args.tokens < 2:
+        raise ValueError("Magnetar qualification requires --tokens >= 2 to measure decode latency")
     if not args.model_path or not Path(args.model_path).is_dir():
         raise ValueError("Magnetar requires --model-path pointing to the pinned Hugging Face bundle")
     raw_dir.mkdir(parents=True, exist_ok=False)
