@@ -118,7 +118,14 @@ fn turboquant_kv_gains_on_cuda() {
         None => magnetar_provider_cuda::CudaProvider::new().is_available(),
     };
     let gpus = match &devices {
-        Some(ordinals) => format!("{} GPUs, the layers placed across them", ordinals.len()),
+        Some(ordinals) => format!(
+            "{} GPUs, the layers placed across them ({})",
+            ordinals.len(),
+            match std::env::var("MAGNETAR_LAYER_PLACEMENT").as_deref() {
+                Ok("balanced") => "balanced",
+                _ => "filling the first",
+            }
+        ),
         None => "one GPU".to_string(),
     };
     if !available {
@@ -214,15 +221,38 @@ fn turboquant_kv_gains_on_cuda() {
         let single = devices
             .is_none()
             .then(|| Arc::new(magnetar_provider_cuda::CudaProvider::new()));
-        let provider: Arc<dyn Provider> = match (&single, &devices) {
-            (Some(single), _) => single.clone(),
-            (None, Some(ordinals)) => Arc::new(
+        let multi = devices.as_ref().map(|ordinals| {
+            Arc::new(
                 magnetar_provider_cuda::multi::CudaMultiProvider::for_devices(
                     ordinals,
                     "magnetar:provider/cuda",
                 ),
-            ),
+            )
+        });
+        let provider: Arc<dyn Provider> = match (&single, &multi) {
+            (Some(single), _) => single.clone(),
+            (None, Some(multi)) => multi.clone(),
             (None, None) => unreachable!("a single Provider without devices"),
+        };
+        // Each GPU's free memory (diagnostic): after the load, and after a
+        // context that failed.
+        let free_memory = |when: &str| {
+            if let Some(multi) = &multi {
+                let free: Vec<String> = multi
+                    .free_memory()
+                    .iter()
+                    .enumerate()
+                    .map(|(gpu, free)| match free {
+                        Some(bytes) => format!("GPU {gpu} {} MiB", bytes >> 20),
+                        None => format!("GPU {gpu} unknown"),
+                    })
+                    .collect();
+                eprintln!(
+                    "[kv gains] {label} {}: free memory {when}: {}",
+                    precision_label(&precision),
+                    free.join(", ")
+                );
+            }
         };
         let mut model = ProductionLoadedModel::load_with_component(
             fixture,
@@ -233,6 +263,7 @@ fn turboquant_kv_gains_on_cuda() {
         )
         .expect("the checkpoint loads");
         model.request_kv_precisions(precision);
+        free_memory("after the load");
         let free_bytes_after_load = single.as_ref().map(|single| {
             single
                 .context()
@@ -295,11 +326,14 @@ fn turboquant_kv_gains_on_cuda() {
                     token_times.len(),
                     context_started.elapsed().as_secs_f64()
                 ),
-                Err(error) => eprintln!(
-                    "[kv gains] {label} {} context {context}: failed after {:.0} s: {error}",
-                    precision_label(&precision),
-                    context_started.elapsed().as_secs_f64()
-                ),
+                Err(error) => {
+                    eprintln!(
+                        "[kv gains] {label} {} context {context}: failed after {:.0} s: {error}",
+                        precision_label(&precision),
+                        context_started.elapsed().as_secs_f64()
+                    );
+                    free_memory(&format!("after context {context} failed"));
+                }
             }
             match outcome {
                 Ok(outcome) => {

@@ -1860,13 +1860,17 @@ jobs:
         # GPUs, the latent history f32, tq4 with its default exact head and
         # tq4 without, at 1,024 to 16,384 tokens: TPOT and the agreement
         # with f32 of the absorbed decode on the history (grouped f32 heads,
-        # tq4 on its codes). Diagnostic: the report is in the summary.
+        # tq4 on its codes). Diagnostic: the report is in the summary. The
+        # layers are balanced across the GPUs: with the first GPU filled,
+        # a 4,096-token prefill ran out of its memory (run 44358602056).
+        # Each GPU's free memory is printed after the load.
         if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
         continue-on-error: true
         timeout-minutes: 60
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
           MAGNETAR_KV_POOL_BYTES: "0"
           MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4,tq4@0"
           MAGNETAR_KV_GAINS_CONTEXTS: "1024,4096,16384"
