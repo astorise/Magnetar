@@ -165,6 +165,14 @@ jobs:
         # only.
         timeout-minutes: 10
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml moe_decode_kernel_times -- --ignored --nocapture
+      - name: CUDA mixture-of-experts prefill times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # The Device time of a moe-experts prefill at DeepSeek-V2-Lite's
+        # routed experts, packed Q8_0, over 1,024 and 4,096 tokens: the
+        # pairs grouped by expert against one pair at a time; diagnostic
+        # only.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml moe_prefill_kernel_times -- --ignored --nocapture
       - name: CUDA long-context kernel times (diagnostic)
         if: ${{ env.SUITE_KERNELS == 'true' }}
         # The Device time of each prefill matmul shape and of the attention
