@@ -156,3 +156,15 @@ out of memory (the latent attention's prefill is not chunked, and the
 `fill` placement leaves little free on the first GPU), so longer contexts
 are not measured on this hardware. Short prompts keep " Paris." with both
 histories (TPOT 13.51 and 13.54 ms).
+
+The exact head's keys in the latent code Kernel: scoring them in a
+separate pass from queries staged as they are, rotated only afterwards
+(providers/cuda 3680c94), brought a 4,096-key step with the head from
+295.0 to 195.1 us but slowed the decode on codes alone from 155.2 to
+172.8 us at 4,096 keys and from 560.6 to 743.4 at 16,384 (run
+44367354898); it is reverted. Reading the exact keys' rows and the
+queries as float4s within the original loop (providers/cuda 080e79c,
+run 44369519228) keeps the decode on codes alone at its times (150.6,
+569.2 and 1,030.5 us at 4,096, 16,384 and 32,768 keys) and brings the
+head's 4,096-key step to 227.7 us (595.1 and 1,123.7 at 16,384 and
+32,768).
