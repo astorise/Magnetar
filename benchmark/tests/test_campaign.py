@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import campaign_report
 import llama_server
+import qwen36_preflight
+import strata_native
 
 
 class FakeProcess:
@@ -29,6 +32,79 @@ class FakeProcess:
 
 
 class CampaignTests(unittest.TestCase):
+    def test_experimental_llama_records_the_exact_ids_used_by_strata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "model.gguf"
+            model.write_bytes(b"same weights")
+            ids = root / "prompt.json"
+            requests = []
+            args = SimpleNamespace(binary="server", model_path=str(model), device="gpu", tokens=2, runs=1)
+
+            def http(url, body=None, timeout=3600):
+                requests.append((url, body))
+                if url.endswith("/health"):
+                    return {"status": "ok"}
+                if url.endswith("/tokenize"):
+                    return {"tokens": [11, 22]}
+                return {"content": "ok", "tokens": [33, 44],
+                        "timings": {"prompt_n": 2, "predicted_n": 2, "predicted_per_second": 1}}
+
+            with patch.dict(os.environ, {"BENCH_MODEL_PROFILE": "qwen3.6-35b-experimental", "BENCH_PROMPT_IDS_PATH": str(ids)}), \
+                    patch.object(llama_server.subprocess, "Popen", side_effect=FakeProcess), \
+                    patch.object(llama_server, "http_json", side_effect=http):
+                result = llama_server.run(args, root / "raw")
+            self.assertEqual(json.loads(ids.read_text()), [11, 22])
+            self.assertEqual([body["prompt"] for url, body in requests if url.endswith("/completion")], [[11, 22], [11, 22]])
+            self.assertIn("--cpu-moe", result["command"])
+            self.assertEqual(result["samples"][0]["generated_token_ids"], [33, 44])
+
+    def test_strata_native_uses_same_prompt_and_preserves_cache_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "model.gguf"
+            model.write_bytes(b"same weights")
+            ids = root / "prompt.json"
+            ids.write_text("[11, 22]")
+            args = SimpleNamespace(binary=str(root / "strata"), model_path=str(model), device="gpu", tokens=2, runs=1)
+
+            class Process:
+                def __init__(self, *args, **kwargs):
+                    self.stdin = io.StringIO()
+                    self.stdout = io.StringIO("INFO test=1\nREADY 512 stop\nT 33\nT 44\nDONE 2 2 1 2 length 0 0 0\n"
+                                              "T 33\nT 44\nDONE 2 2 1 2 length 0 0 1\n")
+                def wait(self, timeout=None):
+                    return 0
+
+            with patch.dict(os.environ, {"BENCH_PROMPT_IDS_PATH": str(ids), "CUDA_VISIBLE_DEVICES": "0"}), \
+                    patch.object(strata_native.subprocess, "Popen", side_effect=Process):
+                result = strata_native.run(args, root / "raw")
+            self.assertEqual(result["samples"][0]["generated_token_ids"], [33, 44])
+            self.assertEqual(result["samples"][0]["cached_prompt_tokens"], 1)
+            self.assertEqual(result["samples"][0]["prompt_tokens"], 2)
+            self.assertIn("--mtp", result["command"])
+
+    def test_large_model_preflight_refuses_insufficient_memory(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(qwen36_preflight, "effective_memory", return_value=16_000_000_000):
+            with self.assertRaisesRegex(RuntimeError, "32 GB RAM"):
+                qwen36_preflight.main(tmp, Path(tmp) / "model.gguf")
+
+    def test_experimental_summary_keeps_unknown_tokens_and_strata_cache_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "model-profile.txt").write_text("qwen3.6-35b-experimental", encoding="utf-8")
+            (root / "status.tsv").write_text("strata_native\tsuccess\ncandle\tunavailable\n", encoding="utf-8")
+            path = root / "strata_native" / "report.json"
+            path.parent.mkdir()
+            path.write_text(json.dumps({"schema": "magnetar.benchmark/v1", "engine": "strata_native",
+                "samples": [], "summary": {"cached_prompt_tokens": {"max": 3}}}), encoding="utf-8")
+            text = campaign_report.render(root)
+            self.assertIn("Experimental profile", text)
+            self.assertIn("Strata reused up to 3 prompt tokens", text)
+            self.assertIn("Prompt token counts are unavailable", text)
+            self.assertNotIn("Token counts differ", text)
+
     def test_llama_server_is_local_disables_cache_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

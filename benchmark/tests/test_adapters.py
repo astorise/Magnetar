@@ -37,6 +37,8 @@ class AdapterTests(unittest.TestCase):
                 result = candle.run(config, Path(tmp) / "raw")
             self.assertEqual(command.call_count, 3)
             self.assertEqual(result["samples"][0]["generated_tokens"], 16)
+            self.assertEqual(result["samples"][0]["request_tokens_per_second"], 12.5)
+            self.assertEqual(result["samples"][0]["request_seconds"], 16 / 12.5)
             self.assertIn("--cpu", command.call_args.args[0])
             with patch.object(candle, "timed_command", return_value=("Running on CPU", "", 3.0)):
                 with self.assertRaisesRegex(RuntimeError, "fell back"):

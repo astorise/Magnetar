@@ -3,6 +3,12 @@ name: Benchmark CPU
 on:
   workflow_dispatch:
     inputs:
+      model:
+        description: Model profile (Qwen3.6 requires a large-memory runner)
+        type: choice
+        options: [qwen2.5-0.5b, qwen3.6-35b-experimental]
+        default: qwen2.5-0.5b
+        required: true
       tokens:
         description: Maximum generated tokens per request (at least 2)
         default: '16'
@@ -26,6 +32,7 @@ jobs:
     timeout-minutes: 360
     env:
       BENCH_DEVICE: cpu
+      BENCH_MODEL_PROFILE: ${{ inputs.model }}
       BENCH_TOKENS: ${{ inputs.tokens }}
       BENCH_RUNS: ${{ inputs.runs }}
     steps:

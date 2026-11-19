@@ -3,6 +3,12 @@ name: Benchmark GPU
 on:
   workflow_dispatch:
     inputs:
+      model:
+        description: Model profile (Qwen3.6 needs about 32 GB RAM and 30 GB free disk)
+        type: choice
+        options: [qwen2.5-0.5b, qwen3.6-35b-experimental]
+        default: qwen2.5-0.5b
+        required: true
       tokens:
         description: Maximum generated tokens per request (at least 2)
         default: '16'
@@ -32,6 +38,7 @@ jobs:
         shell: bash
     env:
       BENCH_DEVICE: gpu
+      BENCH_MODEL_PROFILE: ${{ inputs.model }}
       BENCH_TOKENS: ${{ inputs.tokens }}
       BENCH_RUNS: ${{ inputs.runs }}
     steps:

@@ -7,8 +7,25 @@ mkdir -p "$work"
 if [[ "$BENCH_DEVICE" == cpu ]]; then export CUDA_VISIBLE_DEVICES=""; fi
 
 case "$BENCH_ENGINE" in
-  magnetar|llama_server)
+  magnetar|candle|llama_server)
     exec bash benchmark/ci.sh
+    ;;
+  strata_native)
+    if [[ "$BENCH_DEVICE" != gpu || "${BENCH_MODEL_PROFILE:-}" != qwen3.6-35b-experimental ]]; then
+      echo 'Strata native Qwen3.6 requires the experimental GPU profile' >&2; exit 1
+    fi
+    source benchmark/qwen36.sh
+    prepare_qwen36 "$work"
+    archive="$work/strata-engine.tar.gz"
+    curl --retry 3 -fsSL 'https://github.com/Niko1221/Strata/releases/download/v0.2.16/strata-engine-0.1.62-linux-x86_64-cuda-cuda13.tar.gz' -o "$archive"
+    echo "6723e1b6b6042bfe1d368723ebf873afb0fa65f4f1908d948dd865098f6cfb9e  $archive" | sha256sum -c
+    mkdir -p "$work/strata-engine"
+    tar -xzf "$archive" -C "$work/strata-engine"
+    binary=$(find "$work/strata-engine" -type f -name strata -print -quit)
+    if [[ -z "$binary" ]]; then echo 'Strata engine binary missing from release' >&2; exit 1; fi
+    export BENCH_PROMPT_IDS_PATH="$RUNNER_TEMP/benchmark-results/qwen36-prompt-ids.json"
+    python3 benchmark/run.py strata_native --device gpu --tokens "$BENCH_TOKENS" --runs "$BENCH_RUNS" \
+      --binary "$binary" --model-path "$QWEN36_MODEL" --revision 'strata-engine-0.1.62' --output-dir "$RUNNER_TEMP/benchmark-results"
     ;;
   airllm)
     revision=56e297a30511289fc85473f9911d6fa6cf9e27cf
