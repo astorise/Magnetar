@@ -7,4 +7,12 @@
 ## 2. Qualification
 
 - [x] 2.1 Local, Qwen2.5-0.5B, qualification campaign (16 tokens, 5 runs, 4 threads): identical tokens with capture on and off. The median time per output token is 68 ms with capture against 84 ms without; the container's timings are noisy.
-- [ ] 2.2 Benchmark CPU, all engines in one job.
+- [x] 2.2 Benchmark CPU on Qwen2.5-0.5B, all engines in one job (run 44521749985, AMD EPYC 7763, 4 vCPUs, no AVX-512, providers/cpu 65e9627). Same tokens as the GPU runs:
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar `cpu-native` | 600 ms | 101.8 ms | 33.2 ms (32-34 ms once replayed) |
+  | llama-server (FP16 GGUF) | 532 ms | 49.4 ms | 32.6 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached) | 500 ms | 30.7 ms | 29.2 ms |
+
+  Run 44517360795 (an EPYC 9V74, without capture) measured Magnetar at 752 ms per request and 43.6 ms per token, against 32.3 ms for llama-server on that host. The gap that remains is the TTFT: the 5-token prompt runs as an 8-row bucket.
