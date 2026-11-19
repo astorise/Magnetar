@@ -233,3 +233,9 @@ against 1,125.0 us at 32,768, about 7.7 ms less per token over 27 layers),
 yet the `tq4` TPOT stays within 5% of `f32`'s: the rest of a `tq4` decode
 step costs about that much more at 32,768 tokens, which this run does not
 locate.
+
+Node by node with every dispatch waiting for its Kernels (run 44431584039),
+a `tq4` decode step at 16,384 tokens takes 49.45 ms against `f32`'s 52.02:
+its attention's 12.88 against 15.46 ms, every other phase the same
+(`chunk-latent-prefills`, Evidence). The replayed steps' TPOT differences of
+about a millisecond either way between runs are within their noise.

@@ -107,3 +107,29 @@ time (3,975.4 against 2,960.4 ms at 1,024 tokens in that run) is spent
 elsewhere. The pass itself runs the tiled 192/128 Kernel at about 0.5
 multiply-add Tera-operations per second (2,048 x 16,384 x 16 heads x 320 in
 335 ms): at 32,768 tokens it is about half of TTFT.
+
+The DeepSeek phases step (run 44431584039: every dispatch waits for its
+Kernels, decode steps node by node, `f32` then `tq4` without an exact head)
+attributes each request's host time, which then covers Device time:
+
+| Phase | f32, 1,024 | tq4, 1,024 | f32, 16,384 | tq4, 16,384 |
+|---|---|---|---|---|
+| prefill | 3,292.6 ms | 3,651.7 ms | 94,919.4 ms | 106,225.4 ms |
+| `moe-experts` | 2,124.4 | 2,359.3 | 35,213.7 | 40,901.0 |
+| `gated-matmul` | 338.4 | 382.3 | 5,217.0 | 6,394.8 |
+| `matmul-residual` | 292.8 | 324.1 | 4,203.5 | 4,731.6 |
+| `matmul` | 232.3 | 254.3 | 3,165.7 | 3,704.5 |
+| `attention` | 229.7 | 256.0 | 46,196.1 | 49,505.1 |
+| KV append | 2.2 | 7.5 | 22.3 | 59.1 |
+| decode step | 35.66 ms | 36.69 ms | 52.02 ms | 49.45 ms |
+| its `attention` | 1.59 | 2.24 | 15.46 | 12.88 |
+
+The `tq4` prefill's extra time is spread over every operator, those that
+never read the history included (`moe-experts` 11% and 16% slower), while
+its own work, the KV append, adds 5 and 37 ms. That is not TurboQuant work;
+it is consistent with the Device running slower later in the job (the
+`tq4` requests follow the `f32` ones, 32,768 tokens included, in every run)
+while the bandwidth-bound decode steps keep their times; this run does not
+measure the clocks. A `tq4` decode step at 16,384 tokens takes 2.57 ms less
+than an `f32` one, its attention's 2.58 ms. At 16,384 tokens the latent
+prefill attention is 49% of the prefill and `moe-experts` 37%.

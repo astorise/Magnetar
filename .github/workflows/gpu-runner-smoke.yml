@@ -1897,9 +1897,16 @@ jobs:
           set -o pipefail
           report="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-gguf"
           mkdir -p "$report"
+          # The GPUs' clocks, temperature and power every 15 s, to tell
+          # whether later requests run on slower clocks (diagnostic).
+          nvidia-smi --query-gpu=timestamp,index,clocks.sm,clocks.mem,temperature.gpu,power.draw,pstate --format=csv,noheader -l 15 > "$report/clocks.csv" 2>&1 &
+          clocks=$!
           MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR" \
           MAGNETAR_KV_GAINS_REPORT="$report/gains.md" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains.log"
+          kill "$clocks" || true
+          echo "GPU clocks (timestamp, index, SM MHz, memory MHz, temperature, power, P-state):"
+          cat "$report/clocks.csv" || true
           cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
       - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF prefill and decode phases at long contexts (diagnostic)
         # chunk-latent-prefills: where a tq4 latent history's prefill and
