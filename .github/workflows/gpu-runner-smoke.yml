@@ -1921,8 +1921,11 @@ jobs:
           MAGNETAR_CUDA_DEVICES: "0,1"
           MAGNETAR_LAYER_PLACEMENT: balanced
           MAGNETAR_KV_POOL_BYTES: "0"
-          MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4@0"
-          MAGNETAR_KV_GAINS_CONTEXTS: "1024,16384"
+          # f32 again after tq4: whether the second model's requests are
+          # slower whatever their history (run 44441670479: the GPUs' clocks
+          # did not drop).
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4@0,f32"
+          MAGNETAR_KV_GAINS_CONTEXTS: "1024,4096"
           MAGNETAR_KV_GAINS_NEW_TOKENS: "16"
           MAGNETAR_KV_GAINS_LABEL: deepseek-v2-lite-chat-q8_0-phases
           MAGNETAR_KV_GAINS_PHASES: "1"

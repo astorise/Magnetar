@@ -130,6 +130,11 @@ its own work, the KV append, adds 5 and 37 ms. That is not TurboQuant work;
 it is consistent with the Device running slower later in the job (the
 `tq4` requests follow the `f32` ones, 32,768 tokens included, in every run)
 while the bandwidth-bound decode steps keep their times; this run does not
-measure the clocks. A `tq4` decode step at 16,384 tokens takes 2.57 ms less
+measure the clocks. Run 44441670479 does: the first GPU's SM clock stays
+between 1,732 and 1,942 MHz and its temperature at most 64 C through the
+`f32` and `tq4` requests alike, while the `tq4` TTFTs are again 22% (1,024
+tokens) to 19% (32,768) above `f32`'s, even with every 1,024-token prompt
+row in the exact head (the same values as `f32`'s): the clocks do not
+explain it. A `tq4` decode step at 16,384 tokens takes 2.57 ms less
 than an `f32` one, its attention's 2.58 ms. At 16,384 tokens the latent
 prefill attention is 49% of the prefill and `moe-experts` 37%.
