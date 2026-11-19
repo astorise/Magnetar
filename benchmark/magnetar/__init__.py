@@ -17,7 +17,7 @@ def run(args, raw_dir):
                 "MAGNETAR_QUALIFICATION_REPORT_DIR": str(raw_dir.resolve()),
                 "MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS": str(args.tokens),
                 "MAGNETAR_QUALIFICATION_MEASURED_RUNS": str(args.runs),
-                "MAGNETAR_QUALIFICATION_PROVIDERS": "reference-cpu" if args.device == "cpu" else "cuda"})
+                "MAGNETAR_QUALIFICATION_PROVIDERS": "cpu-native" if args.device == "cpu" else "cuda"})
     if args.device == "gpu":
         env["MAGNETAR_QUALIFICATION_REQUIRE_CUDA"] = "1"
     else:

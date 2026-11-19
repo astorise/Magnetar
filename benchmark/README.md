@@ -129,7 +129,7 @@ du modèle est décrit ci-dessous.
 
 | Sous-projet | Mesure et limites |
 | --- | --- |
-| Magnetar | Campagne native de qualification : modèle résident, requête froide, échauffement puis requêtes mesurées en streaming. TTFT, débit et traces par token ; CPU de référence ou CUDA exigé. Le rapport natif contient aussi les ressources et les limites de qualification. |
+| Magnetar | Campagne native de qualification : modèle résident, requête froide, échauffement puis requêtes mesurées en streaming. TTFT, débit et traces par token ; Provider CPU optimisé (`cpu-native`) ou CUDA exigé. Le rapport natif contient aussi les ressources et les limites de qualification. |
 | Candle | Exemple Qwen : nouveau processus et rechargement à chaque essai. `generation_tokens_per_second` inclut le traitement du prompt ; `process_seconds_including_load` inclut le démarrage et le chargement. CPU F32, GPU BF16 selon l'exemple. Le repli CPU explicite est refusé en mode GPU. |
 | llama.cpp | `llama-completion`, nouveau processus et rechargement à chaque essai. Débit de décodage lu dans les timings natifs. `--n-gpu-layers 0` en CPU, `999` demandé en GPU : vérifier dans les journaux les couches réellement déchargées et le backend utilisé. |
 | Ollama | API `/api/generate` sans template ; durée de requête et débit de décodage natif. Le placement est vérifié par `size_vram` dans `/api/ps`. Une valeur positive peut représenter un placement partiel GPU/CPU. Redémarrer ou décharger le modèle entre les modes CPU et GPU si nécessaire. |

@@ -24,7 +24,8 @@
 //!   Optional: `MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS` (default 16),
 //!   `MAGNETAR_QUALIFICATION_MEASURED_RUNS` (default 5),
 //!   `MAGNETAR_QUALIFICATION_PROVIDERS` (comma-separated subset of
-//!   `reference-cpu,cuda`, default both), `MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1`
+//!   `reference-cpu,cpu-native,cuda`, default `reference-cpu,cuda`),
+//!   `MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1`
 //!   (fail instead of skipping when no CUDA Device exists -- set by the GPU
 //!   CI job, which must never report a skipped CUDA campaign as a pass),
 //!   `MAGNETAR_QUALIFICATION_DRIVER` (driver identity recorded in the
@@ -473,7 +474,7 @@ fn write_report_if_requested(report: &CampaignReport) {
 }
 
 /// Which Providers the real campaign runs, from
-/// `MAGNETAR_QUALIFICATION_PROVIDERS` (default: all known).
+/// `MAGNETAR_QUALIFICATION_PROVIDERS` (default: the reference CPU and CUDA).
 fn selected_providers() -> Vec<String> {
     let selection = std::env::var("MAGNETAR_QUALIFICATION_PROVIDERS")
         .unwrap_or_else(|_| "reference-cpu,cuda".into());
@@ -485,7 +486,7 @@ fn selected_providers() -> Vec<String> {
         .collect();
     for name in &providers {
         assert!(
-            matches!(name.as_str(), "reference-cpu" | "cuda"),
+            matches!(name.as_str(), "reference-cpu" | "cpu-native" | "cuda"),
             "MAGNETAR_QUALIFICATION_PROVIDERS names unknown Provider {name:?}"
         );
     }
@@ -660,6 +661,15 @@ fn selected_real_providers() -> Vec<(&'static str, Arc<dyn Provider>)> {
     let mut providers: Vec<(&'static str, Arc<dyn Provider>)> = Vec::new();
     if selected.iter().any(|name| name == "reference-cpu") {
         providers.push(("reference-cpu", Arc::new(ReferenceCpuProvider::new())));
+    }
+    // The optimized CPU Provider: the reference one is a correctness
+    // baseline, orders of magnitude slower.
+    if selected.iter().any(|name| name == "cpu-native") {
+        let executor = magnetar_provider_cpu::native::NativeCpuExecutor::new();
+        providers.push((
+            "cpu-native",
+            Arc::new(magnetar_provider_cpu::native::NativeCpuProvider::with_executor(executor)),
+        ));
     }
     if selected.iter().any(|name| name == "cuda") {
         let cuda = magnetar_provider_cuda::CudaProvider::new();
