@@ -239,3 +239,9 @@ a `tq4` decode step at 16,384 tokens takes 49.45 ms against `f32`'s 52.02:
 its attention's 12.88 against 15.46 ms, every other phase the same
 (`chunk-latent-prefills`, Evidence). The replayed steps' TPOT differences of
 about a millisecond either way between runs are within their noise.
+
+The runner's second GPU throttles under these long prefills (91-95 C, SM
+675-1,320 MHz against about 1,890; `chunk-latent-prefills`, Evidence): the
+`tq4` histories, measured after the `f32` one, run on slower clocks than it
+did, so their TTFT and, to a lesser degree, TPOT comparisons with `f32`
+understate them.

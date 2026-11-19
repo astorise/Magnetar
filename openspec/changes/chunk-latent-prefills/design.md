@@ -130,12 +130,13 @@ its own work, the KV append, adds 5 and 37 ms. That is not TurboQuant work;
 it is consistent with the Device running slower later in the job (the
 `tq4` requests follow the `f32` ones, 32,768 tokens included, in every run)
 while the bandwidth-bound decode steps keep their times; this run does not
-measure the clocks. Run 44441670479 does: the first GPU's SM clock stays
-between 1,732 and 1,942 MHz and its temperature at most 64 C through the
-`f32` and `tq4` requests alike, while the `tq4` TTFTs are again 22% (1,024
-tokens) to 19% (32,768) above `f32`'s, even with every 1,024-token prompt
-row in the exact head (the same values as `f32`'s): the clocks do not
-explain it. A `tq4` decode step at 16,384 tokens takes 2.57 ms less
+measure the clocks. Run 44441670479 does: the first GPU stays at most 64 C
+and between 1,732 and 1,942 MHz, but the second, which holds half the
+layers, reaches 94 C within the `f32` requests and throttles its SM clock
+from about 1,890 MHz to 742-1,320 MHz for every later request: the `tq4`
+TTFTs (22% above `f32`'s at 1,024 tokens to 19% at 32,768, even with
+every 1,024-token prompt row in the exact head) were measured on a
+throttled GPU. A `tq4` decode step at 16,384 tokens takes 2.57 ms less
 than an `f32` one, its attention's 2.58 ms. At 16,384 tokens the latent
 prefill attention is 49% of the prefill and `moe-experts` 37%.
 
@@ -143,8 +144,15 @@ Run 44450645042 runs `f32`, `tq4` (no exact head) and `f32` again, each a
 model of its own, every dispatch waiting for its Kernels: prefill 3,295.4,
 3,399.4 and 3,560.6 ms at 1,024 tokens, 14,937.7, 15,474.1 and 16,904.8 ms
 at 4,096, the decode steps 36 to 40 ms in all three. Every model loaded
-after the first prefills slower, whatever its history: the `tq4` TTFTs
-measured after `f32`'s carry it. providers/cuda ed7edfd keeps the memory
-the stream-ordered allocator frees in the device's pool instead of
-returning it to the driver at each synchronization, which a prefill's
-large temporaries met at every pass.
+after the first prefills slower, whatever its history. Run 44458793626 runs
+each length twice per model, with freed device memory kept in the
+allocator's pool (providers/cuda ed7edfd): requests slow down within a
+model too (`f32` at 1,024 tokens: 3,188.6 then 3,324.0 ms; the last `f32`
+model 4,062.8 then 5,078.5), every heavy Kernel by the same factor
+(`moe-experts` +58%, `gated-matmul` +73%, `attention` +56% from the first
+to the last request) while `rmsnorm` and the host's work do not: the
+second GPU heats from 57 to 91-95 C and throttles to 675-1,320 MHz. The
+pool change did not remove it and is reverted (providers/cuda 36c3717).
+Every comparison of later requests with earlier ones on this runner
+carries the second GPU's throttling, the `tq4`-against-`f32` TTFTs above
+included; the bandwidth-bound decode steps much less.
