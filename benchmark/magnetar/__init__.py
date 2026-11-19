@@ -35,7 +35,13 @@ def run(args, raw_dir):
     if len(reports) != 1:
         raise RuntimeError(f"Expected one Magnetar campaign report, got {len(reports)}")
     campaign = json.loads(reports[0].read_text(encoding="utf-8"))
-    samples = [sample["metrics"] for sample in campaign["samples"] if sample["phase"] == "measured"]
+    samples = []
+    for sample in campaign["samples"]:
+        if sample["phase"] == "measured":
+            metrics = dict(sample["metrics"])
+            if "generated_token_ids" in sample:
+                metrics["generated_token_ids"] = sample["generated_token_ids"]
+            samples.append(metrics)
     if len(samples) != args.runs:
         raise RuntimeError("Magnetar report did not contain the requested measured runs")
     return {"protocol": "resident model; cold request, one warmup, measured streaming requests",

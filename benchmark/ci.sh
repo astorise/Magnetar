@@ -4,7 +4,7 @@ set -euo pipefail
 
 : "${BENCH_ENGINE:?}" "${BENCH_DEVICE:?}" "${BENCH_TOKENS:?}" "${BENCH_RUNS:?}" "${RUNNER_TEMP:?}"
 case "$BENCH_DEVICE" in cpu|gpu) ;; *) echo 'Invalid device' >&2; exit 1 ;; esac
-case "$BENCH_ENGINE" in magnetar|candle|llama_cpp|ollama|strata) ;; *) echo 'Invalid engine' >&2; exit 1 ;; esac
+case "$BENCH_ENGINE" in magnetar|candle|llama_cpp|llama_server|ollama|strata|airllm) ;; *) echo 'Invalid engine' >&2; exit 1 ;; esac
 if [[ ! "$BENCH_TOKENS" =~ ^[1-9][0-9]*$ || ! "$BENCH_RUNS" =~ ^[1-9][0-9]*$ ]]; then
   echo 'Tokens and runs must be positive integers' >&2
   exit 1
@@ -19,12 +19,15 @@ results="$RUNNER_TEMP/benchmark-results"
 mkdir -p "$work" "$results"
 args=("$BENCH_ENGINE" --device "$BENCH_DEVICE" --tokens "$BENCH_TOKENS" --runs "$BENCH_RUNS" --output-dir "$results")
 
-if [[ "$BENCH_ENGINE" == magnetar || "$BENCH_ENGINE" == candle ]]; then
+if [[ "$BENCH_ENGINE" == magnetar || "$BENCH_ENGINE" == candle || "$BENCH_ENGINE" == airllm ]]; then
   revision=7ae557604adf67be50417f59c2c2f167def9a775
   bundle="$work/qwen2.5-0.5b-instruct"
   mkdir -p "$bundle"
   for file in config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors; do
-    curl --retry 3 -fsSL "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/$revision/$file" -o "$bundle/$file"
+    if [[ ! -f "$bundle/$file" ]]; then
+      curl --retry 3 -fsSL "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/$revision/$file" -o "$bundle/$file.tmp"
+      mv "$bundle/$file.tmp" "$bundle/$file"
+    fi
   done
   (
     cd "$bundle"
@@ -52,18 +55,26 @@ case "$BENCH_ENGINE" in
     cargo build --release --manifest-path "$work/candle/Cargo.toml" -p candle-examples --example qwen "${features[@]}"
     args+=(--binary "$work/candle/target/release/examples/qwen" --revision "$engine_revision")
     ;;
-  llama_cpp)
+  llama_cpp|llama_server)
     gguf="$work/qwen2.5-0.5b-instruct-fp16.gguf"
-    curl --retry 3 -fsSL 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-fp16.gguf' -o "$gguf"
+    if [[ ! -f "$gguf" ]]; then
+      curl --retry 3 -fsSL 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-fp16.gguf' -o "$gguf.tmp"
+      mv "$gguf.tmp" "$gguf"
+    fi
     echo "8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc  $gguf" | sha256sum -c
     git clone --no-tags https://github.com/ggml-org/llama.cpp.git "$work/llama.cpp"
     git -C "$work/llama.cpp" checkout --detach "${BENCH_ENGINE_REF:-bafa0420c1e57edf04d71587d32fe57d45df7b95}"
     engine_revision=$(git -C "$work/llama.cpp" rev-parse HEAD)
     cmake_args=(-DCMAKE_BUILD_TYPE=Release)
-    if [[ "$BENCH_DEVICE" == gpu ]]; then cmake_args+=(-DGGML_CUDA=ON); fi
+    if [[ "$BENCH_DEVICE" == gpu ]]; then cmake_args+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native); fi
     cmake -S "$work/llama.cpp" -B "$work/llama.cpp/build" "${cmake_args[@]}"
-    cmake --build "$work/llama.cpp/build" --config Release --target llama-completion --parallel 2
-    args+=(--binary "$work/llama.cpp/build/bin/llama-completion" --model-path "$gguf" --revision "$engine_revision")
+    target=llama-completion
+    if [[ "$BENCH_ENGINE" == llama_server ]]; then target=llama-server; fi
+    cmake --build "$work/llama.cpp/build" --config Release --target "$target" --parallel 2
+    args+=(--binary "$work/llama.cpp/build/bin/$target" --model-path "$gguf" --revision "$engine_revision")
+    ;;
+  airllm)
+    args+=(--revision "${BENCH_ENGINE_REF:-unknown}")
     ;;
   ollama|strata)
     if [[ -z "${BENCH_URL:-}" || -z "${BENCH_MODEL:-}" ]]; then
