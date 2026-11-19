@@ -3,6 +3,7 @@
 import argparse
 import importlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +20,7 @@ def positive(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("engine", choices=("magnetar", "candle", "llama_cpp", "llama_server", "ollama", "strata", "airllm"))
+    parser.add_argument("engine", choices=("magnetar", "candle", "llama_cpp", "llama_server", "ollama", "strata", "strata_native", "airllm"))
     parser.add_argument("--device", choices=("cpu", "gpu"), required=True)
     parser.add_argument("--model-path", help="Local Hugging Face model directory or GGUF file")
     parser.add_argument("--binary", help="Path to the Candle example or llama-completion executable")
@@ -47,6 +48,7 @@ def main(argv=None):
                 sample["request_tokens_per_second"] = tokens / seconds
         report = {"schema": "magnetar.benchmark/v1", "engine": args.engine,
                   "requested_device": args.device, "prompt": PROMPT,
+                  "model_profile": os.environ.get("BENCH_MODEL_PROFILE", "qwen2.5-0.5b"),
                   "max_new_tokens": args.tokens, "measured_runs": args.runs,
                   "engine_revision": args.revision, "notes": args.notes,
                   "environment": environment(), **result}

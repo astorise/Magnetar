@@ -1,5 +1,6 @@
 """Run llama-server locally for a resident-model comparison."""
 import json
+import os
 import re
 import socket
 import subprocess
@@ -22,6 +23,10 @@ def run(args, raw_dir):
     command = [str(Path(args.binary).resolve()), "--model", str(model), "--host", "127.0.0.1",
                "--port", str(port), "--parallel", "1", "--ctx-size", "512",
                "--n-gpu-layers", "0" if args.device == "cpu" else "999"]
+    experimental = os.environ.get("BENCH_MODEL_PROFILE") == "qwen3.6-35b-experimental"
+    if experimental and args.device == "gpu":
+        # The 35B MoE model does not fit the runner's 12 GB GPU; keep experts on CPU.
+        command.append("--cpu-moe")
     # Recent llama-server versions hide loader/offload messages at the default verbosity.
     if args.device == "gpu":
         command.append("--verbose")
@@ -29,7 +34,7 @@ def run(args, raw_dir):
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         try:
-            deadline = time.monotonic() + 300
+            deadline = time.monotonic() + (900 if experimental else 300)
             while True:
                 if process.poll() is not None:
                     raise RuntimeError(f"llama-server exited ({process.returncode}); see {log_path}")
@@ -46,7 +51,17 @@ def run(args, raw_dir):
             offload = re.search(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers", evidence, re.IGNORECASE)
             if args.device == "gpu" and (not offload or int(offload[1]) == 0):
                 raise RuntimeError(f"llama-server did not confirm GPU layer offload; see {log_path}")
-            body = {"prompt": PROMPT, "n_predict": args.tokens, "temperature": 0,
+            prompt = PROMPT
+            if experimental:
+                tokenized = http_json(url + "/tokenize", {"content": PROMPT, "add_special": False})
+                prompt = tokenized.get("tokens")
+                if not isinstance(prompt, list) or not prompt or any(type(t) is not int for t in prompt):
+                    raise RuntimeError("llama-server did not return valid prompt token IDs")
+                ids_path = os.environ.get("BENCH_PROMPT_IDS_PATH")
+                if not ids_path:
+                    raise RuntimeError("BENCH_PROMPT_IDS_PATH is required for Qwen3.6")
+                Path(ids_path).write_text(json.dumps(prompt), encoding="utf-8")
+            body = {"prompt": prompt, "n_predict": args.tokens, "temperature": 0,
                     "repeat_penalty": 1, "cache_prompt": False, "return_tokens": True}
             samples = []
             for index in range(args.runs + 1):
@@ -71,7 +86,9 @@ def run(args, raw_dir):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-    return {"protocol": "local resident llama-server; one warmup then non-streaming HTTP requests; prefix cache disabled",
+    return {"protocol": "local resident llama-server; one warmup then non-streaming HTTP requests; prefix cache disabled"
+                        + ("; MoE experts kept on CPU" if experimental and args.device == "gpu" else ""),
             "device_evidence": offload.group(0) if offload else "GPU offload disabled",
-            "model": {"path": str(model), "weights_sha256": sha256(model)}, "dtype": "GGUF FP16 weights",
+            "model": {"path": str(model), "weights_sha256": sha256(model)},
+            "dtype": "GGUF UD-Q4_K_XL mixed weights" if experimental else "GGUF FP16 weights",
             "command": command, "samples": samples}

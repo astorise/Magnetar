@@ -56,12 +56,19 @@ case "$BENCH_ENGINE" in
     args+=(--binary "$work/candle/target/release/examples/qwen" --revision "$engine_revision")
     ;;
   llama_cpp|llama_server)
-    gguf="$work/qwen2.5-0.5b-instruct-fp16.gguf"
-    if [[ ! -f "$gguf" ]]; then
-      curl --retry 3 -fsSL 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-fp16.gguf' -o "$gguf.tmp"
-      mv "$gguf.tmp" "$gguf"
+    if [[ "${BENCH_MODEL_PROFILE:-qwen2.5-0.5b}" == qwen3.6-35b-experimental ]]; then
+      source benchmark/qwen36.sh
+      prepare_qwen36 "$work"
+      gguf="$QWEN36_MODEL"
+      export BENCH_PROMPT_IDS_PATH="$results/qwen36-prompt-ids.json"
+    else
+      gguf="$work/qwen2.5-0.5b-instruct-fp16.gguf"
+      if [[ ! -f "$gguf" ]]; then
+        curl --retry 3 -fsSL 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-fp16.gguf' -o "$gguf.tmp"
+        mv "$gguf.tmp" "$gguf"
+      fi
+      echo "8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc  $gguf" | sha256sum -c
     fi
-    echo "8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc  $gguf" | sha256sum -c
     git clone --no-tags https://github.com/ggml-org/llama.cpp.git "$work/llama.cpp"
     git -C "$work/llama.cpp" checkout --detach "${BENCH_ENGINE_REF:-bafa0420c1e57edf04d71587d32fe57d45df7b95}"
     engine_revision=$(git -C "$work/llama.cpp" rev-parse HEAD)
