@@ -19,7 +19,7 @@ def positive(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("engine", choices=("magnetar", "candle", "llama_cpp", "ollama", "strata"))
+    parser.add_argument("engine", choices=("magnetar", "candle", "llama_cpp", "llama_server", "ollama", "strata", "airllm"))
     parser.add_argument("--device", choices=("cpu", "gpu"), required=True)
     parser.add_argument("--model-path", help="Local Hugging Face model directory or GGUF file")
     parser.add_argument("--binary", help="Path to the Candle example or llama-completion executable")
@@ -36,6 +36,15 @@ def main(argv=None):
     raw_dir = output / "raw"
     try:
         result = importlib.import_module(args.engine).run(args, raw_dir)
+        # Request throughput includes prompt processing and generation. Native
+        # decode throughput remains separate because its boundaries differ.
+        for sample in result["samples"]:
+            if "end_to_end_latency_ms" in sample:
+                sample["request_seconds"] = sample["end_to_end_latency_ms"] / 1000
+            seconds = sample.get("request_seconds")
+            tokens = sample.get("generated_tokens")
+            if isinstance(seconds, (int, float)) and seconds > 0 and isinstance(tokens, int):
+                sample["request_tokens_per_second"] = tokens / seconds
         report = {"schema": "magnetar.benchmark/v1", "engine": args.engine,
                   "requested_device": args.device, "prompt": PROMPT,
                   "max_new_tokens": args.tokens, "measured_runs": args.runs,

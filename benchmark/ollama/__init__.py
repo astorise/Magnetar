@@ -19,7 +19,7 @@ def run(args, raw_dir):
         result = http_json(base + "/api/generate", body)
         elapsed = time.perf_counter() - started
         (raw_dir / f"run-{index}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        if not result.get("done") or not isinstance(result.get("eval_count"), int):
+        if not result.get("done") or not isinstance(result.get("eval_count"), int) or result["eval_count"] < 1:
             raise RuntimeError("Ollama returned an incomplete response or no token count")
         models = http_json(base + "/api/ps").get("models", [])
         placement = next((m for m in models if m.get("name") in (args.model, result.get("model"))

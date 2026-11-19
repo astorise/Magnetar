@@ -1,31 +1,18 @@
 name: Benchmark CPU
 
 on:
+  push:
+    branches: [codex/benchmark-comparison-20261119-0749]
   workflow_dispatch:
     inputs:
-      engine:
-        description: Engine to benchmark
-        type: choice
-        options: [magnetar, candle, llama_cpp, ollama, strata]
-        default: magnetar
-        required: true
       tokens:
-        description: Maximum number of generated tokens
+        description: Maximum generated tokens per request (at least 2)
         default: '16'
         required: true
       runs:
-        description: Number of measured requests
+        description: Number of measured requests per engine
         default: '5'
         required: true
-      engine_ref:
-        description: 'Optional Candle/llama.cpp Git ref or server version'
-        required: false
-      server_url:
-        description: 'Base URL of the running Ollama or Strata server'
-        required: false
-      server_model:
-        description: Model name on the running server
-        required: false
 
 permissions:
   contents: read
@@ -36,35 +23,29 @@ concurrency:
 
 jobs:
   benchmark:
-    name: CPU / ${{ inputs.engine }}
+    name: CPU / same-machine comparison
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      BENCH_ENGINE: ${{ inputs.engine }}
       BENCH_DEVICE: cpu
-      BENCH_TOKENS: ${{ inputs.tokens }}
-      BENCH_RUNS: ${{ inputs.runs }}
-      BENCH_ENGINE_REF: ${{ inputs.engine_ref }}
-      BENCH_URL: ${{ inputs.server_url }}
-      BENCH_MODEL: ${{ inputs.server_model }}
-      STRATA_API_KEY: ${{ secrets.STRATA_API_KEY }}
+      BENCH_TOKENS: ${{ inputs.tokens || '16' }}
+      BENCH_RUNS: ${{ inputs.runs || '5' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install benchmark build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev
+      - name: Install benchmark dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev python3-venv zstd
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Initialize Magnetar dependencies
-        if: ${{ inputs.engine == 'magnetar' }}
         run: git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf
-      - name: Record CPU and run benchmark
+      - name: Record CPU and run all engines sequentially
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/benchmark-results"
           lscpu | tee "$RUNNER_TEMP/benchmark-results/cpu-info.txt"
-          bash benchmark/ci.sh
+          bash benchmark/campaign.sh
       - name: Upload benchmark results
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
