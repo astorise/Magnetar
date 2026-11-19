@@ -27,3 +27,12 @@ The optimized CPU Provider SHALL select the greedy column of a logits row in pla
 
 - **WHEN** the best column of a row is excluded
 - **THEN** the best remaining column is selected
+
+### Requirement: Replayed prefills skip their padding rows
+
+While a captured step whose advancing attributes include `padding_rows` replays with offset `p`, the optimized CPU Provider SHALL compute a row matmul of `m > max(p, 1)` rows on its leading `m - p` rows only, leaving the padding rows zero, and SHALL compute every row of any other row matmul.
+
+#### Scenario: A padded prefill and its LM head
+
+- **WHEN** an 8-row matmul and a 1-row matmul run during a replay with 3 padding rows
+- **THEN** the first 5 rows of the 8-row product equal the Reference CPU product and the last 3 are zero, and the 1-row product is whole
