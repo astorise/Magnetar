@@ -43,6 +43,7 @@ def main():
         if index:
             samples.append({"prompt_tokens": int(input_ids.shape[1]), "generated_tokens": count,
                             "request_seconds": elapsed, "request_tokens_per_second": count / elapsed,
+                            "generated_token_ids": generated.tolist(),
                             "text": model.tokenizer.decode(generated, skip_special_tokens=False)})
     result = {"device_evidence": {"device": str(model.device), "cuda_available": torch.cuda.is_available(),
                                   "gpu": torch.cuda.get_device_name(0) if args.device == "gpu" else None},

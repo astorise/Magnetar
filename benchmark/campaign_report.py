@@ -28,6 +28,11 @@ def render(root):
     cached = reports.get("ollama", {}).get("summary", {}).get("cached_prompt_tokens", {}).get("max")
     if cached:
         lines.extend(["", f"**Ollama reused up to {cached} prompt tokens from cache; prefill work differs.**"])
+    sequences = {engine: {tuple(s["generated_token_ids"]) for s in r.get("samples", [])
+                          if isinstance(s.get("generated_token_ids"), list)} for engine, r in reports.items()}
+    sequences = {engine: values for engine, values in sequences.items() if values}
+    if len(sequences) > 1 and len(set.union(*sequences.values())) > 1:
+        lines.extend(["", "**Generated token sequences differ across measured runs or engines; inspect the raw outputs.**"])
     lines += ["", "These are per-request measurements after warmup on the same job host; HTTP and in-process boundaries differ.",
               "The HF checkpoint and FP16 GGUF derive from the same model, but weight and compute precision differ; inspect each report.",
               "Ollama may reuse prompt cache. Check actual token counts, outputs, GPU placement, versions, logs and raw reports before ranking.",

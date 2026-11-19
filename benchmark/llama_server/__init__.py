@@ -60,7 +60,7 @@ def run(args, raw_dir):
                     samples.append({"generated_tokens": generated, "prompt_tokens": prompt,
                                     "request_seconds": elapsed, "request_tokens_per_second": generated / elapsed,
                                     "decode_tokens_per_second": timings.get("predicted_per_second"),
-                                    "text": response.get("content")})
+                                    "text": response.get("content"), "generated_token_ids": response.get("tokens")})
         finally:
             process.terminate()
             try:

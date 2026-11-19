@@ -1,8 +1,6 @@
 name: Benchmark CPU
 
 on:
-  push:
-    branches: [codex/benchmark-comparison-20261119-0749]
   workflow_dispatch:
     inputs:
       tokens:
@@ -28,8 +26,8 @@ jobs:
     timeout-minutes: 360
     env:
       BENCH_DEVICE: cpu
-      BENCH_TOKENS: ${{ inputs.tokens || '16' }}
-      BENCH_RUNS: ${{ inputs.runs || '5' }}
+      BENCH_TOKENS: ${{ inputs.tokens }}
+      BENCH_RUNS: ${{ inputs.runs }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

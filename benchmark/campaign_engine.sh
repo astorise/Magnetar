@@ -14,6 +14,7 @@ case "$BENCH_ENGINE" in
     revision=56e297a30511289fc85473f9911d6fa6cf9e27cf
     python3 -m venv "$work/airllm-venv"
     py="$work/airllm-venv/bin/python"
+    export PIP_NO_CACHE_DIR=1
     "$py" -m pip install --disable-pip-version-check --upgrade 'pip==25.3'
     if [[ "$BENCH_DEVICE" == cpu ]]; then torch_index=https://download.pytorch.org/whl/cpu; else torch_index=https://download.pytorch.org/whl/cu128; fi
     "$py" -m pip install --disable-pip-version-check 'torch==2.8.0' --index-url "$torch_index"

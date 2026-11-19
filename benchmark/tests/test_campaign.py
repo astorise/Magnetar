@@ -66,12 +66,14 @@ class CampaignTests(unittest.TestCase):
                 path = root / engine / "report.json"
                 path.parent.mkdir()
                 path.write_text(json.dumps({"schema": "magnetar.benchmark/v1", "engine": engine,
+                    "samples": [{"generated_token_ids": [count]}],
                     "summary": {"prompt_tokens": {"median": count}, "generated_tokens": {"median": 8},
                                 "request_seconds": {"median": 2}, "request_tokens_per_second": {"median": 4}}}), encoding="utf-8")
             text = campaign_report.render(root)
             self.assertIn("| airllm | failed |", text)
             self.assertIn("| strata | unavailable |", text)
             self.assertIn("Token counts differ", text)
+            self.assertIn("Generated token sequences differ", text)
 
     def test_llama_server_rejects_unverified_gpu_and_still_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
