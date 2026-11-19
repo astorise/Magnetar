@@ -63,4 +63,3 @@ jobs:
           name: benchmark-gpu-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/benchmark-results/
           if-no-files-found: warn
-
