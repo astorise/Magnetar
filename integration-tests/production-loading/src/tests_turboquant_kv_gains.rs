@@ -1,8 +1,9 @@
 //! TurboQuant KV gains on CUDA (`turboquant-kv-history`), run by
 //! `.github/workflows/turboquant-kv-gains.yml`. One real GGUF checkpoint is
-//! loaded once per KV precision (f32, then each TurboQuant one) and
-//! generates greedily at several context lengths. For each precision and
-//! context the test reports:
+//! loaded once per KV precision (f32, then each TurboQuant one, with or
+//! without an exact head: `keep-turboquant-kv-head-exact`) and generates
+//! greedily at several context lengths. For each precision and context the
+//! test reports:
 //!
 //! - the KV bytes per token, and how many tokens of KV history the VRAM
 //!   left free after loading holds;
@@ -56,9 +57,13 @@ struct Measure {
 
 /// One precision's runs.
 struct PrecisionRuns {
-    precision: KvStorePrecision,
+    precision: KvPrecisions,
     kv_bytes_per_token: u64,
-    free_bytes_after_load: u64,
+    /// `None` across several GPUs.
+    free_bytes_after_load: Option<u64>,
+    /// The rows of each prefill pass, `0` for one pass
+    /// (`chunk-long-prefills`).
+    prefill_chunk: u64,
     measures: Vec<Measure>,
 }
 
@@ -66,11 +71,64 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
 }
 
+/// A precision of `MAGNETAR_KV_GAINS_PRECISIONS`: `f32`, `tq4` or `tq3`
+/// with the Runtime's default exact head, or `tq4@ROWS` / `tq3@ROWS` with
+/// an exact head of `ROWS` rows (`@0` for none).
+fn parse_precisions(value: &str) -> KvPrecisions {
+    let (precision, exact_rows) = match value.trim().split_once('@') {
+        Some((precision, rows)) => (precision, Some(rows.parse().expect("a row count"))),
+        None => (value.trim(), None),
+    };
+    let precisions =
+        KvPrecisions::uniform(KvStorePrecision::parse(precision).expect("f32, tq4 or tq3"));
+    match exact_rows {
+        Some(rows) => precisions.with_exact_rows(rows),
+        None => precisions,
+    }
+}
+
+/// How the report names `precisions`.
+fn precision_label(precisions: &KvPrecisions) -> String {
+    match (precisions.k, precisions.exact_rows) {
+        (KvStorePrecision::F32, _) => "f32".into(),
+        (precision, 0) => format!("{}, no exact head", precision.as_str()),
+        (precision, rows) => format!("{}, exact head {rows}", precision.as_str()),
+    }
+}
+
 #[test]
 #[ignore = "needs a CUDA Device and a real checkpoint (turboquant-kv-gains workflow)"]
 fn turboquant_kv_gains_on_cuda() {
-    let cuda = magnetar_provider_cuda::CudaProvider::new();
-    if !cuda.is_available() {
+    let devices: Option<Vec<usize>> = std::env::var("MAGNETAR_CUDA_DEVICES").ok().map(|list| {
+        list.split(',')
+            .map(|ordinal| {
+                ordinal
+                    .trim()
+                    .parse()
+                    .expect("MAGNETAR_CUDA_DEVICES lists GPU ordinals")
+            })
+            .collect()
+    });
+    let available = match &devices {
+        Some(ordinals) => magnetar_provider_cuda::multi::CudaMultiProvider::for_devices(
+            ordinals,
+            "magnetar:provider/cuda",
+        )
+        .is_available(),
+        None => magnetar_provider_cuda::CudaProvider::new().is_available(),
+    };
+    let gpus = match &devices {
+        Some(ordinals) => format!(
+            "{} GPUs, the layers placed across them ({})",
+            ordinals.len(),
+            match std::env::var("MAGNETAR_LAYER_PLACEMENT").as_deref() {
+                Ok("balanced") => "balanced",
+                _ => "filling the first",
+            }
+        ),
+        None => "one GPU".to_string(),
+    };
+    if !available {
         assert!(
             std::env::var("MAGNETAR_REQUIRE_CUDA").as_deref() != Ok("1"),
             "MAGNETAR_REQUIRE_CUDA=1 but no CUDA-capable Device is available"
@@ -90,13 +148,13 @@ fn turboquant_kv_gains_on_cuda() {
     let new_tokens: usize = env_or("MAGNETAR_KV_GAINS_NEW_TOKENS", "64")
         .parse()
         .expect("a token count");
-    let precisions: Vec<KvStorePrecision> = env_or("MAGNETAR_KV_GAINS_PRECISIONS", "f32,tq4,tq3")
+    let precisions: Vec<KvPrecisions> = env_or("MAGNETAR_KV_GAINS_PRECISIONS", "f32,tq4,tq3")
         .split(',')
-        .map(|value| KvStorePrecision::parse(value).expect("f32, tq4 or tq3"))
+        .map(parse_precisions)
         .collect();
     assert_eq!(
         precisions.first(),
-        Some(&KvStorePrecision::F32),
+        Some(&KvPrecisions::default()),
         "f32 runs first: every other precision is compared with it"
     );
 
@@ -157,20 +215,67 @@ fn turboquant_kv_gains_on_cuda() {
         let component = crate::test_support::real_component_for_architecture_family(
             &manifest.architecture.family,
         );
-        let provider = Arc::new(magnetar_provider_cuda::CudaProvider::new());
+        // `MAGNETAR_CUDA_DEVICES=0,1`: one Provider spanning those GPUs, the
+        // Runtime placing the layers across them, for a checkpoint larger
+        // than one GPU (the free VRAM is then not reported).
+        let single = devices
+            .is_none()
+            .then(|| Arc::new(magnetar_provider_cuda::CudaProvider::new()));
+        let multi = devices.as_ref().map(|ordinals| {
+            Arc::new(
+                magnetar_provider_cuda::multi::CudaMultiProvider::for_devices(
+                    ordinals,
+                    "magnetar:provider/cuda",
+                ),
+            )
+        });
+        let provider: Arc<dyn Provider> = match (&single, &multi) {
+            (Some(single), _) => single.clone(),
+            (None, Some(multi)) => multi.clone(),
+            (None, None) => unreachable!("a single Provider without devices"),
+        };
+        // Each GPU's free memory (diagnostic): after the load, and after a
+        // context that failed.
+        let free_memory = |when: &str| {
+            if let Some(multi) = &multi {
+                let free: Vec<String> = multi
+                    .free_memory()
+                    .iter()
+                    .enumerate()
+                    .map(|(gpu, free)| match free {
+                        Some(bytes) => format!("GPU {gpu} {} MiB", bytes >> 20),
+                        None => format!("GPU {gpu} unknown"),
+                    })
+                    .collect();
+                eprintln!(
+                    "[kv gains] {label} {}: free memory {when}: {}",
+                    precision_label(&precision),
+                    free.join(", ")
+                );
+            }
+        };
         let mut model = ProductionLoadedModel::load_with_component(
             fixture,
             ingested.payload_source.as_ref(),
             ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()),
-            provider.clone() as Arc<dyn Provider>,
+            provider,
             Some(component),
         )
         .expect("the checkpoint loads");
-        model.request_kv_precisions(KvPrecisions::uniform(precision));
-        let free_bytes_after_load = provider
-            .context()
-            .and_then(|context| context.mem_get_info().ok())
-            .map_or(0, |(free, _)| free as u64);
+        model.request_kv_precisions(precision);
+        // Diagnostics: decode steps dispatched node by node, and each
+        // measured request's host time attributed to its phases.
+        if std::env::var("MAGNETAR_KV_GAINS_STEP_REPLAY").as_deref() == Ok("0") {
+            model.set_step_replay(false);
+        }
+        let phases = std::env::var("MAGNETAR_KV_GAINS_PHASES").as_deref() == Ok("1");
+        free_memory("after the load");
+        let free_bytes_after_load = single.as_ref().map(|single| {
+            single
+                .context()
+                .and_then(|context| context.mem_get_info().ok())
+                .map_or(0, |(free, _)| free as u64)
+        });
         let mut measures = Vec::new();
         let mut failed = false;
         for &context in &contexts {
@@ -201,6 +306,9 @@ fn turboquant_kv_gains_on_cuda() {
             };
             let mut token_times = Vec::new();
             let mut first_logits: Vec<f32> = Vec::new();
+            if phases {
+                model.enable_phase_attribution();
+            }
             let started = Instant::now();
             let outcome = warm.and_then(|_| {
                 model.generate_streaming_with_logits(
@@ -219,19 +327,29 @@ fn turboquant_kv_gains_on_cuda() {
                     },
                 )
             });
+            if phases {
+                print_phases(
+                    &format!("{label} {} context {context}", precision_label(&precision)),
+                    &model.take_phase_attribution(),
+                );
+                model.disable_phase_attribution();
+            }
             match &outcome {
                 Ok(_) => eprintln!(
                     "[kv gains] {label} {} context {context}: ran, TTFT {:.1} ms, {} tokens, {:.0} s",
-                    precision.as_str(),
+                    precision_label(&precision),
                     token_times.first().copied().unwrap_or(0.0),
                     token_times.len(),
                     context_started.elapsed().as_secs_f64()
                 ),
-                Err(error) => eprintln!(
-                    "[kv gains] {label} {} context {context}: failed after {:.0} s: {error}",
-                    precision.as_str(),
-                    context_started.elapsed().as_secs_f64()
-                ),
+                Err(error) => {
+                    eprintln!(
+                        "[kv gains] {label} {} context {context}: failed after {:.0} s: {error}",
+                        precision_label(&precision),
+                        context_started.elapsed().as_secs_f64()
+                    );
+                    free_memory(&format!("after context {context} failed"));
+                }
             }
             match outcome {
                 Ok(outcome) => {
@@ -267,27 +385,29 @@ fn turboquant_kv_gains_on_cuda() {
             .expect("a prefill resolved the KV precisions");
         assert_eq!(
             resolution.resolved,
-            KvPrecisions::uniform(precision),
+            precision,
             "{label}: {} stores were asked for: {:?}",
-            precision.as_str(),
+            precision_label(&precision),
             resolution.fallbacks
         );
         let kv_bytes_per_token = model.kv_bytes_per_token();
+        let prefill_chunk = model.prefill_chunk();
         let _ = model.unload();
         runs.push(PrecisionRuns {
             precision,
             kv_bytes_per_token,
             free_bytes_after_load,
+            prefill_chunk,
             measures,
         });
         // The report so far, so a run stopped by its time limit keeps it.
         if let Ok(path) = std::env::var("MAGNETAR_KV_GAINS_REPORT") {
-            std::fs::write(&path, gains_report(&label, new_tokens, &runs))
+            std::fs::write(&path, gains_report(&label, &gpus, new_tokens, &runs))
                 .expect("the report is writable");
         }
     }
 
-    let report = gains_report(&label, new_tokens, &runs);
+    let report = gains_report(&label, &gpus, new_tokens, &runs);
     eprintln!("{report}");
     let baseline = &runs[0];
     assert!(
@@ -298,12 +418,18 @@ fn turboquant_kv_gains_on_cuda() {
 }
 
 /// The gains of every precision against f32, as a Markdown report.
-fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> String {
+fn gains_report(label: &str, gpus: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> String {
     let baseline = &runs[0];
+    let prefill = match baseline.prefill_chunk {
+        0 => "every prompt prefilled in one pass".to_string(),
+        chunk => format!("longer prompts prefilled in passes of {chunk} rows"),
+    };
     let mut report = format!(
         "### TurboQuant KV gains: {label}\n\n\
-         Greedy decoding of {new_tokens} tokens after a prompt of each context length, one RTX 3060; \
-         TTFT warm up to {MAX_WARMED_CONTEXT} tokens.\n\n\
+         Greedy decoding of {new_tokens} tokens after a prompt of each context length, {gpus}; \
+         TTFT warm up to {MAX_WARMED_CONTEXT} tokens; {prefill}. An exact head keeps a store's \
+         first rows at f32 (`keep-turboquant-kv-head-exact`): the bytes per token and the tokens \
+         the free VRAM holds count every row at its TurboQuant size.\n\n\
          | KV precision | KV bytes/token | vs f32 | Tokens of KV in the free VRAM after load |\n\
          |---|---|---|---|\n"
     );
@@ -311,9 +437,11 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
         let ratio = baseline.kv_bytes_per_token as f64 / run.kv_bytes_per_token.max(1) as f64;
         report.push_str(&format!(
             "| {} | {} | {ratio:.2}x smaller | {} |\n",
-            run.precision.as_str(),
+            precision_label(&run.precision),
             run.kv_bytes_per_token,
-            run.free_bytes_after_load / run.kv_bytes_per_token.max(1)
+            run.free_bytes_after_load.map_or("-".to_string(), |free| {
+                (free / run.kv_bytes_per_token.max(1)).to_string()
+            })
         ));
     }
     report.push_str(
@@ -358,7 +486,7 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
                 };
                 report.push_str(&format!(
                     "| {} | {} | yes | {:.1} | {:.2} | {speed} | {agree} | {first} | {logit} |\n",
-                    run.precision.as_str(),
+                    precision_label(&run.precision),
                     measure.context,
                     measure.ttft_ms,
                     measure.tpot_ms,
@@ -368,11 +496,48 @@ fn gains_report(label: &str, new_tokens: usize, runs: &[PrecisionRuns]) -> Strin
             let reason: String = error.chars().take(80).collect();
             report.push_str(&format!(
                 "| {} | {} | no: {} | - | - | - | - | - | - |\n",
-                run.precision.as_str(),
+                precision_label(&run.precision),
                 measure.context,
                 reason.replace('|', "/")
             ));
         }
     }
     report
+}
+
+/// Prints a measured request's heaviest phases per prefill and per decode
+/// step (`MAGNETAR_KV_GAINS_PHASES=1`): host time, which covers the Device's
+/// with `MAGNETAR_CUDA_SYNC_NODES=1`.
+fn print_phases(label: &str, report: &magnetar_runtime::phase_attribution::PhaseAttributionReport) {
+    use magnetar_runtime::phase_attribution::StepKind;
+    for kind in [StepKind::Prefill, StepKind::Decode] {
+        let Some(summary) = report.summary(kind) else {
+            continue;
+        };
+        let steps = summary.steps.max(1) as f64;
+        let mut phases: Vec<_> = summary.phases.iter().collect();
+        phases.sort_by_key(|(_, total)| std::cmp::Reverse(total.host_micros));
+        let top: Vec<String> = phases
+            .iter()
+            .take(12)
+            .map(|(key, total)| {
+                format!(
+                    "{:?}{} {:.2} ms",
+                    key.phase,
+                    key.operator
+                        .as_deref()
+                        .map(|operator| format!("[{operator}]"))
+                        .unwrap_or_default(),
+                    total.host_micros as f64 / steps / 1_000.0
+                )
+            })
+            .collect();
+        eprintln!(
+            "[kv gains] {label}: {kind:?}, {} steps of {:.2} ms ({:.2} unattributed): {}",
+            summary.steps,
+            summary.wall_micros as f64 / steps / 1_000.0,
+            summary.unattributed_micros as f64 / steps / 1_000.0,
+            top.join(", ")
+        );
+    }
 }

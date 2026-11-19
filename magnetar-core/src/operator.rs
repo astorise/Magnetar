@@ -328,6 +328,12 @@ pub const ATTENTION_VALUE_HEAD_DIMENSION_FEATURE: &str = "attention-value-head-d
 /// (`cache-latent-attention-history`).
 pub const ATTENTION_VALUE_HEAD_STRIDE_FEATURE: &str = "attention-value-head-stride";
 
+/// Kernel feature an `attention` Kernel advertises when it honours
+/// `latent_kv_width`: K and V are latent rows `[c | k_rope]` and two more
+/// inputs give each head's key `[c W_k_h | k_rope]` and value `c W_v_h`
+/// (`chunk-latent-prefills`).
+pub const ATTENTION_LATENT_KV_FEATURE: &str = "attention-latent-kv";
+
 /// Kernel feature a `concat` Kernel advertises when it honours `axis =
 /// "heads"`: the inputs joined head by head instead of row after row.
 pub const CONCAT_HEADS_FEATURE: &str = "concat-heads";
@@ -343,6 +349,11 @@ pub const KV_WRITE_TURBOQUANT_FEATURE: &str = "turboquant-kv-store";
 /// The `attention` Kernel feature a Provider advertises when its attention
 /// reads K and V from TurboQuant KV stores (`turboquant-kv-history`).
 pub const ATTENTION_TURBOQUANT_KV_FEATURE: &str = "turboquant-kv-read";
+
+/// The `kv-write` Kernel feature a Provider advertises when it creates
+/// TurboQuant KV stores whose first rows stay exact
+/// (`keep-turboquant-kv-head-exact`).
+pub const KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE: &str = "turboquant-kv-exact-head";
 
 /// The Kernel features an `operator` node with these `attributes` and
 /// `input_count` inputs needs beyond the Operator's baseline form: the
@@ -368,6 +379,9 @@ pub fn required_kernel_features(
             }
             if present("value_head_stride") {
                 features.push(ATTENTION_VALUE_HEAD_STRIDE_FEATURE);
+            }
+            if present("latent_kv_width") || input_count > 3 {
+                features.push(ATTENTION_LATENT_KV_FEATURE);
             }
         }
         "concat" => {
@@ -1308,7 +1322,9 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::SameShape,
         ),
-        ("attention", OperatorFamily::Attention, 3, 1, ShapeRule::Any),
+        // Q, K and V; with `latent_kv_width`, the latent K and V's key and
+        // value projections (`chunk-latent-prefills`).
+        ("attention", OperatorFamily::Attention, 5, 1, ShapeRule::Any),
         (
             "paged-attention",
             OperatorFamily::Attention,
@@ -1430,11 +1446,12 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 TensorLayoutKind::BrowserCompatible,
             ]);
         spec.attributes = default_attribute_schema(name);
-        // Optional trailing inputs: a scale-less RMSNorm, and the experts'
-        // optional per-expert output scale.
+        // Optional trailing inputs: a scale-less RMSNorm, the experts'
+        // optional per-expert output scale, and latent K and V's projections.
         spec.min_inputs = match name {
             "rmsnorm" => 1,
             "moe-experts" => 5,
+            "attention" => 3,
             _ => inputs,
         };
         if name == "kv-write" {
@@ -1542,6 +1559,13 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             // leading `value_head_dimension` (`cache-latent-attention-history`).
             .with_rule(
                 "value_head_stride",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // K and V are latent rows of this many values and one shared
+            // rope key, expanded per head by the fourth and fifth inputs
+            // (`chunk-latent-prefills`).
+            .with_rule(
+                "latent_kv_width",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         // `axis = "heads"` joins the inputs head by head (see [`ConcatAxis`]):

@@ -103,3 +103,145 @@ and digest change, and the KV compatibility key carries both.
 - **Numerics.** The absorbed scores sum in another order than the expanded
   ones; the tiny checkpoints' tolerances against `transformers` hold or the
   difference is reported.
+
+## Evidence: latent decode on codes
+
+One RTX 3060; one decode step's absorbed attention at DeepSeek-V2-Lite's
+shapes (16 query heads over one history of 576-value rows, the values
+each row's leading 512, `tq4` in groups of 64), `latent_decode_attention_times`:
+
+| us | 1,024 keys | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|---|
+| f32 history | 101.6 | 318.7 | 3,030.1 | 6,886.6 |
+| `tq4` through dequantized scratch (before) | 149.7 | 513.1 | 3,688.3 | 8,105.5 |
+| `tq4` on its codes | 105.6 | 154.8 | 525.4 | 921.5 |
+| `tq4` on its codes, 1,024-row exact head | 108.6 | 300.9 | 616.7 | 904.4 |
+
+(Run 44352387517, providers/cuda 472bf54; run 44351792640 measured the
+first two rows the same.) The decode steps read each row's leading values
+in place (providers/cuda c8abbd1) instead of gathering the history at
+every step. On its codes (`tq_latent_attention_split_kernel`: a block per
+chunk and eight query heads, each code decoded once for them, the values
+summed in each group's rotated domain with the group's norm) a `tq4`
+latent decode is 8.8x faster than through dequantized scratch at 32,768
+keys and 7.5x faster than the f32 history's, whose per-head Kernel reads
+the history once for each of the 16 heads (11 GB/s). Conformance:
+`turboquant_latent_decode_on_codes_matches_the_cpu` (`tq4` and `tq3`, 33
+to 1,100 keys, exact heads, a sliding window) and
+`batched_matmul_and_strided_values_match_the_cpu` pass.
+
+Run 44355981594 (providers/cuda 8947b7f): the f32 latent decode takes a
+block per chunk and eight query heads (`latent_attention_split_kernel`),
+reading each row once for them all, the values in place:
+
+| us | 1,024 keys | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|---|
+| f32 history, per-head Kernel (before) | 101.6 | 318.7 | 3,030.1 | 6,886.6 |
+| f32 history, eight heads per block | 101.2 | 163.6 | 810.4 | 1,499.6 |
+| `tq4` on its codes | 107.9 | 155.2 | 560.6 | 1,046.2 |
+| `tq4` on its codes, 1,024-row exact head | 105.3 | 295.0 | 605.0 | 1,122.8 |
+
+The f32 latent decode is 4.6x faster at 32,768 keys (50 GB/s against
+11); `tq4` on its codes stays 1.4x faster than it there. At 1,024 keys
+both take about 100 us: 8 chunks and 2 head blocks give 16 blocks for 28
+multiprocessors. `latent_decode_matches_the_cpu` (33 to 1,100 keys, a
+sliding window) passes.
+
+DeepSeek-V2-Lite-Chat Q8_0 across both GPUs (run 44358602056, the gains
+test, 64 greedy tokens): at 1,024 prompt tokens, TPOT 15.06 ms with an
+f32 latent history, 15.31 ms with `tq4` without an exact head, 17.96 ms
+with the default head of 1,024 rows; all 64 tokens and the first step's
+logits are f32's. At 4,096 tokens every precision's one-pass prefill runs
+out of memory (the latent attention's prefill is not chunked, and the
+`fill` placement leaves little free on the first GPU), so longer contexts
+are not measured on this hardware. Short prompts keep " Paris." with both
+histories (TPOT 13.51 and 13.54 ms).
+
+The exact head's keys in the latent code Kernel: scoring them in a
+separate pass from queries staged as they are, rotated only afterwards
+(providers/cuda 3680c94), brought a 4,096-key step with the head from
+295.0 to 195.1 us but slowed the decode on codes alone from 155.2 to
+172.8 us at 4,096 keys and from 560.6 to 743.4 at 16,384 (run
+44367354898); it is reverted. Reading the exact keys' rows and the
+queries as float4s within the original loop (providers/cuda 080e79c,
+run 44369519228) keeps the decode on codes alone at its times (150.6,
+569.2 and 1,030.5 us at 4,096, 16,384 and 32,768 keys) and brings the
+head's 4,096-key step to 227.7 us (595.1 and 1,123.7 at 16,384 and
+32,768).
+
+DeepSeek-V2-Lite-Chat Q8_0 across both GPUs with the layers balanced (run
+44374637064; 3,890 and 2,740 MiB free after the load), against the first GPU
+filled (run 44358602056, out of memory from 4,096 tokens):
+
+| History | Context | TTFT (ms) | TPOT (ms) | TPOT vs f32 | Tokens = f32 |
+|---|---|---|---|---|---|
+| f32 | 1,024 | 5,989.3 | 15.09 | 1.00x | 64/64 |
+| f32 | 4,096 | 24,776.6 | 16.56 | 1.00x | 64/64 |
+| `tq4`, exact head 1,024 | 1,024 | 6,010.3 | 16.89 | 0.89x | 64/64 |
+| `tq4`, exact head 1,024 | 4,096 | 24,905.8 | 17.96 | 0.92x | 64/64 |
+| `tq4`, no exact head | 1,024 | 6,025.8 | 15.44 | 0.98x | 64/64 |
+| `tq4`, no exact head | 4,096 | 25,361.6 | 16.97 | 0.98x | 64/64 |
+
+The first-step logits equal f32's in every case. At 16,384 tokens every
+history runs out of the first GPU's memory in the prefill's layer 0 gated
+MLP (`bound-one-pass-prefill-memory`). With the tiled prefill attention for
+192-dimension keys and 128-dimension values (providers/cuda 758b8ba) and the
+balanced placement together, TTFT at 1,024 tokens is 5,989.3 against
+6,975.8 ms; the run does not separate the two.
+
+The latent decode Kernels with four threads per key (512 per block, each
+taking every fourth float4 of a row, or every fourth group of codes; one
+value coordinate per thread; providers/cuda 27e1b9e), run 44396512952,
+against 128 threads (one per key; run 44382825307), in us:
+
+| Keys | f32 before | f32 | codes before | codes | codes, 1,024-row head |
+|---|---|---|---|---|---|
+| 1,024 | 101.2 | 39.3 | 107.0 | 79.7 | 40.8 |
+| 4,096 | 178.2 | 150.0 | 158.1 | 209.9 | 222.2 |
+| 16,384 | 797.4 | 555.1 | 567.4 | 658.0 | 647.2 |
+| 32,768 | 1,500.3 | 1,124.6 | 1,032.6 | 1,305.0 | 1,188.8 |
+
+DeepSeek-V2-Lite's TPOT with an `f32` history falls to 13.42 ms at 1,024
+tokens (15.02); with `tq4` it rises at 4,096 tokens (19.94 against 17.48 ms)
+and 16,384 (34.20 against 29.26), as the decode on codes does: the four
+threads of a key read rotated queries 64 floats apart, in one shared-memory
+bank. providers/cuda 417616d splits each group's eight-value blocks among
+them instead.
+
+Each group's eight-value blocks split among a key's four threads
+(providers/cuda 417616d, run 44407276899), the decode on codes, in us:
+
+| Keys | 128 threads | four threads, groups split | blocks split | with a 1,024-row head | f32 |
+|---|---|---|---|---|---|
+| 1,024 | 107.0 | 79.7 | 53.9 | 40.2 | 38.6 |
+| 4,096 | 158.1 | 209.9 | 126.0 | 139.5 | 149.9 |
+| 16,384 | 567.4 | 658.0 | 401.9 | 412.1 | 552.0 |
+| 32,768 | 1,032.6 | 1,305.0 | 839.5 | 738.4 | 1,125.0 |
+
+DeepSeek-V2-Lite-Chat Q8_0, prefilled in passes of 2,048 rows
+(`chunk-latent-prefills`), 64/64 tokens equal to `f32` everywhere, TPOT in
+ms:
+
+| History | 1,024 | 4,096 | 16,384 | 32,768 |
+|---|---|---|---|---|
+| f32 | 13.42 | 16.38 | 26.93 | 42.47 |
+| `tq4`, exact head 1,024 | 15.09 | 17.46 | 27.55 | 40.52 |
+| `tq4`, no exact head | 14.78 | 17.55 | 27.07 | 43.16 |
+
+The decode on codes is now faster than `f32`'s from 4,096 keys (839.5
+against 1,125.0 us at 32,768, about 7.7 ms less per token over 27 layers),
+yet the `tq4` TPOT stays within 5% of `f32`'s: the rest of a `tq4` decode
+step costs about that much more at 32,768 tokens, which this run does not
+locate.
+
+Node by node with every dispatch waiting for its Kernels (run 44431584039),
+a `tq4` decode step at 16,384 tokens takes 49.45 ms against `f32`'s 52.02:
+its attention's 12.88 against 15.46 ms, every other phase the same
+(`chunk-latent-prefills`, Evidence). The replayed steps' TPOT differences of
+about a millisecond either way between runs are within their noise.
+
+The runner's second GPU throttles under these long prefills (91-95 C, SM
+675-1,320 MHz against about 1,890; `chunk-latent-prefills`, Evidence): the
+`tq4` histories, measured after the `f32` one, run on slower clocks than it
+did, so their TTFT and, to a lesser degree, TPOT comparisons with `f32`
+understate them.

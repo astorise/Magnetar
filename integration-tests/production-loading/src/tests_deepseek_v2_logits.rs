@@ -4,7 +4,8 @@
 //! `DeepseekV2ForCausalLM` in float32, on tiny random checkpoints
 //! (`fixtures/deepseek_v2/`, see its README for how they were made). Each
 //! has a dense first layer, then routed experts beside two ungated shared
-//! experts, and multi-head latent attention in its expanded form.
+//! experts, and multi-head latent attention over a latent history: expanded
+//! in the prefill, absorbed in the decode steps.
 //!
 //! The `gguf-*` checkpoints are quantized `deepseek2` GGUF files, compared
 //! with `transformers` run on their dequantized weights: they test the GGUF
@@ -95,6 +96,28 @@ fn the_tiny_deepseek_v2_checkpoints_match_transformers_with_resident_values() {
     }
 }
 
+/// A latent-attention prefill attends over the latent history's rows, each
+/// head's keys and values expanded from them (`latent_kv_width`,
+/// `chunk-latent-prefills`), so a long prompt runs in passes of the chunk
+/// length that read the earlier passes' rows (`chunk-long-prefills`), and
+/// the logits still match the references.
+#[test]
+fn a_latent_attention_prefill_runs_in_passes() {
+    for (variant, format, family) in VARIANTS {
+        let (difference, chunk) = crate::logit_comparison::compare_chunked_on(
+            std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+            "magnetar-reference-cpu",
+            "deepseek_v2",
+            variant,
+            format,
+            family,
+            4,
+        );
+        assert_eq!(chunk, 4, "{variant}: the prefill was not chunked");
+        eprintln!("{variant}, passes of 4 rows: max |logit difference| {difference:.3e}");
+    }
+}
+
 /// Every checkpoint of this file, with its format and declared family.
 const VARIANTS: [(&str, Format, &str); 6] = [
     ("lite", Format::HuggingFace, "deepseek_v2"),
@@ -166,13 +189,14 @@ fn the_tiny_deepseek_v2_checkpoints_match_transformers_on_the_cpu_providers() {
 /// in groups of gcd(kv_lora_rank, qk_rope_head_dim), and the logits move
 /// from the f32 history's by the stores' rounding; the Hugging Face ones'
 /// groups of 4 values are too narrow, and they keep f32 with the reason
-/// recorded.
+/// recorded. Every row is quantized: these histories are shorter than the
+/// default exact head (`keep-turboquant-kv-head-exact`).
 #[test]
 fn the_tiny_deepseek_v2_checkpoints_run_with_a_turboquant_latent_history() {
     use crate::logit_comparison::kv_precision_drift;
     use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
     for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
-        let requested = KvPrecisions::uniform(precision);
+        let requested = KvPrecisions::uniform(precision).with_exact_rows(0);
         for (variant, format, family) in VARIANTS {
             let drift = kv_precision_drift(
                 &|| std::sync::Arc::new(ReferenceCpuProvider::new()),
@@ -222,41 +246,102 @@ fn the_tiny_deepseek_v2_checkpoints_run_with_a_turboquant_latent_history() {
     }
 }
 
+/// The GGUF checkpoints' latent histories (18 prompt rows and 12 steps)
+/// against an exact head (`keep-turboquant-kv-head-exact`) on the
+/// Reference CPU: under the default head every row is exact, and the
+/// logits are the f32 history's, bit for bit; under a head of 8 rows the
+/// later rows are quantized, and the logits move by their rounding.
+#[test]
+fn the_tiny_deepseek_v2_checkpoints_keep_an_exact_latent_head() {
+    use crate::logit_comparison::kv_precision_drift;
+    use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        for (variant, format, family) in VARIANTS {
+            if !matches!(format, Format::Gguf) {
+                continue;
+            }
+            let drift = |requested: KvPrecisions| {
+                let drift = kv_precision_drift(
+                    &|| std::sync::Arc::new(ReferenceCpuProvider::new()),
+                    "deepseek_v2",
+                    variant,
+                    format,
+                    family,
+                    requested,
+                );
+                assert_eq!(
+                    drift.resolution.resolved, requested,
+                    "{variant}: {:?}",
+                    drift.resolution.fallbacks
+                );
+                drift
+            };
+            let whole = drift(KvPrecisions::uniform(precision));
+            assert_eq!(whole.resolution.resolved.exact_rows, 1024, "{variant}");
+            assert_eq!(whole.max_abs_difference, 0.0, "{variant} {precision:?}");
+            assert_eq!(
+                whole.agreeing_tokens, whole.steps,
+                "{variant} {precision:?}"
+            );
+            let partial = drift(KvPrecisions::uniform(precision).with_exact_rows(8));
+            assert!(
+                partial.max_abs_difference > 0.0 && partial.max_abs_difference.is_finite(),
+                "{variant} {precision:?}: {}",
+                partial.max_abs_difference
+            );
+            eprintln!(
+                "{} {variant}, exact head of 8 rows: max |logit difference| {:.3e} against \
+                 f32 stores, {}/{} leading tokens agree",
+                precision.as_str(),
+                partial.max_abs_difference,
+                partial.agreeing_tokens,
+                partial.steps
+            );
+        }
+    }
+}
+
 /// The CPU Providers of `providers/cpu` hold a TurboQuant latent history
-/// as the Runtime's Reference CPU does: with `tq4`, the GGUF checkpoints
-/// generate the same tokens with logits within 1e-3 of the Reference
-/// CPU's.
+/// as the Runtime's Reference CPU does: with `tq4`, every row quantized or
+/// the first 8 kept exact (`keep-turboquant-kv-head-exact`), the GGUF
+/// checkpoints generate the same tokens with logits within 1e-3 of the
+/// Reference CPU's.
 #[test]
 fn the_cpu_providers_hold_a_turboquant_latent_history_like_the_reference_cpu() {
     use crate::logit_comparison::generate_logits;
     use magnetar_runtime::{KvPrecisions, KvStorePrecision, ReferenceCpuProvider};
-    let tq4 = KvPrecisions::uniform(KvStorePrecision::Tq4);
     for (variant, format, family) in VARIANTS {
         if !matches!(format, Format::Gguf) {
             continue;
         }
-        let (reference_steps, reference_tokens, _) = generate_logits(
-            std::sync::Arc::new(ReferenceCpuProvider::new()),
-            "deepseek_v2",
-            variant,
-            format,
-            family,
-            tq4,
-        );
-        for (provider, label) in cpu_providers() {
-            let (steps, tokens, resolution) =
-                generate_logits(provider, "deepseek_v2", variant, format, family, tq4);
-            assert_eq!(resolution.resolved, tq4, "{label} {variant}");
-            assert_eq!(tokens, reference_tokens, "{label} {variant}");
-            let difference = reference_steps
-                .iter()
-                .zip(&steps)
-                .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
-                .fold(0.0_f32, f32::max);
-            assert!(difference < 1e-3, "{label} {variant}: {difference}");
-            eprintln!(
-                "{label} {variant} tq4: max |logit difference| {difference:.3e} against the Reference CPU"
+        for tq4 in [0, 8].map(|exact_rows| {
+            KvPrecisions::uniform(KvStorePrecision::Tq4).with_exact_rows(exact_rows)
+        }) {
+            let (reference_steps, reference_tokens, _) = generate_logits(
+                std::sync::Arc::new(ReferenceCpuProvider::new()),
+                "deepseek_v2",
+                variant,
+                format,
+                family,
+                tq4,
             );
+            for (provider, label) in cpu_providers() {
+                let (steps, tokens, resolution) =
+                    generate_logits(provider, "deepseek_v2", variant, format, family, tq4);
+                assert_eq!(resolution.resolved, tq4, "{label} {variant}");
+                assert_eq!(tokens, reference_tokens, "{label} {variant}");
+                let difference = reference_steps
+                    .iter()
+                    .zip(&steps)
+                    .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+                    .fold(0.0_f32, f32::max);
+                assert!(difference < 1e-3, "{label} {variant}: {difference}");
+                eprintln!(
+                    "{label} {variant} tq4, exact head of {} rows: max |logit difference| \
+                 {difference:.3e} against the Reference CPU",
+                    tq4.exact_rows
+                );
+            }
         }
     }
 }

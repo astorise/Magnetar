@@ -165,12 +165,35 @@ jobs:
         # only.
         timeout-minutes: 10
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml moe_decode_kernel_times -- --ignored --nocapture
+      - name: CUDA mixture-of-experts prefill times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # The Device time of a moe-experts prefill at DeepSeek-V2-Lite's
+        # routed experts, packed Q8_0, over 1,024 and 4,096 tokens: the
+        # pairs grouped by expert against one pair at a time; diagnostic
+        # only.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml moe_prefill_kernel_times -- --ignored --nocapture
       - name: CUDA long-context kernel times (diagnostic)
         if: ${{ env.SUITE_KERNELS == 'true' }}
         # The Device time of each prefill matmul shape and of the attention
         # at 512 and 4096 rows; diagnostic only.
         timeout-minutes: 15
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml long_context_kernel_times -- --ignored --nocapture
+      - name: CUDA decode attention times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # The Device time of one decode step's attention over 512 to 32,768
+        # keys in f32 and tq4 stores, with and without an exact head
+        # (keep-turboquant-kv-head-exact), for Qwen2.5-0.5B's and Mistral
+        # 7B's heads, and the bandwidth each reaches; diagnostic only.
+        timeout-minutes: 15
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml decode_attention_times -- --ignored --nocapture
+      - name: CUDA latent prefill attention times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # One latent prefill attention pass (chunk-latent-prefills) at
+        # DeepSeek-V2-Lite's shapes over f32 and tq4 histories, and its
+        # split step alone; diagnostic only.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml latent_prefill_attention_times -- --ignored --nocapture
       - name: CUDA packed embedding lookup times (diagnostic)
         if: ${{ env.SUITE_KERNELS == 'true' }}
         # The Device time and bytes written of a lookup from a packed table
@@ -1577,11 +1600,15 @@ jobs:
         # f32, tq4 and tq3 KV stores (MAGNETAR_KV_PRECISION); the greedy
         # tokens are compared with the f32 run's. A run whose stores fell
         # back to f32 fails. Where f32 continues "The capital of France is"
-        # with "Paris", tq4 must too; tq3 only reports.
+        # with "Paris", tq4 must too; tq3 only reports. Every row is
+        # quantized (no exact head, keep-turboquant-kv-head-exact): these
+        # short prompts would otherwise lie in the head and test nothing of
+        # the codes; the gains step measures the head.
         if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
         timeout-minutes: 60
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_KV_EXACT_ROWS: "0"
         shell: bash
         run: |
           set -uo pipefail
@@ -1615,21 +1642,59 @@ jobs:
           qualify gemma-4-e2b-qat-q4_0 real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_GEMMA4_E2B_GGUF_QAT_REAL_CHECKPOINT_DIR google/gemma-4-E2B-it-qat-q4_0-gguf 675cff42a74c774d6cb76f76d8eacb49b48c9b93 gemma-4-E2B_q4_0-it.gguf
           qualify mistral-7b-q4_k_m real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
           exit "$status"
+      - name: Chunked prefill against one pass
+        # chunk-long-prefills: each checkpoint prefills one long prompt in
+        # one pass, then in passes of each chunk length (the last one
+        # padded), continuing the KV history in place. The test requires
+        # the one-pass run's first token and first-step logits within 0.5,
+        # and reports TTFT and the leading tokens that agree.
+        if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_KV_POOL_BYTES: "0"
+        shell: bash
+        run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/qualification-reports/chunked-prefill"
+          mkdir -p "$report"
+          status=0
+          # label prompt-tokens chunks repository revision file sha256
+          while read -r label tokens chunks repository revision file sha256; do
+            dir="$RUNNER_TEMP/chunked-prefill-$label"
+            mkdir -p "$dir"
+            curl -fsSL "https://huggingface.co/$repository/resolve/$revision/$file" -o "$dir/model.gguf" || { echo "::error::$label: download failed"; status=1; continue; }
+            [ "$(sha256sum "$dir/model.gguf" | cut -d' ' -f1)" = "$sha256" ] || { echo "::error::$label: sha256 mismatch"; status=1; rm -rf "$dir"; continue; }
+            MAGNETAR_CHUNKED_PREFILL_CHECKPOINT_DIR="$dir" MAGNETAR_CHUNKED_PREFILL_LABEL="$label" \
+            MAGNETAR_CHUNKED_PREFILL_PROMPT_TOKENS="$tokens" MAGNETAR_CHUNKED_PREFILL_CHUNKS="$chunks" \
+              cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml chunked_prefill_matches_one_pass_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/$label.log" || { echo "::error::$label: chunked prefill differs from one pass"; status=1; }
+            grep -h '\[chunked prefill\]' "$report/$label.log" >> "$GITHUB_STEP_SUMMARY" || true
+            rm -rf "$dir"
+          done <<'CHECKPOINTS'
+          qwen2.5-0.5b-q8_0 3000 1024,512 Qwen/Qwen2.5-0.5B-Instruct-GGUF 9217f5db79a29953eb74d5343926648285ec7e67 qwen2.5-0.5b-instruct-q8_0.gguf ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e
+          mistral-7b-q4_k_m 4000 2048,1024 bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6
+          CHECKPOINTS
+          exit "$status"
       - name: TurboQuant KV gains at long contexts
         # turboquant-kv-history: the gains test of turboquant-kv-gains.yml,
         # so the kv group reports them too: KV bytes per token, the tokens
         # the free VRAM holds, which contexts run, TTFT, TPOT and the
         # agreement with f32, in the run summary (next step). Qwen2.5-0.5B
-        # up to 32,768 tokens; Mistral 7B Q4_K_M from 4,096, whose f32
+        # up to 32,768 tokens; Mistral 7B Q4_K_M from 512, whose f32
         # history at 32,768 tokens (8 GiB) does not fit beside its weights
-        # on a 12 GB GPU. Gemma 4 E2B is not measured here: its prefill took
+        # on a 12 GB GPU. Prompts longer than 2,048 tokens are prefilled in
+        # passes of 2,048 rows (chunk-long-prefills), so the activations no
+        # longer bound the context. Gemma 4 E2B is not measured here: its prefill took
         # 19 s at 4,096 tokens and did not finish 16,384 within the hour
-        # (run 44145395903).
+        # (run 44145395903). tq4 runs with its default exact head of
+        # 1,024 rows and with none (keep-turboquant-kv-head-exact), so the
+        # report shows what the head costs and saves at each context.
         if: ${{ !cancelled() && env.SUITE_KV == 'true' }}
         timeout-minutes: 90
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4,tq4@0,tq3"
         shell: bash
         run: |
           set -uo pipefail
@@ -1648,7 +1713,7 @@ jobs:
             rm -rf "$dir"
           done <<'CHECKPOINTS'
           qwen2.5-0.5b-q8_0 512,4096,16384,32768 Qwen/Qwen2.5-0.5B-Instruct-GGUF 9217f5db79a29953eb74d5343926648285ec7e67 qwen2.5-0.5b-instruct-q8_0.gguf ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e
-          mistral-7b-q4_k_m 4096,16384,32768 bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6
+          mistral-7b-q4_k_m 512,4096,16384,32768 bartowski/Mistral-7B-Instruct-v0.3-GGUF 61fd4167fff3ab01ee1cfe0da183fa27a944db48 Mistral-7B-Instruct-v0.3-Q4_K_M.gguf 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6
           CHECKPOINTS
           exit "$status"
       - name: TurboQuant KV gains summary
@@ -1805,6 +1870,44 @@ jobs:
             echo "::error::DeepSeek-V2-Lite-Chat Q8_0 tq4: the continuation no longer starts with 'Paris'"
             exit 1
           }
+      - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF latent decode at long contexts
+        # cache-latent-attention-history task 6.7: the gains test across both
+        # GPUs, the latent history f32, tq4 with its default exact head and
+        # tq4 without, at 1,024 to 16,384 tokens: TPOT and the agreement
+        # with f32 of the absorbed decode on the history (grouped f32 heads,
+        # tq4 on its codes). Diagnostic: the report is in the summary. The
+        # layers are balanced across the GPUs: with the first GPU filled,
+        # a 4,096-token prefill ran out of its memory (run 44358602056).
+        # Each GPU's free memory is printed after the load. Since
+        # chunk-latent-prefills the prefill runs in passes of 2,048 rows, so
+        # 32,768 tokens are tried too.
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+          MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4,tq4@0"
+          MAGNETAR_KV_GAINS_CONTEXTS: "1024,4096,16384,32768"
+          MAGNETAR_KV_GAINS_LABEL: deepseek-v2-lite-chat-q8_0
+        shell: bash
+        run: |
+          set -o pipefail
+          report="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-gguf"
+          mkdir -p "$report"
+          # The GPUs' clocks, temperature and power every 15 s, to tell
+          # whether later requests run on slower clocks (diagnostic).
+          nvidia-smi --query-gpu=timestamp,index,clocks.sm,clocks.mem,temperature.gpu,power.draw,pstate --format=csv,noheader -l 15 > "$report/clocks.csv" 2>&1 &
+          clocks=$!
+          MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR" \
+          MAGNETAR_KV_GAINS_REPORT="$report/gains.md" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains.log"
+          kill "$clocks" || true
+          echo "GPU clocks (timestamp, index, SM MHz, memory MHz, temperature, power, P-state):"
+          cat "$report/clocks.csv" || true
+          cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
       - name: GPU peer-to-peer readiness, again (diagnostic)
         # The readiness printed at the start, repeated where the job's log
         # tail keeps it.

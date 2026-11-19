@@ -519,6 +519,26 @@ pub trait ProviderExecutionApi: Send + Sync {
         Ok(false)
     }
 
+    /// [`Self::write_zeroed_kv_store`] for a store whose first `exact_rows`
+    /// rows stay exact (`keep-turboquant-kv-head-exact`): a row `kv-write`
+    /// writes below `exact_rows` reads back unchanged, any other as its
+    /// round trip. Without an exact head, the store
+    /// [`Self::write_zeroed_kv_store`] creates; with one, `Ok(false)` unless
+    /// the Provider keeps exact heads (the default).
+    fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: crate::KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        if exact_rows == 0 || precision.bits().is_none() {
+            return self.write_zeroed_kv_store(id, shape, precision, head_dimension);
+        }
+        Ok(false)
+    }
+
     /// The [`TensorValue`] counterpart to [`Self::write_tensor_admitted`]:
     /// admits `value`'s byte size (when it is [`TensorValue::Host`]; a
     /// Provider whose [`TensorValue::Opaque`] resources have their own

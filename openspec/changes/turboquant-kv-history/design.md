@@ -184,7 +184,11 @@ At 4,096 tokens: TPOT 23.34 ms (f32), 26.74 ms (tq4), 26.40 ms (tq3); 64/64
 leading tokens agree in both. At 16,384 tokens every precision ran out of
 device memory in the prefill's MLP (`gate_proj`), before the history's
 size matters: the KV savings need a chunked prefill to turn into longer
-contexts on this GPU.
+contexts on this GPU. With the chunked prefill of `chunk-long-prefills`
+(passes of 2,048 rows, run 44256946982), every precision runs 16,384 tokens
+(TPOT 40.89 ms in f32, 35.09 ms in tq4, 36.81 ms in tq3, 64/64 tokens equal
+to f32's) and tq4 and tq3 run 32,768 tokens (51.68 and 55.18 ms), where the
+f32 history no longer fits.
 
 Findings:
 - The history shrinks as designed (7.1-7.5× in `tq4`, 9.1-9.9× in `tq3`).

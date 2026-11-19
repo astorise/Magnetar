@@ -85,6 +85,7 @@ mod graph_execution;
 mod kv_pool;
 mod kv_state;
 mod prefill_buckets;
+mod prefill_chunks;
 mod prepared_plans;
 mod production;
 mod segments;

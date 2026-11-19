@@ -1442,8 +1442,11 @@ impl ProductionLoadedModel {
         require_ready_first_native_instance(&runtime, &instance)?;
         graph_cache.set_fusion_provider(Some(provider_binding.clone()));
         // A Provider that keeps no KV history in place would append a
-        // bucketed prefill's padding rows to the history.
-        if !in_place_kv_supported(&runtime, &provider_binding) {
+        // bucketed prefill's padding rows to the history, and could not
+        // continue a chunked prefill's.
+        if in_place_kv_supported(&runtime, &provider_binding) {
+            graph_cache.set_prefill_chunk(super::prefill_chunks::prefill_chunk_from_env());
+        } else {
             graph_cache.set_prefill_buckets(Vec::new());
         }
         Ok(Self {
@@ -1514,6 +1517,30 @@ impl ProductionLoadedModel {
         } else {
             Vec::new()
         });
+    }
+
+    /// Sets the chunk length of later prefills (`chunk-long-prefills`): a
+    /// longer prompt runs in passes of this many rows, each continuing the
+    /// KV history the passes before it wrote, so a pass's activations are
+    /// bounded by the chunk instead of the prompt. `0` runs every prompt in
+    /// one pass. Defaults to `MAGNETAR_PREFILL_CHUNK` (2048 when unset).
+    /// A Provider that keeps no KV history in place, or tensor parallelism,
+    /// runs every prompt in one pass, and so does a model whose prefill
+    /// cannot continue a history (an attention reading K or V other than
+    /// its KV history's), from its first long prompt on.
+    pub fn set_prefill_chunk(&mut self, chunk: u64) {
+        let chunk = if in_place_kv_supported(&self.runtime, &self.provider_binding) {
+            chunk
+        } else {
+            0
+        };
+        self.graph_cache.set_prefill_chunk(chunk);
+    }
+
+    /// The chunk length of later prefills, `0` when every prompt runs in
+    /// one pass (`chunk-long-prefills`).
+    pub fn prefill_chunk(&self) -> u64 {
+        self.graph_cache.prefill_chunk()
     }
 
     /// Bytes the pooled KV store sets hold, free or in use
@@ -1828,15 +1855,28 @@ impl ProductionLoadedModel {
                     graphs
                 }
             };
+            // A chunked prefill's later passes read the earlier passes' rows
+            // through the KV history alone (`chunk-long-prefills`): a graph
+            // whose attention reads K or V from elsewhere runs every prompt
+            // in one pass.
+            if graph_length < prompt_token_count
+                && !super::prefill_chunks::prefill_continues_history(&component_graphs.prefill)
+            {
+                self.graph_cache.set_prefill_chunk(0);
+                continue;
+            }
             // Padding rows are only invisible to KV history kept in place,
             // where attention reads the first `key_count` rows: a graph whose
-            // KV edges have other readers runs at the prompt's exact length.
-            if (graph_length != prompt_token_count || component_graphs.logits_row)
+            // KV edges have other readers runs at the prompt's exact length,
+            // outside every bucket and the chunk.
+            if (graph_length != prompt_token_count
+                || self.graph_cache.is_prefill_bucket(graph_length))
                 && !component_graphs
                     .prefill_memo
                     .kv_edges_feed_only_attention(&component_graphs.prefill)
             {
                 self.graph_cache.set_prefill_buckets(Vec::new());
+                self.graph_cache.set_prefill_chunk(0);
                 continue;
             }
             break (graph_length, component_graphs);

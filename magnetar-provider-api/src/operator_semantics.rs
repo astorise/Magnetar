@@ -508,6 +508,92 @@ pub fn value_heads(
     })
 }
 
+/// `latent [rows, latent_width + rope]` times `weight [latent_width, n]`,
+/// each row's leading `latent_width` values only: `[rows, n]`, each product
+/// summing in index order, as `matmul` does.
+fn latent_product(
+    latent: &HostTensor,
+    weight: &HostTensor,
+    latent_width: u64,
+    what: &str,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let invalid =
+        |reason: String| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
+    let (rows, width) = rows_cols_of(latent, "attention's latent K or V")?;
+    let (weight_rows, n) = rows_cols_of(weight, what)?;
+    if latent_width == 0 || latent_width > width || weight_rows != latent_width {
+        return Err(invalid(format!(
+            "{what} {:?} cannot expand latent rows {:?} of {latent_width} latent values",
+            weight.shape, latent.shape
+        )));
+    }
+    let (rows, width, latent_width, n) = (
+        rows as usize,
+        width as usize,
+        latent_width as usize,
+        n as usize,
+    );
+    let mut data = vec![0.0_f32; rows * n];
+    for row in 0..rows {
+        let out = &mut data[row * n..(row + 1) * n];
+        for (inner, &a) in latent.data[row * width..row * width + latent_width]
+            .iter()
+            .enumerate()
+        {
+            for (out, &b) in out.iter_mut().zip(&weight.data[inner * n..(inner + 1) * n]) {
+                *out += a * b;
+            }
+        }
+    }
+    Ok(HostTensor {
+        shape: vec![rows as u64, n as u64],
+        data,
+    })
+}
+
+/// `attention`'s keys under `latent_kv_width` (`chunk-latent-prefills`):
+/// `latent [rows, latent_width + rope]` holds each key row's latent `c` and
+/// one rope key shared by every head, and `w_k [latent_width, head_count *
+/// nope]` gives head `h` the key `[c W_k_h | k_rope]`:
+/// `[rows, head_count * (nope + rope)]`.
+pub fn latent_keys(
+    latent: &HostTensor,
+    w_k: &HostTensor,
+    latent_width: u64,
+    head_count: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let invalid =
+        |reason: String| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
+    let (rows, width) = rows_cols_of(latent, "attention's latent K")?;
+    if latent_width >= width {
+        return Err(invalid(format!(
+            "latent K rows {:?} hold no rope key after {latent_width} latent values",
+            latent.shape
+        )));
+    }
+    let nope = latent_product(latent, w_k, latent_width, "attention's key projection")?;
+    let rope = HostTensor {
+        shape: vec![rows, width - latent_width],
+        data: latent
+            .data
+            .chunks_exact(width as usize)
+            .flat_map(|row| row[latent_width as usize..].iter().copied())
+            .collect(),
+    };
+    concat_heads(&nope, &rope, head_count, 1)
+}
+
+/// `attention`'s values under `latent_kv_width` (`chunk-latent-prefills`):
+/// `w_v [latent_width, head_count * value]` gives head `h` the value
+/// `c W_v_h` of each latent row's leading `latent_width` values `c`.
+pub fn latent_values(
+    latent: &HostTensor,
+    w_v: &HostTensor,
+    latent_width: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    latent_product(latent, w_v, latent_width, "attention's value projection")
+}
+
 /// `concat` with `axis = "heads"` (`express-latent-attention-forms`): joins
 /// `[T, head_count * a]` and `[T, second_head_count * b]` rows head by head
 /// into `[T, head_count * (a + b)]`, output head `h` being the first input's

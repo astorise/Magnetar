@@ -72,6 +72,32 @@ pub(super) fn prepare_first_native_plan_for_graph(
     generation: PreparedExecutionPlanGeneration,
     provider: &ProviderBinding,
 ) -> Result<PreparedExecutionPlan, E2eConformanceError> {
+    prepare_first_native_plan_serving(
+        runtime,
+        graph,
+        instance,
+        model_instance_revision,
+        token_count,
+        token_count,
+        generation,
+        provider,
+    )
+}
+
+/// [`prepare_first_native_plan_for_graph`] for a graph of `token_count`
+/// rows serving workloads of up to `max_sequence` tokens: the chunk's
+/// prefill graph serves longer prompts in passes (`chunk-long-prefills`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_first_native_plan_serving(
+    runtime: &Runtime,
+    graph: &ExecutionGraph,
+    instance: &ModelInstanceId,
+    model_instance_revision: u64,
+    token_count: u64,
+    max_sequence: u64,
+    generation: PreparedExecutionPlanGeneration,
+    provider: &ProviderBinding,
+) -> Result<PreparedExecutionPlan, E2eConformanceError> {
     let phase = PreparedExecutionPhase::from(graph.phase);
     let mut scope = PreparedExecutionPlanScope::for_phase(phase)
         .with_model_instance(instance.clone(), model_instance_revision)
@@ -187,7 +213,7 @@ pub(super) fn prepare_first_native_plan_for_graph(
     // already correct).
     plan.add_guard(PlanGuard::SequenceRange {
         min: 1,
-        max: token_count.max(E2E_FIXTURE_CONTEXT),
+        max: token_count.max(max_sequence).max(E2E_FIXTURE_CONTEXT),
     });
     plan.add_guard(PlanGuard::Readiness);
     plan.add_guard(PlanGuard::AffinityRequired);
@@ -383,15 +409,37 @@ pub fn prepare_first_native_execution_plans_for_provider(
     prompt_token_count: u64,
     provider: &ProviderBinding,
 ) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
+    prepare_first_native_execution_plans_serving(
+        runtime,
+        instance,
+        graphs,
+        prompt_token_count,
+        prompt_token_count,
+        provider,
+    )
+}
+
+/// [`prepare_first_native_execution_plans_for_provider`] whose prefill plan
+/// serves prompts of up to `max_prompt_tokens` tokens: the chunk's graph
+/// runs longer prompts in passes (`chunk-long-prefills`).
+pub(super) fn prepare_first_native_execution_plans_serving(
+    runtime: &Runtime,
+    instance: &ModelInstanceId,
+    graphs: FirstNativeComponentGraphs,
+    prompt_token_count: u64,
+    max_prompt_tokens: u64,
+    provider: &ProviderBinding,
+) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
     let status = require_ready_first_native_instance(runtime, instance)?;
     let mutation_version = status.status().mutation_version;
     Ok(FirstNativePreparedPlans {
-        prefill: prepare_first_native_plan_for_graph(
+        prefill: prepare_first_native_plan_serving(
             runtime,
             &graphs.prefill,
             instance,
             mutation_version,
             prompt_token_count,
+            max_prompt_tokens,
             PreparedExecutionPlanGeneration::new(1),
             provider,
         )?,

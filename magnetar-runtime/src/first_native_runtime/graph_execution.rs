@@ -581,25 +581,31 @@ pub(super) fn dispatch_first_native_graph_node(
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "attention" => {
-            if inputs.len() != 3 {
+            // Five inputs: latent K and V and their key and value
+            // projections (`latent_kv_width`, `chunk-latent-prefills`).
+            if inputs.len() != 3 && inputs.len() != 5 {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 3 attention inputs"),
+                    reason: format!("graph node '{node_id}' expects 3 or 5 attention inputs"),
                 });
             }
             let q = inputs.remove(0);
             let k = inputs.remove(0);
             let v = inputs.remove(0);
+            let latent_weights = (inputs.len() == 2).then(|| {
+                let w_k = inputs.remove(0);
+                let w_v = inputs.remove(0);
+                [w_k, w_v]
+            });
             let key_count = node
                 .inputs
                 .get(1)
                 .and_then(|edge| ctx.bounded_kv_edges.get(edge))
                 .copied();
-            dispatch_qwen_attention(
+            super::dispatch::dispatch_attention_with_latent_weights(
                 ctx,
                 node_id,
-                q,
-                k,
-                v,
+                [q, k, v],
+                latent_weights,
                 architecture,
                 &node.attributes,
                 Some(output_target),
@@ -1560,10 +1566,14 @@ pub(super) fn execute_first_native_graph_nodes(
                                 KvRole::K => key,
                                 KvRole::V => value,
                             });
+                        // Its first rows kept exact
+                        // (`keep-turboquant-kv-head-exact`).
+                        let exact_rows = spec.precisions.exact_rows;
                         let compact = match head_dimension {
-                            Some(head) if precision != KvStorePrecision::F32 => {
-                                Some((head, precision.stored_bytes(capacity, width, head)))
-                            }
+                            Some(head) if precision != KvStorePrecision::F32 => Some((
+                                head,
+                                precision.stored_bytes_with_head(capacity, width, head, exact_rows),
+                            )),
                             _ => None,
                         };
                         let zeroed = if let Some((head, stored_bytes)) = compact {
@@ -1594,7 +1604,13 @@ pub(super) fn execute_first_native_graph_nodes(
                                 })?;
                             let created = dispatch_ctx
                                 .provider
-                                .write_zeroed_kv_store(&store, &[capacity, width], precision, head)
+                                .write_zeroed_kv_store_with_exact_head(
+                                    &store,
+                                    &[capacity, width],
+                                    precision,
+                                    head,
+                                    exact_rows,
+                                )
                                 .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
                                     reason: error.to_string(),
                                 })?;

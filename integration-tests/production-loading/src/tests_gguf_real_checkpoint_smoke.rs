@@ -581,9 +581,13 @@ fn generate_gguf_with(
     }
     if let Some(resolution) = model.kv_precision_resolution() {
         eprintln!(
-            "[{label}] kv precisions K {} V {}{}",
+            "[{label}] kv precisions K {} V {}{}{}",
             resolution.resolved.k.as_str(),
             resolution.resolved.v.as_str(),
+            match resolution.resolved.exact_rows {
+                0 => String::new(),
+                rows => format!(", exact head {rows} rows"),
+            },
             if resolution.fallbacks.is_empty() {
                 String::new()
             } else {
