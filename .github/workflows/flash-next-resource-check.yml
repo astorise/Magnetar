@@ -1,0 +1,26 @@
+name: Flash Next resource check
+on:
+  push:
+    branches: [codex/flash-next-resource-check-20261119]
+permissions:
+  contents: read
+concurrency:
+  group: gpu-runner-smoke
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: arc-gpu-magnetar
+    timeout-minutes: 15
+    container:
+      image: nvidia/cuda:13.5.0-cudnn-devel-ubuntu24.04
+      options: --gpus all
+    steps:
+      - name: Record accessible GPU and memory resources
+        shell: bash
+        run: |
+          set -eu
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
+          nvidia-smi topo -m || true
+          cat /proc/meminfo | head -n 3
+          for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do if [ -r "$f" ]; then printf "%s " "$f"; cat "$f"; fi; done
+          df -B1 / "$RUNNER_TEMP"
