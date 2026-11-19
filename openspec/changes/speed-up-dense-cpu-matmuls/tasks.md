@@ -12,4 +12,12 @@
 ## 2. Benchmark
 
 - [x] 2.1 `cpu-native` in the qualification campaign; the benchmark's CPU cell selects it.
-- [ ] 2.2 Benchmark CPU (`magnetar`, 16 tokens, 5 runs) on Qwen2.5-0.5B against runs 44511061319 and 44485741553.
+- [x] 2.2 Benchmark CPU on Qwen2.5-0.5B, all engines in one job (run 44517360795, AMD EPYC 9V74, 4 vCPUs, providers/cpu 9cbb5a5):
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar `cpu-native` (bfloat16 checkpoint) | 752 ms | 95.8 ms | 43.6 ms |
+  | llama-server (FP16 GGUF) | 537 ms | 47.8 ms | 32.3 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached) | 446 ms | 27.9 ms | 26.0 ms |
+
+  Before this change the same cell ran 7.49 s per request on `cpu-native` (run 44511061319, 419 ms per token), and 19.9 s on the Reference CPU Provider (run 44485741553). A local profile (4 threads) puts about 12 ms of each 58 ms decode step in the Runtime's per-node dispatch, which the CPU Provider cannot capture and replay yet.

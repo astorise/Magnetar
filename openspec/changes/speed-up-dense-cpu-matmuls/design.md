@@ -18,16 +18,24 @@ A compact weight lives beside the packed ones. It is forgotten by every write th
 
 ### Kernels by weight layout
 
+Every weight of the Qwen2.5 Components is used input-major (`transpose_b` false): the input-major kernel matters most.
+
 A matmul's weight is stored either output-major (`[n, k]` used with `transpose_b`, a checkpoint's linear weights) or input-major (`[k, n]`).
 
 - **Output-major.** Each output value is a dot product over a stored row. Rows of `a` are taken four at a time, so one weight load serves four rows. A single row (a decode step) uses four independent accumulators, so consecutive fused multiply-adds do not wait on each other.
-- **Input-major.** Each stored row scales and adds into a block of output columns.
+- **Input-major.** Each stored row scales and adds into a block of output columns, four rows per read and write of the block.
+  - A weight narrower than 2,048 columns per thread is shared out by blocks of whole rows: each task reads its rows contiguously into a partial product, which the caller sums. Column blocks of a few hundred columns read a few hundred bytes per row between strides of the row width, at about 15 GB/s.
+  - A wider one (the 151,936-column LM head) keeps column blocks of at least 2,048 columns.
 
 Both are written once per weight encoding (f32, bfloat16), so a loop never dispatches per load. The pool shares output columns, in blocks that are multiples of 8.
 
 ### Numerics
 
 Products are accumulated in f32 with fused multiply-adds, in another order than the Reference CPU kernel's. Results agree to rounding, not bit for bit, as the packed kernels' do. Tests compare them within the existing tolerance (`2e-5` of the largest value).
+
+### Polling workers
+
+Pool workers that finish a job, and a caller waiting for the last tasks, poll for 500 microseconds before sleeping. A decode step runs a pooled Kernel every few hundred microseconds, and a sleeping worker's wake-up left the caller running most tasks of a sub-millisecond matmul alone.
 
 ## Risks / Trade-offs
 
