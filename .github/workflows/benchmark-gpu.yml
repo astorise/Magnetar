@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: Model profile (Qwen3.6 needs about 32 GB RAM and 30 GB free disk)
+        description: Model profile (Flash Next requires the 100 GiB /cache volume)
         type: choice
-        options: [qwen2.5-0.5b, qwen3.6-35b-experimental]
+        options: [qwen2.5-0.5b, qwen3.6-35b-experimental, qwen3.8-flash-next-q2-experimental]
         default: qwen2.5-0.5b
         required: true
       tokens:
@@ -28,6 +28,7 @@ concurrency:
 jobs:
   benchmark:
     name: GPU / same-machine comparison
+    if: ${{ inputs.model != 'qwen3.8-flash-next-q2-experimental' }}
     runs-on: arc-gpu-magnetar
     timeout-minutes: 360
     container:
@@ -68,5 +69,31 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: benchmark-gpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/benchmark-results/
+          if-no-files-found: warn
+  flash-next:
+    name: GPU / Flash Next experimental
+    if: ${{ inputs.model == 'qwen3.8-flash-next-q2-experimental' }}
+    runs-on: arc-gpu-magnetar
+    timeout-minutes: 360
+    container:
+      image: ghcr.io/niko1221/strata:0.2.16-cuda13@sha256:acc0feffeef9d4123e3928537300357908937de530d53771053b6db57129a0c1
+      options: --gpus all
+    env:
+      BENCH_DEVICE: gpu
+      BENCH_MODEL_PROFILE: ${{ inputs.model }}
+      BENCH_TOKENS: ${{ inputs.tokens }}
+      BENCH_RUNS: ${{ inputs.runs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run Flash Next on both GPUs
+        shell: bash
+        run: bash benchmark/flash_next.sh
+      - name: Upload benchmark results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: benchmark-flash-next-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/benchmark-results/
           if-no-files-found: warn

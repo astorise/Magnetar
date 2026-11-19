@@ -44,7 +44,11 @@ def render(root):
     if len(texts) > 1:
         lines.extend(["", "**Generated text differs across measured runs or engines; inspect the raw outputs.**"])
     lines += ["", "These are per-request measurements after warmup on the same job host; HTTP and in-process boundaries differ."]
-    if profile == "qwen3.6-35b-experimental":
+    if profile == "qwen3.8-flash-next-q2-experimental":
+        lines += ["Experimental Flash Next profile: Strata only; other engines are not yet integrated.",
+                  "Inspect strata-engine.log and gpu-usage.csv for the two-GPU split and actual placement.",
+                  "Strata applies its chat template and may reuse prompt cache. Short outputs can contain only reasoning."]
+    elif profile == "qwen3.6-35b-experimental":
         lines += ["Experimental profile: llama.cpp and Strata use the same pinned GGUF and prompt token IDs; "
                   "GPU runs use different hybrid CPU/GPU placements.",
                   "Other engines are not integrated for this architecture. This is not yet an all-engine comparison."]
