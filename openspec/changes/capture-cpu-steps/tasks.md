@@ -18,4 +18,12 @@
   | Ollama (FP16 GGUF, 4 prompt tokens cached) | 500 ms | 30.7 ms | 29.2 ms |
 
   Run 44517360795 (an EPYC 9V74, without capture) measured Magnetar at 752 ms per request and 43.6 ms per token, against 32.3 ms for llama-server on that host. The gap that remains is the TTFT: the 5-token prompt runs as an 8-row bucket.
-- [ ] 2.3 Benchmark CPU, all engines in one job, with the padding skip (providers/cpu 5c8cd07).
+- [x] 2.3 Benchmark CPU, all engines in one job, with the padding skip (run 44525765520, AMD EPYC 9V45, 4 vCPUs with AVX-512, providers/cpu 5c8cd07). Same tokens:
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar `cpu-native` | 493 ms | 53.5 ms | 29.2 ms |
+  | llama-server (FP16 GGUF) | 382 ms | 33.1 ms | 23.2 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached) | 366 ms | 23.2 ms | 21.3 ms |
+
+  The runner's CPU differs from campaign to campaign. On this host, llama.cpp's CPU backend uses AVX-512, while these kernels use AVX2.
