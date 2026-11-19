@@ -138,3 +138,13 @@ row in the exact head (the same values as `f32`'s): the clocks do not
 explain it. A `tq4` decode step at 16,384 tokens takes 2.57 ms less
 than an `f32` one, its attention's 2.58 ms. At 16,384 tokens the latent
 prefill attention is 49% of the prefill and `moe-experts` 37%.
+
+Run 44450645042 runs `f32`, `tq4` (no exact head) and `f32` again, each a
+model of its own, every dispatch waiting for its Kernels: prefill 3,295.4,
+3,399.4 and 3,560.6 ms at 1,024 tokens, 14,937.7, 15,474.1 and 16,904.8 ms
+at 4,096, the decode steps 36 to 40 ms in all three. Every model loaded
+after the first prefills slower, whatever its history: the `tq4` TTFTs
+measured after `f32`'s carry it. providers/cuda ed7edfd keeps the memory
+the stream-ordered allocator frees in the device's pool instead of
+returning it to the driver at each synchronization, which a prefill's
+large temporaries met at every pass.

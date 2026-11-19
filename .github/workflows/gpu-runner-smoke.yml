@@ -1925,7 +1925,8 @@ jobs:
           # slower whatever their history (run 44441670479: the GPUs' clocks
           # did not drop).
           MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4@0,f32"
-          MAGNETAR_KV_GAINS_CONTEXTS: "1024,4096"
+          # Each length twice: whether requests slow down within one model.
+          MAGNETAR_KV_GAINS_CONTEXTS: "1024,4096,1024,4096"
           MAGNETAR_KV_GAINS_NEW_TOKENS: "16"
           MAGNETAR_KV_GAINS_LABEL: deepseek-v2-lite-chat-q8_0-phases
           MAGNETAR_KV_GAINS_PHASES: "1"

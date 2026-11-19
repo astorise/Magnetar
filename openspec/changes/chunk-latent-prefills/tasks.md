@@ -23,4 +23,5 @@
 - [x] 5.2 DeepSeek-V2-Lite-Chat Q8_0 across both GPUs prefills in passes of 2,048 rows: 16,384 tokens with an `f32` history and 32,768 tokens; TTFT and TPOT recorded in `cache-latent-attention-history` task 6.7 (run 44404969859, design.md Evidence).
 - [x] 5.3 The `tq4` prefill's extra time over `f32`'s. Not the latent attention pass (`latent_prefill_attention_times`, run 44417598937: equal times); the DeepSeek phases step (run 44431584039) spreads it over every operator, those that never read the history included, its KV append adding 5 and 37 ms at 1,024 and 16,384 tokens (design.md, Evidence).
 - [x] 5.4 The GPUs' clocks over the DeepSeek long-context step, to tell whether the later requests run on slower clocks: they do not (run 44441670479, SM 1,732 to 1,942 MHz, at most 64 C throughout).
-- [ ] 5.5 Whether a model loaded after another runs every request slower whatever its history: the phases step runs `f32`, `tq4`, then `f32` again.
+- [x] 5.5 Whether a model loaded after another runs every request slower whatever its history: it does (run 44450645042: `f32` loaded third 8% and 13% slower than loaded first at 1,024 and 4,096 tokens, `tq4` second 3% and 4%).
+- [ ] 5.6 Freed device memory kept in the pool: the reload slowdown gone, and each length run twice within a model.
