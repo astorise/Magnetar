@@ -1,0 +1,85 @@
+name: Flash Next cache trial
+on:
+  push:
+    branches: [codex/flash-next-cache-trial-20261119]
+permissions:
+  contents: read
+concurrency:
+  group: gpu-runner-smoke
+  cancel-in-progress: false
+jobs:
+  strata:
+    runs-on: arc-gpu-magnetar
+    timeout-minutes: 180
+    container:
+      image: ghcr.io/niko1221/strata:0.2.16-cuda13@sha256:acc0feffeef9d4123e3928537300357908937de530d53771053b6db57129a0c1
+      options: --gpus all
+    steps:
+      - name: Run Qwen3.8 Flash Next on two GPUs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CACHE_ROOT=/cache/magnetar-flash-next-q2
+          test -d /cache
+          mkdir -p "$CACHE_ROOT"/{data,home,state,config,install}
+          export HOME="$CACHE_ROOT/home" XDG_STATE_HOME="$CACHE_ROOT/state" XDG_CONFIG_HOME="$CACHE_ROOT/config"
+          export STRATA_INSTALL_DIR="$CACHE_ROOT/install"
+          export CUDA_VISIBLE_DEVICES=0,1 STRATA_DL_CONNECTIONS=4 PYTHONUNBUFFERED=1
+          export STRATA_SMOKE_KEY="$(/opt/strata/terminal/python/bin/python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          trap '/opt/strata/terminal/bin/strata launch --stop >/dev/null 2>&1 || true' EXIT
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
+          df -B1 /cache
+          cat /sys/fs/cgroup/memory.max
+          /opt/strata/terminal/bin/strata launch --plan --family qwen --model q2_0 --context 4096 --parallel 1 --gpu 0,1 --vision off --drafting off --data-dir "$CACHE_ROOT/data"
+          /opt/strata/terminal/bin/strata launch --family qwen --model q2_0 --context 4096 --parallel 1 --gpu 0,1 --vision off --drafting off --tune skip --access local --port 18080 --api-key-env STRATA_SMOKE_KEY --data-dir "$CACHE_ROOT/data" --yes --no-tui
+          /opt/strata/terminal/python/bin/python3 -u - <<'PY'
+          import json, os, statistics, subprocess, threading, time, urllib.request
+          base = "http://127.0.0.1:18080"
+          headers = {"Authorization": "Bearer " + os.environ["STRATA_SMOKE_KEY"], "Content-Type": "application/json"}
+          request = urllib.request.Request(base + "/v1/models", headers=headers)
+          with urllib.request.urlopen(request, timeout=30) as response:
+              models = json.load(response)
+          if not models.get("data"):
+              raise RuntimeError("Strata did not report any loaded model")
+          model = models["data"][0]["id"]
+          stop = threading.Event()
+          observations = []
+          def monitor():
+              while not stop.is_set():
+                  proc = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True)
+                  observations.append(proc.stdout.strip())
+                  stop.wait(1)
+          watcher = threading.Thread(target=monitor, daemon=True)
+          watcher.start()
+          samples=[]
+          try:
+              for index in range(4):
+                  body = json.dumps({"model":model,"messages":[{"role":"user","content":"The capital of France is"}],"temperature":0,"max_tokens":16,"stream":False}).encode()
+                  request = urllib.request.Request(base + "/v1/chat/completions", data=body, headers=headers)
+                  started = time.monotonic()
+                  with urllib.request.urlopen(request, timeout=1800) as response:
+                      result = json.load(response)
+                  elapsed = time.monotonic() - started
+                  usage = result.get("usage") or {}
+                  count = usage.get("completion_tokens")
+                  if not result.get("choices") or not isinstance(count, int) or count < 1:
+                      raise RuntimeError("Missing completion or generated-token count")
+                  item={"request":index, "elapsed_seconds":elapsed, "completion_tokens":count, "tokens_per_second":count/elapsed, "prompt_tokens":usage.get("prompt_tokens"),"response":result["choices"][0].get("message")}
+                  print(json.dumps(item,ensure_ascii=False),flush=True)
+                  if index: samples.append(item)
+          finally:
+              stop.set()
+              watcher.join(timeout=10)
+          report = {"model":model, "setup":"Strata Q2_0, two GPUs requested, no vision or drafting; one warmup and three measured chat requests", "samples":samples, "median_tokens_per_second":statistics.median(s["tokens_per_second"] for s in samples), "gpu_samples":observations}
+          path = os.path.join(os.environ["RUNNER_TEMP"],"flash-next-report.json")
+          with open(path,"w",encoding="utf-8") as f: json.dump(report,f,indent=2,ensure_ascii=False)
+          print("REPORT",path,flush=True)
+          print("MEDIAN_TOKENS_PER_SECOND",report["median_tokens_per_second"],flush=True)
+          print("GPU_SAMPLES",json.dumps(observations),flush=True)
+          PY
+      - if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: flash-next-strata-trial
+          path: ${{ runner.temp }}/flash-next-report.json
+          if-no-files-found: warn
