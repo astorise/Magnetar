@@ -1,0 +1,26 @@
+name: Flash Next runner memory check
+on:
+  push:
+    branches: [codex/flash-next-runner-memory-check-20261119]
+permissions:
+  contents: read
+concurrency:
+  group: gpu-runner-smoke
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: arc-gpu-magnetar
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/niko1221/strata:0.2.16-cuda13@sha256:acc0feffeef9d4123e3928537300357908937de530d53771053b6db57129a0c1
+      options: --gpus all
+    steps:
+      - name: Check actual runner and Strata plan
+        shell: bash
+        run: |
+          set -eu
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
+          cat /sys/fs/cgroup/memory.max
+          head -n 3 /proc/meminfo
+          df -B1 / "$RUNNER_TEMP"
+          /opt/strata/terminal/bin/strata launch --plan --family qwen --model q2_0 --gpu 0,1 --vision off --drafting off
