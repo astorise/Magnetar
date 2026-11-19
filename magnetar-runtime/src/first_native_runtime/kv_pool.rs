@@ -47,7 +47,7 @@ pub struct KvPrecisions {
 
 impl KvPrecisions {
     /// Both roles in `precision`, a TurboQuant one with the default exact
-    /// head ([`DEFAULT_KV_EXACT_ROWS`]).
+    /// head (`DEFAULT_KV_EXACT_ROWS`, 1,024 rows).
     pub fn uniform(precision: KvStorePrecision) -> Self {
         Self {
             k: precision,
