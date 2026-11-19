@@ -43,7 +43,8 @@ def run(args, raw_dir):
             raise RuntimeError(f"Ollama placement does not match {args.device}: size_vram={vram}")
         if index:
             sample = {"generated_tokens": result["eval_count"], "prompt_tokens": result.get("prompt_eval_count"),
-                      "request_seconds": elapsed, "load_seconds": result.get("load_duration", 0) / 1e9}
+                      "request_seconds": elapsed, "load_seconds": result.get("load_duration", 0) / 1e9,
+                      "text": result.get("response")}
             if isinstance(result.get("prompt_eval_cached_count"), int):
                 sample["cached_prompt_tokens"] = result["prompt_eval_cached_count"]
             if result.get("eval_duration", 0) > 0:
