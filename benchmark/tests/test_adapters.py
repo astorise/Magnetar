@@ -63,7 +63,7 @@ class AdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             def fake(url, body=None, **kwargs):
                 if url.endswith("/api/ps"):
-                    return {"models": [{"name": "test", "size_vram": 0}]}
+                    return {"models": [{"name": "test:latest", "size_vram": 0}]}
                 return {"done": True, "model": "test", "eval_count": 4, "eval_duration": 2_000_000_000}
             with patch.object(ollama, "http_json", side_effect=fake):
                 result = ollama.run(args(), Path(tmp) / "cpu")

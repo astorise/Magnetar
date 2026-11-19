@@ -1,3 +1,4 @@
+import io
 import json
 import sys
 import tempfile
@@ -71,6 +72,19 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("| airllm | failed |", text)
             self.assertIn("| strata | unavailable |", text)
             self.assertIn("Token counts differ", text)
+
+    def test_llama_server_rejects_unverified_gpu_and_still_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "test.gguf"
+            model.write_bytes(b"test")
+            args = SimpleNamespace(binary="server", model_path=str(model), device="gpu", tokens=8, runs=1)
+            process = FakeProcess([], io.StringIO(), None)
+            with patch.object(llama_server.subprocess, "Popen", return_value=process), \
+                    patch.object(llama_server, "http_json", return_value={"status": "ok"}):
+                with self.assertRaisesRegex(RuntimeError, "did not confirm GPU"):
+                    llama_server.run(args, root / "raw")
+            self.assertTrue(process.terminated)
 
 
 if __name__ == "__main__":

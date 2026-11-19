@@ -4,6 +4,15 @@ import time
 from common import PROMPT, http_json
 
 
+def canonical_name(name):
+    if not isinstance(name, str):
+        return None
+    name = name.removeprefix("registry.ollama.ai/").removeprefix("library/")
+    if ":" not in name.rsplit("/", 1)[-1]:
+        name += ":latest"
+    return name
+
+
 def run(args, raw_dir):
     if not args.model:
         raise ValueError("Ollama requires --model naming an installed model")
@@ -21,9 +30,12 @@ def run(args, raw_dir):
         (raw_dir / f"run-{index}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         if not result.get("done") or not isinstance(result.get("eval_count"), int) or result["eval_count"] < 1:
             raise RuntimeError("Ollama returned an incomplete response or no token count")
-        models = http_json(base + "/api/ps").get("models", [])
-        placement = next((m for m in models if m.get("name") in (args.model, result.get("model"))
-                          or m.get("model") in (args.model, result.get("model"))), None)
+        ps = http_json(base + "/api/ps")
+        (raw_dir / f"placement-{index}.json").write_text(json.dumps(ps, indent=2), encoding="utf-8")
+        models = ps.get("models", [])
+        names = {canonical_name(args.model), canonical_name(result.get("model"))} - {None}
+        placement = next((m for m in models if canonical_name(m.get("name")) in names
+                          or canonical_name(m.get("model")) in names), None)
         if placement is None or not isinstance(placement.get("size_vram"), int):
             raise RuntimeError("Cannot verify Ollama model placement via /api/ps")
         vram = placement["size_vram"]
@@ -32,6 +44,8 @@ def run(args, raw_dir):
         if index:
             sample = {"generated_tokens": result["eval_count"], "prompt_tokens": result.get("prompt_eval_count"),
                       "request_seconds": elapsed, "load_seconds": result.get("load_duration", 0) / 1e9}
+            if isinstance(result.get("prompt_eval_cached_count"), int):
+                sample["cached_prompt_tokens"] = result["prompt_eval_cached_count"]
             if result.get("eval_duration", 0) > 0:
                 sample["decode_tokens_per_second"] = result["eval_count"] * 1e9 / result["eval_duration"]
             samples.append(sample)

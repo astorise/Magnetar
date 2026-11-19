@@ -25,6 +25,9 @@ def render(root):
     generated_counts = {engine: r.get("summary", {}).get("generated_tokens", {}).get("median") for engine, r in reports.items()}
     if len(set(prompt_counts.values())) > 1 or len(set(generated_counts.values())) > 1:
         lines.extend(["", "**Token counts differ across engines; the requests are not directly equivalent.**"])
+    cached = reports.get("ollama", {}).get("summary", {}).get("cached_prompt_tokens", {}).get("max")
+    if cached:
+        lines.extend(["", f"**Ollama reused up to {cached} prompt tokens from cache; prefill work differs.**"])
     lines += ["", "These are per-request measurements after warmup on the same job host; HTTP and in-process boundaries differ.",
               "The HF checkpoint and FP16 GGUF derive from the same model, but weight and compute precision differ; inspect each report.",
               "Ollama may reuse prompt cache. Check actual token counts, outputs, GPU placement, versions, logs and raw reports before ranking.",
