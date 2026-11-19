@@ -97,3 +97,13 @@ round trip; with every prompt row in the exact head they are equal), the
 chunking); `latent_prefill_attention_times` times the pass over each
 history. This run's decode on codes is the slower four-way split of
 providers/cuda 27e1b9e (`cache-latent-attention-history`).
+
+`latent_prefill_attention_times` (run 44417598937, providers/cuda 6e267f2):
+one latent prefill attention pass of 2,048 queries takes the same time over
+an `f32` history and a `tq4` one (23.34 against 22.45 ms after 2,048 keys,
+153.37 against 154.13 after 8,192, 335.52 against 336.44 after 16,384), its
+split and dequantization at most 1.05 ms of it: the `tq4` prefill's extra
+time (3,975.4 against 2,960.4 ms at 1,024 tokens in that run) is spent
+elsewhere. The pass itself runs the tiled 192/128 Kernel at about 0.5
+multiply-add Tera-operations per second (2,048 x 16,384 x 16 heads x 320 in
+335 ms): at 32,768 tokens it is about half of TTFT.

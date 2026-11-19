@@ -21,4 +21,4 @@
 
 - [x] 5.1 The CUDA conformance test and the tiny checkpoints on CUDA pass (run 44404969859, largest logit difference 9.8e-6).
 - [x] 5.2 DeepSeek-V2-Lite-Chat Q8_0 across both GPUs prefills in passes of 2,048 rows: 16,384 tokens with an `f32` history and 32,768 tokens; TTFT and TPOT recorded in `cache-latent-attention-history` task 6.7 (run 44404969859, design.md Evidence).
-- [ ] 5.3 The `tq4` prefill's extra time over `f32`'s (`latent_prefill_attention_times`).
+- [ ] 5.3 The `tq4` prefill's extra time over `f32`'s. Not the latent attention pass (`latent_prefill_attention_times`, run 44417598937: equal times); the DeepSeek phases step (`MAGNETAR_KV_GAINS_PHASES`, `MAGNETAR_CUDA_SYNC_NODES`) attributes it.

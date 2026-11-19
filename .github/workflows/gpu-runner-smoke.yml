@@ -1901,6 +1901,33 @@ jobs:
           MAGNETAR_KV_GAINS_REPORT="$report/gains.md" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains.log"
           cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF prefill and decode phases at long contexts (diagnostic)
+        # chunk-latent-prefills: where a tq4 latent history's prefill and
+        # decode steps spend the time an f32 one does not. Every dispatch
+        # waits for its Kernels and decode steps run node by node, so host
+        # phases cover Device time; the times are not the step's own.
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+          MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32,tq4@0"
+          MAGNETAR_KV_GAINS_CONTEXTS: "1024,16384"
+          MAGNETAR_KV_GAINS_NEW_TOKENS: "16"
+          MAGNETAR_KV_GAINS_LABEL: deepseek-v2-lite-chat-q8_0-phases
+          MAGNETAR_KV_GAINS_PHASES: "1"
+          MAGNETAR_KV_GAINS_STEP_REPLAY: "0"
+          MAGNETAR_CUDA_SYNC_NODES: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-gguf"
+          MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR" \
+          MAGNETAR_KV_GAINS_REPORT="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-gguf/phases.md" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture
       - name: GPU peer-to-peer readiness, again (diagnostic)
         # The readiness printed at the start, repeated where the job's log
         # tail keeps it.

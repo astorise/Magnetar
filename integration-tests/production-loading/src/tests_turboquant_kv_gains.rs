@@ -263,6 +263,12 @@ fn turboquant_kv_gains_on_cuda() {
         )
         .expect("the checkpoint loads");
         model.request_kv_precisions(precision);
+        // Diagnostics: decode steps dispatched node by node, and each
+        // measured request's host time attributed to its phases.
+        if std::env::var("MAGNETAR_KV_GAINS_STEP_REPLAY").as_deref() == Ok("0") {
+            model.set_step_replay(false);
+        }
+        let phases = std::env::var("MAGNETAR_KV_GAINS_PHASES").as_deref() == Ok("1");
         free_memory("after the load");
         let free_bytes_after_load = single.as_ref().map(|single| {
             single
@@ -300,6 +306,9 @@ fn turboquant_kv_gains_on_cuda() {
             };
             let mut token_times = Vec::new();
             let mut first_logits: Vec<f32> = Vec::new();
+            if phases {
+                model.enable_phase_attribution();
+            }
             let started = Instant::now();
             let outcome = warm.and_then(|_| {
                 model.generate_streaming_with_logits(
@@ -318,6 +327,13 @@ fn turboquant_kv_gains_on_cuda() {
                     },
                 )
             });
+            if phases {
+                print_phases(
+                    &format!("{label} {} context {context}", precision_label(&precision)),
+                    &model.take_phase_attribution(),
+                );
+                model.disable_phase_attribution();
+            }
             match &outcome {
                 Ok(_) => eprintln!(
                     "[kv gains] {label} {} context {context}: ran, TTFT {:.1} ms, {} tokens, {:.0} s",
@@ -487,4 +503,41 @@ fn gains_report(label: &str, gpus: &str, new_tokens: usize, runs: &[PrecisionRun
         }
     }
     report
+}
+
+/// Prints a measured request's heaviest phases per prefill and per decode
+/// step (`MAGNETAR_KV_GAINS_PHASES=1`): host time, which covers the Device's
+/// with `MAGNETAR_CUDA_SYNC_NODES=1`.
+fn print_phases(label: &str, report: &magnetar_runtime::phase_attribution::PhaseAttributionReport) {
+    use magnetar_runtime::phase_attribution::StepKind;
+    for kind in [StepKind::Prefill, StepKind::Decode] {
+        let Some(summary) = report.summary(kind) else {
+            continue;
+        };
+        let steps = summary.steps.max(1) as f64;
+        let mut phases: Vec<_> = summary.phases.iter().collect();
+        phases.sort_by_key(|(_, total)| std::cmp::Reverse(total.host_micros));
+        let top: Vec<String> = phases
+            .iter()
+            .take(12)
+            .map(|(key, total)| {
+                format!(
+                    "{:?}{} {:.2} ms",
+                    key.phase,
+                    key.operator
+                        .as_deref()
+                        .map(|operator| format!("[{operator}]"))
+                        .unwrap_or_default(),
+                    total.host_micros as f64 / steps / 1_000.0
+                )
+            })
+            .collect();
+        eprintln!(
+            "[kv gains] {label}: {kind:?}, {} steps of {:.2} ms ({:.2} unattributed): {}",
+            summary.steps,
+            summary.wall_micros as f64 / steps / 1_000.0,
+            summary.unattributed_micros as f64 / steps / 1_000.0,
+            top.join(", ")
+        );
+    }
 }
