@@ -66,7 +66,7 @@ case "$BENCH_ENGINE" in
     git -C "$work/llama.cpp" checkout --detach "${BENCH_ENGINE_REF:-bafa0420c1e57edf04d71587d32fe57d45df7b95}"
     engine_revision=$(git -C "$work/llama.cpp" rev-parse HEAD)
     cmake_args=(-DCMAKE_BUILD_TYPE=Release)
-    if [[ "$BENCH_DEVICE" == gpu ]]; then cmake_args+=(-DGGML_CUDA=ON); fi
+    if [[ "$BENCH_DEVICE" == gpu ]]; then cmake_args+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native); fi
     cmake -S "$work/llama.cpp" -B "$work/llama.cpp/build" "${cmake_args[@]}"
     target=llama-completion
     if [[ "$BENCH_ENGINE" == llama_server ]]; then target=llama-server; fi

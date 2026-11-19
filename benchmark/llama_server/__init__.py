@@ -22,6 +22,9 @@ def run(args, raw_dir):
     command = [str(Path(args.binary).resolve()), "--model", str(model), "--host", "127.0.0.1",
                "--port", str(port), "--parallel", "1", "--ctx-size", "512",
                "--n-gpu-layers", "0" if args.device == "cpu" else "999"]
+    # Recent llama-server versions hide loader/offload messages at the default verbosity.
+    if args.device == "gpu":
+        command.append("--verbose")
     log_path = raw_dir / "server.log"
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)

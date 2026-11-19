@@ -57,6 +57,7 @@ class CampaignTests(unittest.TestCase):
             self.assertTrue(all(body["cache_prompt"] is False for _, body in requests[1:]))
             self.assertEqual(result["samples"][0]["prompt_tokens"], 5)
             self.assertIn("25/25", result["device_evidence"])
+            self.assertIn("--verbose", result["command"])
 
     def test_summary_keeps_failure_and_warns_on_token_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:

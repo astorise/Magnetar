@@ -1,6 +1,8 @@
 name: Benchmark GPU
 
 on:
+  push:
+    branches: [codex/benchmark-comparison-20261119-0749]
   workflow_dispatch:
     inputs:
       tokens:
@@ -32,8 +34,8 @@ jobs:
         shell: bash
     env:
       BENCH_DEVICE: gpu
-      BENCH_TOKENS: ${{ inputs.tokens }}
-      BENCH_RUNS: ${{ inputs.runs }}
+      BENCH_TOKENS: ${{ inputs.tokens || '16' }}
+      BENCH_RUNS: ${{ inputs.runs || '5' }}
     steps:
       - name: Install benchmark dependencies
         run: apt-get update && apt-get install -y --no-install-recommends git curl build-essential ca-certificates cmake pkg-config libssl-dev python3 python3-venv zstd
