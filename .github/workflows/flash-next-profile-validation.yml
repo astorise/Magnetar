@@ -1,0 +1,31 @@
+name: Validate Flash Next workflow
+on:
+  push:
+    branches: [codex/flash-next-profile-validation-20261119]
+permissions:
+  contents: read
+concurrency:
+  group: gpu-runner-smoke
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: arc-gpu-magnetar
+    timeout-minutes: 180
+    container:
+      image: ghcr.io/niko1221/strata:0.2.16-cuda13@sha256:acc0feffeef9d4123e3928537300357908937de530d53771053b6db57129a0c1
+      options: --gpus all
+    env:
+      BENCH_DEVICE: gpu
+      BENCH_MODEL_PROFILE: qwen3.8-flash-next-q2-experimental
+      BENCH_TOKENS: '16'
+      BENCH_RUNS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: /opt/strata/terminal/python/bin/python3 -m unittest discover -s benchmark/tests -v
+      - run: bash benchmark/flash_next.sh
+      - if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: flash-next-profile-validation
+          path: ${{ runner.temp }}/benchmark-results/
+          if-no-files-found: warn

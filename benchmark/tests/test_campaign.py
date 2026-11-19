@@ -105,6 +105,17 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("Prompt token counts are unavailable", text)
             self.assertNotIn("Token counts differ", text)
 
+    def test_flash_next_summary_reports_the_single_engine_and_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "model-profile.txt").write_text("qwen3.8-flash-next-q2-experimental", encoding="utf-8")
+            (root / "status.tsv").write_text("magnetar\tunavailable\nstrata\tsuccess\n", encoding="utf-8")
+            text = campaign_report.render(root)
+            self.assertIn("Strata only", text)
+            self.assertIn("strata-engine.log", text)
+            self.assertIn("Short outputs can contain only reasoning", text)
+            self.assertIn("| magnetar | unavailable |", text)
+
     def test_llama_server_is_local_disables_cache_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

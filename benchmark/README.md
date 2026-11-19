@@ -18,6 +18,18 @@ Au lancement, le menu **model** propose deux profils :
   intégrés pour ce profil. Ils sont signalés comme indisponibles, et non
   comptés comme des succès. Le profil CPU ne lance pas Strata, dont ce moteur
   nécessite un GPU compatible.
+* `qwen3.8-flash-next-q2-experimental` est disponible dans le workflow GPU.
+  Il mesure Strata seul, sur les deux GPU, avec Qwen3.8-Flash-Next Q2_0.
+  Les cinq autres moteurs sont indiqués comme non intégrés ; ce profil ne
+  constitue pas encore une comparaison avec Magnetar.
+
+Flash Next utilise le volume persistant du runner monté sur `/cache`. Les
+fichiers sont conservés dans `/cache/magnetar-flash-next-q2/data` pour les
+lancements suivants. Prévoir 100 Gio dédiés : les deux fichiers téléchargés
+représentent 66,4 Go et Strata prépare aussi une copie des experts. Sur le
+runner à deux RTX 3060 de 12 Gio et 30 Gio de limite mémoire, le premier essai
+a occupé environ 97 Gio au total sur le volume. La préparation et le
+chargement utilisent aussi la RAM et le SSD ; les temps dépendent de la machine.
 
 Le profil expérimental télécharge environ 22,9 Go de poids. Prévoir au moins
 32 Go de RAM et 30 Go d'espace disque libre, ainsi qu'un GPU NVIDIA et un
@@ -63,6 +75,11 @@ les moteurs :
 * Le cache de prompt de llama.cpp est désactivé. Ollama et Strata peuvent
   réutiliser un préfixe ; le rapport signale les tokens réutilisés, car le
   travail de préremplissage peut alors différer.
+* Flash Next utilise le format chat de Strata, à la différence du prompt brut
+  des autres profils. Les réponses courtes peuvent ne contenir que des tokens
+  de raisonnement ; vérifier les sorties brutes. La télémétrie des deux GPU
+  est enregistrée dans `gpu-usage.csv` et la répartition des couches dans
+  `strata-engine.log`.
 * Le tableau indique les nombres de tokens disponibles. Vérifier également
   les sorties, les placements GPU, les versions et les données brutes avant
   toute comparaison. Une occupation VRAM positive ne prouve pas que tout le
