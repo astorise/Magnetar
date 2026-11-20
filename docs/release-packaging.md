@@ -99,7 +99,7 @@ provider-specific, platform-specific, test-only, conformance-only).
 `reject_experimental_flag_enabled_by_default` denies an experimental flag
 enabled by default. `provider_feature_flags` lists ten Provider flags: the
 original seven from the proposal, plus `npu-provider`, `rocm-provider`, and
-`tpu-provider` (MAG-10, naming the real `providers/{npu,rocm,tpu}`
+`tpu-provider` (MAG-10, naming the real `providers/{openvino,rocm,tpu}`
 submodules, which previously had no release feature flag at all).
 `validate_provider_feature_flags_for_v1_0` requires that only
 `reference-cpu-provider` be enabled by default -- still true even though

@@ -66,6 +66,32 @@ pub(crate) fn real_component_for_architecture_family(
     panic!("no real Model Component declares architecture family '{family}'")
 }
 
+/// Registers the SmolLM2 graph fixture, or the component freshly built by CI.
+pub(crate) fn smollm2_component() -> magnetar_runtime::ComponentDigest {
+    let root = format!(
+        "{}/../../magnetar-runtime/fixtures/components/smollm2-graph.component.wasm",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let path = std::env::var_os("MAGNETAR_SMOLLM2_TEST_COMPONENT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.clone().into());
+    let bytes = fs::read(path).expect("SmolLM2 graph Component is readable");
+    let digest = magnetar_runtime::ComponentDigest::sha256(&bytes);
+    let original = fs::read(&root).expect("checked-in SmolLM2 graph Component is readable");
+    let original_digest = magnetar_runtime::ComponentDigest::sha256(&original);
+    let manifest = fs::read_to_string(format!("{root}.magnetar-component.yaml"))
+        .expect("SmolLM2 graph manifest is readable");
+    assert!(
+        manifest.contains(&original_digest.value),
+        "the fixture manifest must pin the checked-in Component"
+    );
+    let manifest = manifest.replace(&original_digest.value, &digest.value);
+    let trust = magnetar_runtime::ComponentTrustStore::default().trust_digest(&digest.value);
+    magnetar_runtime::register_inference_component_artifact(bytes, manifest.into_bytes(), &trust)
+        .expect("SmolLM2 graph Component registers")
+        .digest
+}
+
 pub(crate) const HIDDEN_SIZE: u64 = 8;
 pub(crate) const LAYER_COUNT: u64 = 1;
 pub(crate) const ATTENTION_HEAD_COUNT: u64 = 2;

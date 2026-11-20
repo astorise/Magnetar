@@ -15,7 +15,7 @@ hardware are genuinely useful here.
 
 ## Provider and hardware
 
-- Provider: <!-- providers/cuda, providers/rocm, providers/metal, providers/wgpu, providers/npu, providers/tpu, providers/qnn, providers/cpu -->
+- Provider: <!-- providers/cuda, providers/rocm, providers/metal, providers/wgpu, providers/openvino, providers/tpu, providers/qnn, providers/cpu -->
 - Device / GPU model:
 - Driver version:
 - OS and version:
