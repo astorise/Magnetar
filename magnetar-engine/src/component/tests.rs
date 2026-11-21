@@ -992,7 +992,7 @@ fn pushed_component_package_temp_materialization_is_removed_with_manager() {
     let package =
         component_artifact_package(bytes, ComponentDistributionSourceKind::ClientProvided);
     // `prepare_pushed_package`'s temp directory name is
-    // "magnetar-distributed-component-{digest}-{counter}": the digest
+    // "magnetar-distributed-component-{digest}-{pid}-{counter}": the digest
     // portion is this test's own (from its own literal `bytes`), so
     // matching on that full prefix -- rather than the bare
     // "magnetar-distributed-component-" prefix every such directory

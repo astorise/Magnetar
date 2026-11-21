@@ -421,6 +421,27 @@ jobs:
         run: cargo test --locked -p magnetar-engine --features wasmtime-component-engine smollm
       - name: Checkout SmolLM2 numerical test dependencies
         run: git submodule update --init -- providers/cpu providers/cuda loaders/huggingface loaders/gguf formats/gguf formats/safetensors
+      - name: Build activation-validated Qwen, Llama and DeepSeek components
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path components/qwen/Cargo.toml --target wasm32-unknown-unknown
+          cargo build --locked --release --manifest-path components/llama/Cargo.toml --target wasm32-unknown-unknown
+          cargo build --locked --release --manifest-path components/deepseek/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/qwen/target/wasm32-unknown-unknown/release/magnetar_component_Qwen.wasm -o "$RUNNER_TEMP/qwen.component.wasm"
+          wasm-tools component new components/llama/target/wasm32-unknown-unknown/release/magnetar_component_Llama.wasm -o "$RUNNER_TEMP/llama.component.wasm"
+          wasm-tools component new components/deepseek/target/wasm32-unknown-unknown/release/magnetar_component_deepseek.wasm -o "$RUNNER_TEMP/deepseek.component.wasm"
+          for component in qwen llama deepseek; do
+            wasm-tools validate "$RUNNER_TEMP/$component.component.wasm" --features component-model
+          done
+      - name: Compare freshly built decoder components with reference fixtures
+        env:
+          MAGNETAR_QWEN_TEST_COMPONENT: ${{ runner.temp }}/qwen.component.wasm
+          MAGNETAR_LLAMA_TEST_COMPONENT: ${{ runner.temp }}/llama.component.wasm
+          MAGNETAR_DEEPSEEK_TEST_COMPONENT: ${{ runner.temp }}/deepseek.component.wasm
+        run: |
+          cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_gguf_loading_e2e
+          cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_deepseek_v2_logits
       - name: Build the Gemma 4 graph component
         shell: bash
         run: |

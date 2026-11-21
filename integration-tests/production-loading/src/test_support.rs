@@ -56,6 +56,9 @@ pub(crate) fn real_component_for_architecture_family(
         );
         let original = fs::read(&path).expect("checked-in real Component .wasm is readable");
         let override_path = match name {
+            "qwen-real" => std::env::var_os("MAGNETAR_QWEN_TEST_COMPONENT"),
+            "llama-real" => std::env::var_os("MAGNETAR_LLAMA_TEST_COMPONENT"),
+            "deepseek-real" => std::env::var_os("MAGNETAR_DEEPSEEK_TEST_COMPONENT"),
             "gemma-real" => std::env::var_os("MAGNETAR_GEMMA_TEST_COMPONENT"),
             "mistral-real" => std::env::var_os("MAGNETAR_MISTRAL_TEST_COMPONENT"),
             "olmo-real" => std::env::var_os("MAGNETAR_OLMO_TEST_COMPONENT"),

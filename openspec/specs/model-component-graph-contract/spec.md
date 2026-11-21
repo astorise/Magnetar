@@ -323,9 +323,10 @@ A Model Component implementing `model-component-graph-producer` SHALL be able to
 `hidden-activation` through `model-config`. The value SHALL preserve the
 normalized checkpoint activation when it is known. Components that support
 only a fixed activation SHALL check the value and refuse missing or different
-values instead of silently producing an incompatible graph. Older Components
-remain compatible with the existing fixed-SiLU convention; the contract alone
-does not prove an older Component's activation semantics.
+values instead of silently producing an incompatible graph. Every Component
+SHALL read this capability, including when the value is unknown; a Component
+with no configurable activation may explicitly ignore the result. The Runtime
+SHALL reject a graph from an older Component that cannot read this capability.
 
 #### Scenario: A fixed-SiLU Component receives an incompatible activation
 

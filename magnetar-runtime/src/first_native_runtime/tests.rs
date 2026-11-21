@@ -4180,6 +4180,7 @@ pub(super) fn forward_segment_logits_with_weights(
 pub(super) fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
     let architecture = first_native_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
     let mut config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    config.hidden_activation = Some("silu".into());
     config.tied_embeddings = true;
     let identity = first_native_component_identity(
         ModelComponentId::new("segment-split-fixture").expect("static id is valid"),

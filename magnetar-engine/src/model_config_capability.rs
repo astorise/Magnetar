@@ -39,7 +39,8 @@ pub struct ModelConfigCapability {
 
 /// The functions whose feature a graph does not otherwise show:
 /// when the bound configuration declares one, a Component must have read
-/// it before its graph is accepted.
+/// it before its graph is accepted. Activation must always be read, so a
+/// Component can distinguish an unknown activation from a supported one.
 const FEATURE_FUNCTIONS: [&str; 7] = [
     "layer-layout",
     "options",
@@ -74,7 +75,8 @@ impl ModelConfigCapability {
     }
 
     /// The functions carrying features the configuration bound to
-    /// `instance_key` declares that the Component has not called since the binding.
+    /// `instance_key` declares that the Component has not called since the
+    /// binding, plus `hidden-activation` even when its value is unknown.
     /// A Component compiled against an earlier version cannot read them, so
     /// a graph it built for such a checkpoint would silently leave the
     /// feature out; the Runtime refuses that graph instead
@@ -99,13 +101,10 @@ impl ModelConfigCapability {
                     "mixture-of-experts-layers" => config.moe_layers.is_some(),
                     "expert-routing" => config.expert_routing.is_some(),
                     "rope-layers" => config.rope_layers.is_some(),
-                    // Preserve compatibility with older fixed-SiLU decoders.
-                    // This cannot prove that an older Component actually uses
-                    // SiLU; other declared activations must be read explicitly.
-                    _ => config
-                        .hidden_activation
-                        .as_deref()
-                        .is_some_and(|value| value != "silu"),
+                    // Even an absent activation is meaningful: a fixed-activation
+                    // decoder must see and reject it instead of guessing.
+                    "hidden-activation" => true,
+                    _ => unreachable!("every tracked model-config function is handled"),
                 };
                 declared && !called.is_some_and(|called| called.contains(*function))
             })

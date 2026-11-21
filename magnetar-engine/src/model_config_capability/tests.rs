@@ -40,6 +40,7 @@ fn per_layer_rope_is_exposed_and_must_be_read() {
     let mut config = sample_config();
     config.rope_layers = Some((0..24).map(|layer| layer % 4 != 3).collect());
     capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
     assert_eq!(
         capability.unread_declared_features("a"),
         vec!["rope-layers"]
@@ -231,6 +232,8 @@ fn declared_layer_layout_and_options_must_be_read_per_instance() {
     config.final_logit_softcapping = Some(30.0);
     capability.bind_config("first", config.clone());
     capability.bind_config("second", config);
+    capability.call("first", "hidden-activation", &[]).unwrap();
+    capability.call("second", "hidden-activation", &[]).unwrap();
     assert_eq!(
         capability.unread_declared_features("first"),
         vec!["layer-layout", "options"]
@@ -249,12 +252,27 @@ fn declared_layer_layout_and_options_must_be_read_per_instance() {
 }
 
 #[test]
-fn activation_is_exposed_and_non_silu_requires_a_read() {
+fn activation_requires_a_read_even_when_unknown() {
     let capability = ModelConfigCapability::new();
     let mut config = sample_config();
+    capability.bind_config("unknown", config.clone());
+    assert_eq!(
+        capability.unread_declared_features("unknown"),
+        vec!["hidden-activation"]
+    );
+    assert_eq!(
+        capability
+            .call("unknown", "hidden-activation", &[])
+            .unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    assert!(capability.unread_declared_features("unknown").is_empty());
     config.hidden_activation = Some("silu".into());
     capability.bind_config("legacy", config.clone());
-    assert!(capability.unread_declared_features("legacy").is_empty());
+    assert_eq!(
+        capability.unread_declared_features("legacy"),
+        vec!["hidden-activation"]
+    );
     config.hidden_activation = Some("gelu".into());
     capability.bind_config("configured", config);
     assert_eq!(
@@ -403,6 +421,7 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
     let mut config = sample_config();
     assert!(capability.unread_declared_features("a").is_empty());
     capability.bind_config("a", config.clone());
+    capability.call("a", "hidden-activation", &[]).unwrap();
     assert!(capability.unread_declared_features("a").is_empty());
 
     config.mixture_of_experts = Some(MixtureOfExpertsConfig {
@@ -421,6 +440,7 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
         v_head_dim: 48,
     });
     capability.bind_config("a", config.clone());
+    capability.call("a", "hidden-activation", &[]).unwrap();
     assert_eq!(
         capability.unread_declared_features("a"),
         vec!["multi-head-latent-attention", "mixture-of-experts-layers"]
@@ -439,8 +459,10 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
     assert!(capability.unread_declared_features("a").is_empty());
     // Another instance, and a fresh binding of the same one, start over.
     capability.bind_config("b", config.clone());
+    capability.call("b", "hidden-activation", &[]).unwrap();
     assert_eq!(capability.unread_declared_features("b").len(), 2);
     capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
     assert_eq!(capability.unread_declared_features("a").len(), 2);
     capability.clear_config("a");
     assert!(capability.unread_declared_features("a").is_empty());

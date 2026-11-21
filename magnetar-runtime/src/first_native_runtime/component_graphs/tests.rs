@@ -7,6 +7,47 @@ use super::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn fixed_silu_components_reject_unknown_and_incompatible_activations() {
+    let fixtures: &[(&[u8], &[u8])] = &[
+        (
+            QWEN_REAL_COMPONENT_BYTES,
+            QWEN_REAL_COMPONENT_MANIFEST_BYTES,
+        ),
+        (
+            LLAMA_REAL_COMPONENT_BYTES,
+            LLAMA_REAL_COMPONENT_MANIFEST_BYTES,
+        ),
+        (
+            include_bytes!("../../../fixtures/components/deepseek-real.component.wasm"),
+            include_bytes!(
+                "../../../fixtures/components/deepseek-real.component.wasm.magnetar-component.yaml"
+            ),
+        ),
+    ];
+    let fixture = e2e_fixture().unwrap();
+    for (bytes, manifest) in fixtures {
+        let digest = ComponentDigest::sha256(bytes);
+        let trust = ComponentTrustStore::default().trust_digest(&digest.value);
+        register_inference_component_artifact(bytes.to_vec(), manifest.to_vec(), &trust).unwrap();
+        for activation in [None, Some("gelu"), Some("unknown")] {
+            let mut config = architecture_config_from_first_native_model_config(&fixture.config);
+            config.hidden_activation = activation.map(str::to_string);
+            assert!(
+                build_first_native_graphs_from_named_component(
+                    &digest,
+                    &config,
+                    &fixture.identity,
+                    2
+                )
+                .is_err(),
+                "component {digest:?} accepted activation {activation:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn mistral_component_reads_activation_and_per_layer_windows() {
     let bytes = include_bytes!("../../../fixtures/components/mistral-real.component.wasm");
     let manifest = include_bytes!(
@@ -314,6 +355,46 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     let synthetic_prefill_hash =
         qwen_operator_sequence_hash(&qwen_graph_operator_codes(&synthetic_graphs.prefill).unwrap());
     assert_ne!(named_prefill_hash, synthetic_prefill_hash);
+    let mut no_activation = architecture_config_from_first_native_model_config(&fixture.config);
+    no_activation.hidden_activation = None;
+    build_first_native_graphs_from_named_component(
+        &synthetic_digest,
+        &no_activation,
+        &fixture.identity,
+        prompt_token_count,
+    )
+    .expect("a Component with no MLP may explicitly accept an unknown activation");
+
+    // The pre-1.8 version of this same fixture cannot distinguish known and
+    // unknown activation values. It must be rejected for both, even though
+    // it could otherwise construct a graph successfully.
+    let legacy_bytes =
+        include_bytes!("../../../fixtures/components/synthetic-legacy.component.wasm");
+    let legacy_manifest = include_bytes!(
+        "../../../fixtures/components/synthetic-legacy.component.wasm.magnetar-component.yaml"
+    );
+    let legacy_digest = ComponentDigest::sha256(legacy_bytes);
+    let legacy_trust = ComponentTrustStore::default().trust_digest(&legacy_digest.value);
+    register_inference_component_artifact(
+        legacy_bytes.to_vec(),
+        legacy_manifest.to_vec(),
+        &legacy_trust,
+    )
+    .expect("the legacy fixture registers before graph validation");
+    for activation in [None, Some("silu")] {
+        let mut config = architecture_config_from_first_native_model_config(&fixture.config);
+        config.hidden_activation = activation.map(str::to_string);
+        let error = build_first_native_graphs_from_named_component(
+            &legacy_digest,
+            &config,
+            &fixture.identity,
+            prompt_token_count,
+        )
+        .map(|_| ())
+        .expect_err("an older Component must not ignore activation")
+        .to_string();
+        assert!(error.contains("hidden-activation"), "{error}");
+    }
 
     // Building the synthetic Component's graphs must not disturb the real
     // Qwen Component's own registered runtime: building from the Qwen

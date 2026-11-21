@@ -47,15 +47,16 @@ pub(super) fn qwen_real_component_runtime()
     // `model-config` shape, itself additive over `1.0.0`'s
     // `graph-builder`-only world. `1.5.0` (`execute-and-cache-moe-experts`)
     // adds `model-config.mixture-of-experts`, and the Component also checks
-    // `rope-scaling` (`1.4.0`).
+    // `rope-scaling` (`1.4.0`). The current Component also verifies the
+    // checkpoint activation exposed by `1.8.0`.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.5.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.8.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.5.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.8.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -1053,8 +1054,8 @@ fn require_declared_features_read(
     }
     Err(E2eConformanceError::ModelComponentFailed {
         reason: format!(
-            "{export}: the checkpoint declares {}, which the Model Component never read from \
-             model-config; it does not implement this model",
+            "{export}: the Model Component never read required model-config values {}; \
+             it cannot safely implement this model",
             unread.join(", ")
         ),
     })

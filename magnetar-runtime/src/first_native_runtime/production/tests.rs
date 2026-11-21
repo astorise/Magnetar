@@ -131,7 +131,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
             dynamic_scaling_supported: false,
             frequency_scaling: None,
         },
-        hidden_activation: None,
+        hidden_activation: Some("silu".into()),
         rope_layers: None,
         rmsnorm_epsilon: 1e-6,
         tied_embeddings: false,
