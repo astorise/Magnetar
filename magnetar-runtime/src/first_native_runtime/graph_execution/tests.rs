@@ -968,10 +968,10 @@ fn geodesic_residual_graph_preserves_parameters_and_original_layer_indices() {
     };
     let x = builder.input("residual", &[1, 4]);
     let g = builder.input("branch", &[1, 4]);
-    let mixer_scale = builder.input("mixer.scale", &[1]);
-    let mixer_bias = builder.input("mixer.bias", &[1]);
-    let mlp_scale = builder.input("mlp.scale", &[1]);
-    let mlp_bias = builder.input("mlp.bias", &[1]);
+    let mixer_scale = builder.input("layers.0.geodesic_mixer.scale", &[1]);
+    let mixer_bias = builder.input("layers.0.geodesic_mixer.bias", &[1]);
+    let mlp_scale = builder.input("layers.11.geodesic_mlp.scale", &[1]);
+    let mlp_bias = builder.input("layers.11.geodesic_mlp.bias", &[1]);
     let mixer = builder.node(
         "mixer",
         "geodesic-residual",
@@ -1036,14 +1036,20 @@ fn geodesic_residual_graph_preserves_parameters_and_original_layer_indices() {
                 "branch",
                 HostTensor::new([1, 4], vec![0.7, 1.2, -1.0, 0.3]).unwrap(),
             ),
-            ("mixer.scale", HostTensor::new([1], vec![1.2]).unwrap()),
-            ("mixer.bias", HostTensor::new([1], vec![0.04]).unwrap()),
             (
-                "mlp.scale",
+                "layers.0.geodesic_mixer.scale",
+                HostTensor::new([1], vec![1.2]).unwrap(),
+            ),
+            (
+                "layers.0.geodesic_mixer.bias",
+                HostTensor::new([1], vec![0.04]).unwrap(),
+            ),
+            (
+                "layers.11.geodesic_mlp.scale",
                 HostTensor::new([1], vec![mlp_parameter]).unwrap(),
             ),
             (
-                "mlp.bias",
+                "layers.11.geodesic_mlp.bias",
                 HostTensor::new([1], vec![if mlp_parameter == 0.0 { 0.0 } else { 0.04 }]).unwrap(),
             ),
         ];

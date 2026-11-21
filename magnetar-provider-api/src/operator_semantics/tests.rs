@@ -153,6 +153,34 @@ fn geodesic_residual_matches_independent_pytorch_cases() {
                 4.049841403961182,
             ],
         ),
+        // The two distinct scalar pairs stored in the pinned Olala layer 0.
+        // Expected values come from its upstream OlalaGeodesicNorm.forward.
+        (
+            &[1.0, -2.0, 0.5, 4.0],
+            &[0.7, 1.2, -1.0, 0.3],
+            1.546875,
+            0.80078125,
+            0,
+            &[
+                2.119403839111328,
+                0.6764312982559204,
+                -1.4924414157867432,
+                3.751424551010132,
+            ],
+        ),
+        (
+            &[1.0, -2.0, 0.5, 4.0],
+            &[0.7, 1.2, -1.0, 0.3],
+            0.3672143518924713,
+            0.31252673268318176,
+            0,
+            &[
+                1.7690331935882568,
+                -0.5152972936630249,
+                -0.6849981546401978,
+                4.169624328613281,
+            ],
+        ),
     ];
     for (x, branch, scale, bias, index, expected) in cases {
         let x = HostTensor::new([1, x.len() as u64], x.to_vec()).unwrap();
