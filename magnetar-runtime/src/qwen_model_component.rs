@@ -370,6 +370,8 @@ impl FirstNativeRopeConfig {
 pub struct FirstNativeModelConfig {
     pub architecture: ModelComponentArchitectureMetadata,
     pub rope: FirstNativeRopeConfig,
+    /// The checkpoint's declared or format-defined MLP activation.
+    pub hidden_activation: Option<String>,
     pub rmsnorm_epsilon: f32,
     pub tied_embeddings: bool,
     /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term -- see
@@ -411,6 +413,7 @@ impl FirstNativeModelConfig {
         Self {
             architecture,
             rope,
+            hidden_activation: None,
             rmsnorm_epsilon: 1e-6,
             tied_embeddings: false,
             attention_bias: false,

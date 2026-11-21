@@ -87,6 +87,34 @@ metadata.
 
 ---
 
+### Requirement: Geodesic residual operator
+
+The optional `magnetar:operator/geodesic-residual@1` SHALL compute a learned
+geodesic update independently for each row along the final dimension. Its
+inputs are a residual `x`, branch `g`, scalar scale and scalar bias; its output
+has the same shape as `x`. The required `layer_index` is the original zero-based
+model layer, including in segmented execution. Mixer and MLP updates SHALL bind
+their own checkpoint scalar tensors.
+
+For each row, let `t = g - x * dot(x,g) / max(dot(x,x), 1e-12)`,
+`r = max(norm(x), 1e-6)`, `n = max(norm(t), 1e-8)`,
+`a = min(n/r, pi/4)`, and `theta = min((a*scale+bias)/(layer_index+1), pi/4)`.
+The result is `x*cos(theta) + (t/n)*r*sin(theta)`; negative angles are not
+clamped. Version 1 accepts and accumulates `f32` and returns `f32`; other
+dtypes require separately qualified semantics. Invalid shapes, indices and
+non-finite values SHALL be rejected. Providers without this operator SHALL
+not claim support for it.
+
+#### Scenario: A segmented model retains its original layer index
+
+Given a geodesic update in layer 11 of a segmented graph
+
+When the update is planned and executed
+
+Then it uses index 11 and the scalar tensors belonging to that update.
+
+---
+
 ### Requirement: Shape Contract
 
 Operators SHALL define shape requirements and shape inference behavior where

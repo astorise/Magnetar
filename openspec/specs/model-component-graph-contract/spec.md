@@ -317,3 +317,19 @@ A Model Component implementing `model-component-graph-producer` SHALL be able to
 - **WHEN** its declared output edge is inspected
 - **THEN** it carries a raw post-layer hidden state of shape `[sequence_length, hidden_size]`, not a vocabulary-sized logits tensor
 
+### Requirement: Model Components Can Validate Declared Activation
+
+`model-component-graph` version `1.8.0` SHALL provide an optional
+`hidden-activation` through `model-config`. The value SHALL preserve the
+normalized checkpoint activation when it is known. Components that support
+only a fixed activation SHALL check the value and refuse missing or different
+values instead of silently producing an incompatible graph. Older Components
+remain compatible with the existing fixed-SiLU convention; the contract alone
+does not prove an older Component's activation semantics.
+
+#### Scenario: A fixed-SiLU Component receives an incompatible activation
+
+- **GIVEN** a Component that implements only SiLU feed-forward activation
+- **WHEN** `hidden-activation` is absent or names a different activation
+- **THEN** graph production fails before inference
+

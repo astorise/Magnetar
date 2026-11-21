@@ -7,6 +7,63 @@ use super::*;
 use crate::{ShapeDescriptor, TensorDescriptor};
 
 use crate::compute_types::LayoutDescriptor;
+
+#[test]
+fn geodesic_residual_requires_matching_tensors_scalar_parameters_and_layer_index() {
+    let catalog = initial_operator_catalog();
+    let spec = catalog
+        .get(&OperatorId::magnetar(
+            "geodesic-residual",
+            1,
+            OperatorFamily::Tensor,
+        ))
+        .unwrap();
+    let tensor = |shape: &[u64], dtype| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(shape.to_vec()),
+            DTypeDescriptor::portable(dtype),
+        )
+    };
+    let x = tensor(&[2, 4], ComputeDType::Float32);
+    let scale = tensor(&[1], ComputeDType::Float32);
+    let bias = tensor(&[], ComputeDType::Float32);
+    let inputs = vec![x.clone(), x.clone(), scale, bias];
+    let attributes = BTreeMap::from([("layer_index".into(), OperatorAttributeValue::Integer(7))]);
+    assert!(
+        spec.validate_invocation(&inputs, std::slice::from_ref(&x), &attributes)
+            .is_ok()
+    );
+    let mut bad = inputs.clone();
+    bad[1] = tensor(&[1, 4], ComputeDType::Float32);
+    assert!(
+        spec.validate_invocation(&bad, std::slice::from_ref(&x), &attributes)
+            .is_err()
+    );
+    bad = inputs.clone();
+    bad[2] = tensor(&[2], ComputeDType::Float32);
+    assert!(
+        spec.validate_invocation(&bad, std::slice::from_ref(&x), &attributes)
+            .is_err()
+    );
+    bad = inputs.clone();
+    bad[2] = tensor(&[1], ComputeDType::Float16);
+    assert!(
+        spec.validate_invocation(&bad, std::slice::from_ref(&x), &attributes)
+            .is_err()
+    );
+    for index in [-1, u32::MAX as i64] {
+        let attributes =
+            BTreeMap::from([("layer_index".into(), OperatorAttributeValue::Integer(index))]);
+        assert!(
+            spec.validate_invocation(&inputs, std::slice::from_ref(&x), &attributes)
+                .is_err()
+        );
+    }
+    assert!(
+        spec.validate_invocation(&inputs, std::slice::from_ref(&x), &BTreeMap::new())
+            .is_err()
+    );
+}
 #[test]
 fn operator_catalog_contains_required_families_and_initial_operators() {
     let families = OperatorFamily::ALL

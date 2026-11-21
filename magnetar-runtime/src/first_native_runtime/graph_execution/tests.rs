@@ -956,6 +956,125 @@ impl FormsGraph {
     }
 }
 
+/// Two independent learned residual updates exercise the portable graph
+/// path with original layer indices and distinct mixer/MLP weight edges.
+#[test]
+fn geodesic_residual_graph_preserves_parameters_and_original_layer_indices() {
+    let mut builder = FormsGraph {
+        graph: ExecutionGraph::new(
+            ExecutionGraphId::new("geodesic-residuals"),
+            ExecutionGraphPhase::Prefill,
+        ),
+    };
+    let x = builder.input("residual", &[1, 4]);
+    let g = builder.input("branch", &[1, 4]);
+    let mixer_scale = builder.input("mixer.scale", &[1]);
+    let mixer_bias = builder.input("mixer.bias", &[1]);
+    let mlp_scale = builder.input("mlp.scale", &[1]);
+    let mlp_bias = builder.input("mlp.bias", &[1]);
+    let mixer = builder.node(
+        "mixer",
+        "geodesic-residual",
+        OperatorFamily::Tensor,
+        vec![("layer_index", OperatorAttributeValue::Integer(0))],
+        vec![x.clone(), g.clone(), mixer_scale, mixer_bias],
+        &[1, 4],
+    );
+    let mlp = builder.node(
+        "mlp",
+        "geodesic-residual",
+        OperatorFamily::Tensor,
+        vec![("layer_index", OperatorAttributeValue::Integer(11))],
+        vec![x, g, mlp_scale, mlp_bias],
+        &[1, 4],
+    );
+    let output = builder.node(
+        "sum",
+        "add",
+        OperatorFamily::Tensor,
+        vec![],
+        vec![mixer, mlp],
+        &[1, 4],
+    );
+    let mut graph = builder.graph;
+    let mut edge = graph.edges.remove(&output).unwrap();
+    edge.id = TensorEdgeId::new("logits");
+    graph.edges.insert(edge.id.clone(), edge);
+    graph
+        .nodes
+        .get_mut(&ExecutionNodeId::new("sum"))
+        .unwrap()
+        .outputs = vec![TensorEdgeId::new("logits")];
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        1,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider,
+    )
+    .unwrap();
+    for (mlp_parameter, expected) in [
+        (1.2, vec![2.9013255, -2.2552404, -0.391_262, 8.194331]),
+        (0.0, vec![2.8208141, -2.37731, -0.28452742, 8.144489]),
+    ] {
+        let tensors = [
+            (
+                "residual",
+                HostTensor::new([1, 4], vec![1.0, -2.0, 0.5, 4.0]).unwrap(),
+            ),
+            (
+                "branch",
+                HostTensor::new([1, 4], vec![0.7, 1.2, -1.0, 0.3]).unwrap(),
+            ),
+            ("mixer.scale", HostTensor::new([1], vec![1.2]).unwrap()),
+            ("mixer.bias", HostTensor::new([1], vec![0.04]).unwrap()),
+            (
+                "mlp.scale",
+                HostTensor::new([1], vec![mlp_parameter]).unwrap(),
+            ),
+            (
+                "mlp.bias",
+                HostTensor::new([1], vec![if mlp_parameter == 0.0 { 0.0 } else { 0.04 }]).unwrap(),
+            ),
+        ];
+        let bindings = tensors
+            .into_iter()
+            .map(|(name, value)| (TensorEdgeId::new(format!("input.{name}")), value))
+            .collect();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("geodesic").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_logits_close(
+            &outputs[&TensorEdgeId::new("logits")].data,
+            &expected,
+            "geodesic graph",
+        );
+    }
+}
+
 const FORMS_ROWS: u64 = 3;
 const FORMS_VOCAB: u64 = 5;
 const FORMS_HEADS: u64 = 2;
