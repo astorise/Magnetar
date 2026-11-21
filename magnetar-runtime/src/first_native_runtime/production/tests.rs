@@ -1025,11 +1025,10 @@ fn layer_placement_keeps_kv_sharing_layers_with_their_source() {
     assert!(uniform.joined.is_empty());
 }
 
-/// A loaded artifact's graph session is also offered the artifact's tensors
-/// that the configuration does not derive, with the shapes its inventory
-/// declares; a tensor both name keeps its derived shape.
+/// A loaded artifact's graph session exposes actual inventory shapes and
+/// does not fabricate weights from the baseline decoder configuration.
 #[test]
-fn artifact_weight_shapes_add_the_tensors_the_configuration_does_not_derive() {
+fn artifact_weight_shapes_use_the_declared_inventory() {
     let config = ModelArchitectureConfig {
         hidden_size: 8,
         intermediate_size: 16,
@@ -1052,7 +1051,6 @@ fn artifact_weight_shapes_add_the_tensors_the_configuration_does_not_derive() {
         expected_compute_dtype: None,
         digest: None,
     };
-    let derived = weight_shapes_for_architecture_config(&config);
     let shapes = weight_shapes_for_artifact(
         &config,
         &[
@@ -1063,11 +1061,9 @@ fn artifact_weight_shapes_add_the_tensors_the_configuration_does_not_derive() {
     );
     assert_eq!(shapes["layers.0.self_attn.q_norm"], vec![2]);
     assert_eq!(shapes["layers.0.layer_scalar"], vec![1]);
-    assert_eq!(
-        shapes["layers.0.self_attn.q_proj"],
-        derived["layers.0.self_attn.q_proj"]
-    );
-    assert_eq!(shapes.len(), derived.len() + 2);
+    assert_eq!(shapes["layers.0.self_attn.q_proj"], vec![1, 1]);
+    assert!(!shapes.contains_key("layers.0.input_norm"));
+    assert_eq!(shapes.len(), 3);
 }
 
 /// `per-layer-kv-geometry`: the weight shapes a Component's graph session

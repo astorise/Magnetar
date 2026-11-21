@@ -377,23 +377,23 @@ fn insert_mlp_shapes(
     );
 }
 
-/// [`weight_shapes_for_architecture_config`], plus each tensor of a Model
-/// Artifact that the configuration does not derive, with the shape its
-/// inventory declares. A Component may request weights beyond the dense
-/// decoder's (per-head and extra norms, a layer scale, a dense MLP beside
-/// routed experts); weight materialization binds every tensor of the
-/// inventory, so the graph-builder offers exactly those. A derived shape
-/// is kept for the tensors both name.
+/// The shapes actually present in a Model Artifact's inventory. A Component
+/// can request any declared tensor; an absent weight must fail graph building
+/// rather than receiving a fabricated baseline-decoder shape. A tied output
+/// projection may be aliased to the declared token embedding by the Component.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub(super) fn weight_shapes_for_artifact(
     config: &ModelArchitectureConfig,
     tensors: &[ModelTensorMetadata],
 ) -> BTreeMap<String, Vec<u64>> {
-    let mut shapes = weight_shapes_for_architecture_config(config);
-    for tensor in tensors {
+    let mut shapes: BTreeMap<_, _> = tensors
+        .iter()
+        .map(|tensor| (tensor.name.clone(), tensor.shape.clone()))
+        .collect();
+    if config.tie_word_embeddings && shapes.contains_key("token_embedding") {
         shapes
-            .entry(tensor.name.clone())
-            .or_insert_with(|| tensor.shape.clone());
+            .entry("lm_head".into())
+            .or_insert_with(|| vec![config.hidden_size, config.vocab_size]);
     }
     shapes
 }
@@ -589,8 +589,20 @@ pub fn production_model_fixture(
     };
     let descriptor = first_native_component_descriptor(identity.clone(), &config)
         .map_err(E2eConformanceError::from)?;
-    validate_first_native_model_artifact(&descriptor, &config, &manifest)
+    // A real Component owns its graph and weight requirements. The baseline
+    // decoder's inventory is not valid for every architecture, so admission
+    // checks the generic artifact contract here and lets graph construction
+    // verify each requested tensor against the actual inventory.
+    manifest.validate().map_err(E2eConformanceError::from)?;
+    descriptor
+        .validate_model_artifact(&manifest)
+        .map_err(QwenComponentError::from)
         .map_err(E2eConformanceError::from)?;
+    if config.chat_template_required && manifest.chat_template.is_none() {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "chat template metadata required but not present in Model Artifact".into(),
+        });
+    }
     Ok(E2eFixture {
         config,
         identity,

@@ -74,6 +74,45 @@ fn mistral_component_reads_activation_and_per_layer_windows() {
             .is_err(),
         "a pre-1.9 component must not ignore the declared per-layer positional encoding"
     );
+    config.rope_layers = None;
+    let mut tensors = fixture.manifest.tensors.clone();
+    build_first_native_graphs_from_named_component_for_artifact(
+        &digest,
+        &config,
+        &tensors,
+        &fixture.identity,
+        4,
+    )
+    .expect("the Component can build from the real inventory");
+    tensors.retain(|tensor| tensor.name != "layers.0.input_norm");
+    assert!(
+        build_first_native_graphs_from_named_component_for_artifact(
+            &digest,
+            &config,
+            &tensors,
+            &fixture.identity,
+            4,
+        )
+        .is_err(),
+        "a missing weight cannot be fabricated from architecture defaults"
+    );
+    let mut tensors = fixture.manifest.tensors.clone();
+    tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == "layers.0.self_attn.q_proj")
+        .unwrap()
+        .shape = vec![1, 1];
+    assert!(
+        build_first_native_graphs_from_named_component_for_artifact(
+            &digest,
+            &config,
+            &tensors,
+            &fixture.identity,
+            4,
+        )
+        .is_err(),
+        "a declared weight with the wrong shape must fail graph validation"
+    );
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

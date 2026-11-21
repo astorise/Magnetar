@@ -443,7 +443,7 @@ jobs:
           cargo build --locked --release --manifest-path components/olmo/Cargo.toml --target wasm32-unknown-unknown
           wasm-tools component new components/olmo/target/wasm32-unknown-unknown/release/magnetar_component_olmo.wasm -o "$RUNNER_TEMP/olmo.component.wasm"
           wasm-tools validate "$RUNNER_TEMP/olmo.component.wasm" --features component-model
-      - name: Check OLMo 3 activation and the pending numerical fixture
+      - name: Compare OLMo 3 prefill and decode with independent logits
         env:
           MAGNETAR_OLMO_TEST_COMPONENT: ${{ runner.temp }}/olmo.component.wasm
         run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading olmo3_

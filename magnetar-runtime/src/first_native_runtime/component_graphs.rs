@@ -397,11 +397,9 @@ pub fn build_first_native_graphs_from_named_component(
 }
 
 /// [`build_first_native_graphs_from_named_component`] for a loaded Model
-/// Artifact: the graph-builder also offers the artifact's tensors that the
-/// architecture configuration does not derive, with the shapes the
-/// artifact's inventory declares (`weight_shapes_for_artifact`), so a
-/// Component may request every weight the artifact carries and weight
-/// materialization binds.
+/// Artifact: the graph-builder offers the actual tensor inventory and its
+/// declared shapes (`weight_shapes_for_artifact`), so missing or mismatched
+/// weights cannot be hidden by inferred baseline-decoder shapes.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn build_first_native_graphs_from_named_component_for_artifact(
     digest: &ComponentDigest,

@@ -348,3 +348,18 @@ the unrotated key for both prefill and cached decode.
 - **WHEN** graph production uses a Component that never reads that selection
 - **THEN** the Runtime refuses the graph rather than assuming all layers rotate
 
+### Requirement: Production Graph Weights Come From The Artifact Inventory
+
+The Runtime SHALL validate a production Component's requested weight edges
+against the loaded artifact's tensor names and declared shapes, without
+inventing decoder-specific tensor names or substituting inferred shapes.
+A tied output projection MAY be represented as an alias of the artifact's
+declared token embedding. The completed graph SHALL pass portable Operator
+shape validation before execution.
+
+#### Scenario: A Component asks for an absent or incompatible weight
+
+- **GIVEN** a loaded artifact whose inventory is missing a requested weight or declares an incompatible shape
+- **WHEN** its Component builds a production graph
+- **THEN** graph construction or validation fails before the graph executes
+
