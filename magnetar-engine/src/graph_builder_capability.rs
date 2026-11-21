@@ -355,6 +355,7 @@ impl GraphBuilderCapability {
         let phase = match phase {
             "prefill" => ExecutionGraphPhase::Prefill,
             "decode" => ExecutionGraphPhase::Decode,
+            "encode" => ExecutionGraphPhase::Encode,
             other => {
                 return Err(rejected(
                     CAPABILITY_NAME,
@@ -367,6 +368,13 @@ impl GraphBuilderCapability {
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
         let position_offset = expect_u64(&arguments[2])
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        if phase == ExecutionGraphPhase::Encode && (sequence_length == 0 || position_offset != 0) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "encode graphs require positive length and zero position offset",
+            ));
+        }
 
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(instance_key).ok_or_else(|| {

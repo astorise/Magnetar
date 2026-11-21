@@ -419,6 +419,17 @@ jobs:
         env:
           MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
         run: cargo test --locked -p magnetar-engine --features wasmtime-component-engine smollm
+      - name: Build and validate the ModernBERT encoder component
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path components/modernbert/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/modernbert/target/wasm32-unknown-unknown/release/magnetar_component_modernbert.wasm -o "$RUNNER_TEMP/modernbert.component.wasm"
+          wasm-tools validate "$RUNNER_TEMP/modernbert.component.wasm" --features component-model
+      - name: Compare the ModernBERT component graph with Transformers
+        env:
+          MAGNETAR_MODERNBERT_TEST_COMPONENT: ${{ runner.temp }}/modernbert.component.wasm
+        run: cargo test --locked -p magnetar-runtime modernbert_component_graph_matches_pinned_transformers
       - name: Checkout SmolLM2 numerical test dependencies
         run: git submodule update --init -- providers/cpu providers/cuda loaders/huggingface loaders/gguf formats/gguf formats/safetensors
       - name: Build activation-validated Qwen, Llama and DeepSeek components

@@ -16,6 +16,27 @@ fn tensor(shape: [u64; 2]) -> TensorDescriptor {
 }
 
 #[test]
+fn encode_phase_rejects_decoder_cache_metadata() {
+    let id = TensorEdgeId::new("cache");
+    let mut edge = TensorEdge::new(id.clone(), tensor([1, 2]));
+    edge.kv_cache = Some(GraphKvCacheMetadata {
+        cache_id: "decoder.layer0.k".into(),
+        behavior: GraphKvCacheBehavior::Input,
+        paged: false,
+        compatibility_key: "model".into(),
+    });
+    let graph = ExecutionGraph::new(
+        ExecutionGraphId::new("encoder"),
+        ExecutionGraphPhase::Encode,
+    )
+    .with_edge(edge);
+    assert!(matches!(
+        graph.validate(&default_graph_catalog()),
+        Err(GraphError::LifecycleInvalid(_))
+    ));
+}
+
+#[test]
 fn graph_validation_accepts_component_produced_portable_graph() {
     let catalog = default_graph_catalog();
     let input = TensorEdgeId::new("input");

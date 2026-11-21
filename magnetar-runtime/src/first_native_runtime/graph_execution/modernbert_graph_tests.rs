@@ -351,3 +351,230 @@ fn modernbert_encoder_graph_matches_pinned_transformers() {
         }
     }
 }
+
+/// Exercises the actual WebAssembly Component, host capabilities, planner and
+/// numeric executor. CI can substitute the Component just built from source.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn modernbert_component_graph_matches_pinned_transformers() {
+    let bytes = match std::env::var_os("MAGNETAR_MODERNBERT_TEST_COMPONENT") {
+        Some(path) => std::fs::read(path).unwrap(),
+        None => include_bytes!("../../../fixtures/components/modernbert-encoder.component.wasm")
+            .to_vec(),
+    };
+    let digest = ComponentDigest::sha256(&bytes);
+    // Derive a complete local-development manifest from the existing fixture;
+    // its digest always identifies the exact Component bytes used by this test.
+    let manifest = include_str!(
+        "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    )
+    .replace(
+        "sha256:abfdf515d2d2d52bd0738d52d3628a6077e65d4217c6c19c9598eef7ae0386a1",
+        &digest.value,
+    )
+    .replace("magnetar.qwen.real", "magnetar.modernbert.test")
+    .replace("1.8.0", "1.12.0");
+    let graph_builder = Arc::new(GraphBuilderCapability::new());
+    let model_config = Arc::new(ModelConfigCapability::new());
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().unwrap(),
+    ));
+    manager.set_resource_limits(inference_component_runtime_limits());
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(&digest.value));
+    manager.provide_capability(
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.12.0"),
+        graph_builder.clone(),
+    );
+    manager.provide_capability(
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.12.0"),
+        model_config.clone(),
+    );
+    let definition = manager
+        .prepare_pushed_package(ComponentArtifactPackage::new(
+            bytes,
+            manifest.into_bytes(),
+            digest,
+            ComponentDistributionSource::new(
+                ComponentDistributionSourceKind::DevelopmentFixture,
+                "modernbert-test",
+            ),
+        ))
+        .unwrap();
+    let cases: Vec<Case> = serde_json::from_str(include_str!(
+        "../../../fixtures/modernbert-encoder-reference.json"
+    ))
+    .unwrap();
+    let fixture = e2e_fixture().unwrap();
+    for case in cases {
+        let component = manager.instantiate_prepared_component(definition).unwrap();
+        let key = manager.engine_instance_key(component).unwrap().to_string();
+        let (_, original_bindings) = graph(&case);
+        let mut shapes = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
+        for (edge, tensor) in original_bindings {
+            let name = edge.as_str().strip_prefix("input.").unwrap();
+            let target = match name {
+                "token_ids" => "input.token_ids".to_string(),
+                "mask" => "input.attention_mask".to_string(),
+                _ => {
+                    shapes.insert(name.to_string(), tensor.shape.clone());
+                    format!("weight.{name}")
+                }
+            };
+            bindings.insert(TensorEdgeId::new(target), tensor);
+        }
+        let mut config = architecture_config_from_first_native_model_config(&fixture.config);
+        config.hidden_size = 8;
+        config.intermediate_size = 12;
+        config.num_hidden_layers = 3;
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = 2;
+        config.head_dim = 4;
+        config.vocab_size = 24;
+        config.hidden_activation = Some("gelu".into());
+        config.attention_bias = case.bias;
+        let encoder_config = EncoderGraphConfig {
+            norm_epsilon: 1e-5,
+            max_positions: 64,
+            norm_bias: case.bias,
+            attention_bias: case.bias,
+            mlp_bias: case.bias,
+            layers: (0..3)
+                .map(|index| EncoderLayerConfig {
+                    local_radius: (index == 1).then_some(2),
+                    rope_theta: if index == 1 { 10_000.0 } else { 160_000.0 },
+                    attention_normalization: index != 0,
+                })
+                .collect(),
+        };
+        model_config.bind_config(&key, config.clone());
+        model_config
+            .bind_encoder_config(&key, encoder_config.clone())
+            .unwrap();
+        graph_builder.prepare_session(
+            &key,
+            SessionContext {
+                component_id: "modernbert-test".into(),
+                compatibility_key: "modernbert-test".into(),
+                kv_namespace: "unused".into(),
+                weight_shapes: shapes.clone(),
+                output_edge_name: "logits".into(),
+            },
+        );
+        let result = manager
+            .invoke(
+                ComponentInvocation::new(
+                    component,
+                    WitInterface::new(
+                        "magnetar:model-component-graph/encoder-component-graph-producer",
+                        "1.12.0",
+                    ),
+                    "build-encoder-graph",
+                )
+                .with_arguments(vec![ComponentValue::S64(case.ids.len() as i64)]),
+            )
+            .unwrap();
+        let [ComponentValue::String(handle)] = result.values.as_slice() else {
+            panic!("expected a graph handle, got {:?}", result.values);
+        };
+        let graph = graph_builder.take_graph(&key, handle).unwrap();
+        assert_eq!(graph.phase, ExecutionGraphPhase::Encode);
+        assert!(model_config.unread_declared_features(&key).is_empty());
+        graph.validate(&initial_operator_catalog()).unwrap();
+
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            case.ids.len() as u64,
+            PreparedExecutionPlanGeneration::new(1),
+            &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+        )
+        .unwrap();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("modernbert-component").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = &outputs[&TensorEdgeId::new("logits")].data;
+        assert_eq!(actual.len(), case.output.len());
+        // Uniform RoPE position shifts preserve Q/K dot products; the second
+        // independent fixture starts at position 3, while this API starts at 0.
+        for (index, (&actual, &expected)) in actual.iter().zip(&case.output).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 3e-6 + 1e-6 * expected.abs(),
+                "bias {} output[{index}]: {actual} != {expected}",
+                case.bias
+            );
+        }
+        graph_builder.clear_session(&key);
+        model_config.clear_config(&key);
+        manager.destroy_instance(component).unwrap();
+
+        // A WebAssembly trap can poison an instance. Isolate each rejection,
+        // while preparing a valid builder session so the test cannot pass due
+        // merely to a missing session or weight.
+        for unsupported in ["length", "activation", "rope-scaling"] {
+            let component = manager.instantiate_prepared_component(definition).unwrap();
+            let key = manager.engine_instance_key(component).unwrap().to_string();
+            let mut unsupported_config = config.clone();
+            if unsupported == "activation" {
+                unsupported_config.hidden_activation = Some("silu".into());
+            } else if unsupported == "rope-scaling" {
+                unsupported_config.rope_scaling_factor = Some(2.0);
+            }
+            model_config.bind_config(&key, unsupported_config);
+            model_config
+                .bind_encoder_config(&key, encoder_config.clone())
+                .unwrap();
+            graph_builder.prepare_session(
+                &key,
+                SessionContext {
+                    component_id: "modernbert-test".into(),
+                    compatibility_key: "modernbert-test".into(),
+                    kv_namespace: "unused".into(),
+                    weight_shapes: shapes.clone(),
+                    output_edge_name: "logits".into(),
+                },
+            );
+            let tokens = if unsupported == "length" {
+                65
+            } else {
+                case.ids.len() as i64
+            };
+            let result = manager.invoke(
+                ComponentInvocation::new(
+                    component,
+                    WitInterface::new(
+                        "magnetar:model-component-graph/encoder-component-graph-producer",
+                        "1.12.0",
+                    ),
+                    "build-encoder-graph",
+                )
+                .with_arguments(vec![ComponentValue::S64(tokens)]),
+            );
+            assert!(result.is_err(), "accepted unsupported {unsupported}");
+            graph_builder.clear_session(&key);
+            model_config.clear_config(&key);
+            manager.destroy_instance(component).unwrap();
+        }
+    }
+}

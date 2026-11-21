@@ -191,6 +191,22 @@ Provider advertises them without implementing their stated semantics. These
 operators enable exact graph construction; they do not themselves supply an
 encoder Component or a decision API.
 
+The additive `model-component-graph@1.12.0` contract introduces an explicit
+`encode` graph phase and a separate `encoder-component-graph-producer` world.
+Its `build-encoder-graph(sequence-length)` exports one single-sequence graph
+whose inputs are token IDs and a binary key mask, and whose output is the
+per-token hidden-state tensor. This is neither decoder prefill nor generation.
+An optional `model-config.encoder-config` supplies a finite positive LayerNorm
+epsilon, the maximum position count, independent normalization/attention/MLP
+bias flags and one ordered record per layer: its optional inclusive symmetric
+local radius, positive RoPE theta and whether attention normalization exists.
+Hidden/head/intermediate/vocabulary sizes still come from the existing
+architecture record. Components must read any declared encoder configuration;
+an older Component that cannot do so is rejected. Unbound, invalid, stale or
+incompatible configurations fail closed. The first profile uses physical
+zero-based positions and f32 tensors; arbitrary position IDs, batching,
+decision-head execution and checkpoint weight mapping remain separate work.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

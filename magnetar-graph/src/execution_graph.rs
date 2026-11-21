@@ -82,6 +82,7 @@ pub enum ExecutionGraphPhase {
     Warmup,
     Prefill,
     Decode,
+    Encode,
     AdapterActivation,
     AdapterMerge,
     SamplingHelper,
@@ -497,6 +498,15 @@ pub fn validate_execution_graph(
     )];
 
     for edge in graph.edges.values() {
+        if graph.phase == ExecutionGraphPhase::Encode
+            && (edge.kv_cache.is_some()
+                || edge.recurrent_state.is_some()
+                || edge.prefix_cache.is_some())
+        {
+            return Err(GraphError::LifecycleInvalid(
+                "encode graphs cannot carry decoder cache or recurrent state".into(),
+            ));
+        }
         if matches!(edge.aliasing, super::execution_graph::TensorAliasing::MayAlias(ref aliased) | super::execution_graph::TensorAliasing::MustAlias(ref aliased) if !graph.edges.contains_key(aliased))
         {
             return Err(GraphError::AliasingInvalid(edge.id.clone()));

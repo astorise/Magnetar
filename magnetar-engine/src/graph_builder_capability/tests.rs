@@ -28,6 +28,73 @@ fn context() -> SessionContext {
 }
 
 #[test]
+fn encoder_phase_is_distinct_and_refuses_decoder_offsets() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("encoder", context());
+    let begin = |length, offset| {
+        [
+            ComponentValue::Enum("encode".into()),
+            ComponentValue::S64(length),
+            ComponentValue::S64(offset),
+        ]
+    };
+    assert!(
+        capability
+            .call("encoder", "begin-graph", &begin(0, 0))
+            .is_err()
+    );
+    assert!(
+        capability
+            .call("encoder", "begin-graph", &begin(4, 1))
+            .is_err()
+    );
+    capability
+        .call("encoder", "begin-graph", &begin(4, 0))
+        .unwrap();
+    let input = capability
+        .call(
+            "encoder",
+            "declare-input",
+            &[ComponentValue::String("values".into()), shape(vec![4, 8])],
+        )
+        .unwrap();
+    let ComponentValue::String(input) = &input[0] else {
+        panic!("missing encoder input")
+    };
+    let output = capability
+        .call(
+            "encoder",
+            "add-node",
+            &[
+                ComponentValue::String("activation".into()),
+                ComponentValue::String("silu".into()),
+                ComponentValue::String("Activation".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                shape(vec![4, 8]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(output) = &output[0] else {
+        panic!("missing encoder output")
+    };
+    let result = capability
+        .call(
+            "encoder",
+            "finish-graph",
+            &[ComponentValue::String(output.clone())],
+        )
+        .unwrap();
+    let ComponentValue::String(handle) = &result[0] else {
+        panic!("missing encoder graph handle")
+    };
+    let graph = capability.take_graph("encoder", handle).unwrap();
+    assert_eq!(graph.phase, ExecutionGraphPhase::Encode);
+    graph.validate(&crate::default_graph_catalog()).unwrap();
+}
+
+#[test]
 fn builds_a_minimal_two_node_graph_end_to_end() {
     let capability = GraphBuilderCapability::new();
     capability.prepare_session("instance-1", context());

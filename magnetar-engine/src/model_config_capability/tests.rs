@@ -35,6 +35,108 @@ fn sample_config() -> ModelArchitectureConfig {
 }
 
 #[test]
+fn encoder_configuration_is_validated_bound_per_instance_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    let mut architecture = sample_config();
+    architecture.hidden_size = 8;
+    architecture.intermediate_size = 12;
+    architecture.num_hidden_layers = 2;
+    architecture.num_attention_heads = 2;
+    architecture.num_key_value_heads = 2;
+    architecture.head_dim = 4;
+    architecture.vocab_size = 24;
+    architecture.attention_bias = false;
+    architecture.hidden_activation = Some("gelu".into());
+    let encoder = EncoderGraphConfig {
+        norm_epsilon: 1e-5,
+        max_positions: 64,
+        norm_bias: false,
+        attention_bias: false,
+        mlp_bias: true,
+        layers: vec![
+            EncoderLayerConfig {
+                local_radius: None,
+                rope_theta: 160_000.0,
+                attention_normalization: false,
+            },
+            EncoderLayerConfig {
+                local_radius: Some(2),
+                rope_theta: 10_000.0,
+                attention_normalization: true,
+            },
+        ],
+    };
+    assert!(
+        capability
+            .bind_encoder_config("missing", encoder.clone())
+            .is_err()
+    );
+    capability.bind_config("first", architecture.clone());
+    capability.bind_config("second", architecture.clone());
+    capability
+        .bind_encoder_config("first", encoder.clone())
+        .unwrap();
+    capability.call("first", "hidden-activation", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["encoder-config"]
+    );
+    assert_eq!(
+        capability.call("second", "encoder-config", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    let values = capability.call("first", "encoder-config", &[]).unwrap();
+    let [ComponentValue::Option(Some(value))] = values.as_slice() else {
+        panic!("missing encoder configuration")
+    };
+    let ComponentValue::Record(fields) = value.as_ref() else {
+        panic!("invalid encoder configuration record")
+    };
+    assert_eq!(
+        fields[0],
+        ("norm-epsilon".into(), ComponentValue::F64(1e-5))
+    );
+    assert_eq!(fields[1], ("max-positions".into(), ComponentValue::S64(64)));
+    assert_eq!(fields[4], ("mlp-bias".into(), ComponentValue::Bool(true)));
+    let ComponentValue::List(layers) = &fields[5].1 else {
+        panic!("missing encoder layers")
+    };
+    assert_eq!(layers.len(), 2);
+    let ComponentValue::Record(local) = &layers[1] else {
+        panic!("invalid encoder layer")
+    };
+    assert_eq!(
+        local[0],
+        (
+            "local-radius".into(),
+            ComponentValue::Option(Some(Box::new(ComponentValue::U32(2))))
+        )
+    );
+    assert_eq!(
+        local[1],
+        ("rope-theta".into(), ComponentValue::F64(10_000.0))
+    );
+    assert!(capability.unread_declared_features("first").is_empty());
+    capability
+        .bind_encoder_config("first", encoder.clone())
+        .unwrap();
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["encoder-config"]
+    );
+    capability.bind_config("first", architecture.clone());
+    assert_eq!(
+        capability.call("first", "encoder-config", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    let mut invalid = encoder;
+    invalid.layers[1].local_radius = Some(0);
+    assert!(capability.bind_encoder_config("first", invalid).is_err());
+    assert!(capability.call("first", "model-config", &[]).is_err());
+    assert!(capability.call("second", "model-config", &[]).is_ok());
+}
+
+#[test]
 fn per_layer_rope_is_exposed_and_must_be_read() {
     let capability = ModelConfigCapability::new();
     let mut config = sample_config();
