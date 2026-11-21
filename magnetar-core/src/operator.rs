@@ -207,6 +207,9 @@ pub enum ShapeRule {
     GeodesicResidual,
     /// One Mamba-2 mixer and its fixed-size convolution and SSM states.
     Mamba2Mixer,
+    /// Mamba-3 recurrence or projected mixer with four explicit states.
+    Mamba3Mimo,
+    Mamba3Mixer,
     Matmul,
     RmsNorm,
     RowBroadcastAdd,
@@ -1369,7 +1372,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             OperatorFamily::LinearAlgebra,
             18,
             5,
-            ShapeRule::Any,
+            ShapeRule::Mamba3Mimo,
         ),
         // Input projection, normalization and the explicit Mamba-3 states.
         (
@@ -1377,7 +1380,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             OperatorFamily::LinearAlgebra,
             16,
             5,
-            ShapeRule::Any,
+            ShapeRule::Mamba3Mixer,
         ),
         // Gate each token against the preceding raw value and retain it.
         ("token-shift", OperatorFamily::Tensor, 4, 2, ShapeRule::Any),
@@ -2282,6 +2285,151 @@ fn validate_mamba2_mixer_shape(
     Ok(())
 }
 
+fn validate_mamba3_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+    projected: bool,
+) -> Result<(), OperatorError> {
+    let invalid = || OperatorError::ShapeMismatch {
+        reason: "invalid mamba3 geometry, attributes or tensor shapes".into(),
+    };
+    let positive = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => Ok(*value as u64),
+        _ => Err(invalid()),
+    };
+    let h = positive("heads")?;
+    let g = positive("groups")?;
+    let r = positive("rank")?;
+    let p = positive("head_dim")?;
+    let n = positive("state_dim")?;
+    let a = positive("angles")?;
+    if !h.is_multiple_of(g) || !n.is_multiple_of(2) || a > n / 2 {
+        return Err(invalid());
+    }
+    let tokens = inputs[0]
+        .shape
+        .dimensions
+        .first()
+        .copied()
+        .ok_or_else(invalid)?;
+    if tokens == 0 {
+        return Err(invalid());
+    }
+    let size_ok = |shape: &[u64]| {
+        shape
+            .iter()
+            .try_fold(1u64, |total, dim| total.checked_mul(*dim))
+            .is_some_and(|elements| elements <= 67_108_864)
+    };
+    let (shapes, output_shapes) = if projected {
+        let [_, hidden] = inputs[0].shape.dimensions.as_slice() else {
+            return Err(invalid());
+        };
+        let inner = h.checked_mul(p).ok_or_else(invalid)?;
+        let expected_inner = hidden.checked_mul(2).ok_or_else(invalid)?;
+        let projected_width = p
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(3))
+            .and_then(|v| h.checked_mul(v))
+            .ok_or_else(invalid)?;
+        let dynamic_width = r
+            .checked_mul(n)
+            .and_then(|v| v.checked_mul(2))
+            .and_then(|v| v.checked_add(a))
+            .ok_or_else(invalid)?;
+        let positive_float = |name: &str| match attributes.get(name) {
+            Some(OperatorAttributeValue::Float(value)) => {
+                value.is_finite() && (*value as f32).is_finite() && (*value as f32) > 0.0
+            }
+            _ => false,
+        };
+        if *hidden == 0
+            || g != 1
+            || a != (n / 2) / 2
+            || inner != expected_inner
+            || !positive_float("epsilon")
+            || !positive_float("decay_floor")
+            || !size_ok(&[tokens, projected_width])
+            || !size_ok(&[tokens, dynamic_width])
+            || !size_ok(&[tokens, r, g, n])
+            || !size_ok(&[tokens, h, a])
+        {
+            return Err(invalid());
+        }
+        let shapes = vec![
+            vec![tokens, *hidden],
+            vec![h, a],
+            vec![h, p, n],
+            vec![r, h, n],
+            vec![h, p],
+            vec![*hidden, projected_width],
+            vec![*hidden, dynamic_width],
+            vec![h],
+            vec![n],
+            vec![n],
+            vec![r, h, n],
+            vec![r, h, n],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![h],
+        ];
+        let output_shapes = vec![
+            vec![tokens, inner],
+            shapes[1].clone(),
+            shapes[2].clone(),
+            shapes[3].clone(),
+            shapes[4].clone(),
+        ];
+        (shapes, output_shapes)
+    } else {
+        let shapes = vec![
+            vec![tokens, r, g, n],
+            vec![tokens, r, g, n],
+            vec![tokens, h, p],
+            vec![tokens, h, p],
+            vec![tokens, h],
+            vec![tokens, h],
+            vec![tokens, h],
+            vec![tokens, h, a],
+            vec![h, a],
+            vec![h, p, n],
+            vec![r, h, n],
+            vec![h, p],
+            vec![r, h, n],
+            vec![r, h, n],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![h],
+        ];
+        let output_shapes = vec![
+            vec![tokens, h, p],
+            shapes[8].clone(),
+            shapes[9].clone(),
+            shapes[10].clone(),
+            shapes[11].clone(),
+        ];
+        (shapes, output_shapes)
+    };
+    let valid = |tensor: &TensorDescriptor, shape: &[u64]| {
+        tensor.shape.symbolic.is_none() && tensor.shape.dimensions == shape && size_ok(shape)
+    };
+    if !inputs
+        .iter()
+        .zip(&shapes)
+        .all(|(tensor, shape)| valid(tensor, shape))
+        || !outputs
+            .iter()
+            .zip(&output_shapes)
+            .all(|(tensor, shape)| valid(tensor, shape))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn validate_shape_rule(
     rule: &ShapeRule,
     inputs: &[TensorDescriptor],
@@ -2291,6 +2439,8 @@ fn validate_shape_rule(
     match rule {
         ShapeRule::Any => Ok(()),
         ShapeRule::Mamba2Mixer => validate_mamba2_mixer_shape(inputs, outputs, attributes),
+        ShapeRule::Mamba3Mimo => validate_mamba3_shape(inputs, outputs, attributes, false),
+        ShapeRule::Mamba3Mixer => validate_mamba3_shape(inputs, outputs, attributes, true),
         ShapeRule::Rank(rank) => inputs
             .iter()
             .chain(outputs)

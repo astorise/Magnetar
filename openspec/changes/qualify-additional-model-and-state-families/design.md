@@ -146,7 +146,9 @@ the upstream rotary fraction, positive epsilon and decay floor, and an
 explicit zero-centered normalization flag. More general grouping, optional
 projection forms, post-gate normalization or auxiliary linear branches are
 not assumed. As with `mamba3-mimo`, explicit state tensors do not establish
-Runtime-managed session state.
+Runtime-managed session state. The Operator catalog validates both forms'
+geometry, all input and output state shapes, bounded intermediate sizes and
+the projected mixer's numerical attributes before a graph is planned.
 
 The portable `token-shift@1` operator expresses the previous-token mixing
 used by the pinned Olala attention profile without equating it to KV history.

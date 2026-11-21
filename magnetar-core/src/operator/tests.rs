@@ -9,6 +9,132 @@ use crate::{ShapeDescriptor, TensorDescriptor};
 use crate::compute_types::LayoutDescriptor;
 
 #[test]
+fn mamba3_operators_validate_four_state_tensors_and_geometry() {
+    let catalog = initial_operator_catalog();
+    let tensor = |shape: &[u64]| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(shape.to_vec()),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        )
+    };
+    let geometry = BTreeMap::from([
+        ("heads".into(), OperatorAttributeValue::Integer(2)),
+        ("groups".into(), OperatorAttributeValue::Integer(1)),
+        ("rank".into(), OperatorAttributeValue::Integer(2)),
+        ("head_dim".into(), OperatorAttributeValue::Integer(2)),
+        ("state_dim".into(), OperatorAttributeValue::Integer(4)),
+        ("angles".into(), OperatorAttributeValue::Integer(1)),
+    ]);
+    let mimo_inputs = vec![
+        tensor(&[2, 2, 1, 4]),
+        tensor(&[2, 2, 1, 4]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2, 1]),
+        tensor(&[2, 1]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2]),
+    ];
+    let states = [
+        tensor(&[2, 1]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2]),
+    ];
+    let mut mimo_outputs = vec![tensor(&[2, 2, 2])];
+    mimo_outputs.extend(states.clone());
+    let mimo = catalog
+        .get(&OperatorId::magnetar(
+            "mamba3-mimo",
+            1,
+            OperatorFamily::LinearAlgebra,
+        ))
+        .unwrap();
+    mimo.validate_invocation(&mimo_inputs, &mimo_outputs, &geometry)
+        .unwrap();
+    for index in 8..12 {
+        let mut invalid = mimo_inputs.clone();
+        invalid[index] = tensor(&[1]);
+        assert!(
+            mimo.validate_invocation(&invalid, &mimo_outputs, &geometry)
+                .is_err()
+        );
+    }
+    let mixer_inputs = vec![
+        tensor(&[2, 2]),
+        states[0].clone(),
+        states[1].clone(),
+        states[2].clone(),
+        states[3].clone(),
+        tensor(&[2, 14]),
+        tensor(&[2, 17]),
+        tensor(&[2]),
+        tensor(&[4]),
+        tensor(&[4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2]),
+    ];
+    let mut mixer_outputs = vec![tensor(&[2, 4])];
+    mixer_outputs.extend(states);
+    let mut mixer_attrs = geometry.clone();
+    mixer_attrs.insert("epsilon".into(), OperatorAttributeValue::Float(1e-5));
+    mixer_attrs.insert("decay_floor".into(), OperatorAttributeValue::Float(1e-4));
+    mixer_attrs.insert(
+        "zero_centered_norm".into(),
+        OperatorAttributeValue::Boolean(false),
+    );
+    let mixer = catalog
+        .get(&OperatorId::magnetar(
+            "mamba3-mixer",
+            1,
+            OperatorFamily::LinearAlgebra,
+        ))
+        .unwrap();
+    mixer
+        .validate_invocation(&mixer_inputs, &mixer_outputs, &mixer_attrs)
+        .unwrap();
+    for index in 1..5 {
+        let mut invalid = mixer_outputs.clone();
+        invalid[index] = tensor(&[1]);
+        assert!(
+            mixer
+                .validate_invocation(&mixer_inputs, &invalid, &mixer_attrs)
+                .is_err()
+        );
+    }
+    for (key, value) in [
+        ("angles", OperatorAttributeValue::Integer(2)),
+        ("groups", OperatorAttributeValue::Integer(2)),
+        ("head_dim", OperatorAttributeValue::Integer(i64::MAX)),
+        ("epsilon", OperatorAttributeValue::Float(0.0)),
+        ("decay_floor", OperatorAttributeValue::Float(-1.0)),
+    ] {
+        let mut invalid = mixer_attrs.clone();
+        invalid.insert(key.into(), value);
+        assert!(
+            mixer
+                .validate_invocation(&mixer_inputs, &mixer_outputs, &invalid)
+                .is_err(),
+            "{key}"
+        );
+    }
+}
+
+#[test]
 fn mamba2_mixer_validates_state_shapes_biases_and_numerics_before_dispatch() {
     let catalog = initial_operator_catalog();
     let spec = catalog
