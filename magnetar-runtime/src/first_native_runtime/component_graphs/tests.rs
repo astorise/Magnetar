@@ -7,6 +7,75 @@ use super::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn encoder_graph_boundary_rejects_missing_or_incompatible_inputs_and_outputs() {
+    let fixture = e2e_fixture().unwrap();
+    let request = FirstNativeEncoderGraphRequest {
+        architecture: architecture_config_from_first_native_model_config(&fixture.config),
+        encoder: EncoderGraphConfig {
+            norm_epsilon: 1e-5,
+            max_positions: 16,
+            norm_bias: false,
+            attention_bias: false,
+            mlp_bias: false,
+            layers: vec![],
+        },
+        weight_shapes: BTreeMap::new(),
+        identity: fixture.identity,
+        sequence_length: 3,
+    };
+    let token_ids = TensorEdgeId::new("input.token_ids");
+    let mask = TensorEdgeId::new("input.attention_mask");
+    let output = TensorEdgeId::new("hidden_states");
+    let mut graph = ExecutionGraph::new(
+        ExecutionGraphId::new("boundary-test"),
+        ExecutionGraphPhase::Encode,
+    );
+    for (id, shape) in [
+        (token_ids.clone(), vec![3]),
+        (mask.clone(), vec![3]),
+        (output.clone(), vec![3, request.architecture.hidden_size]),
+    ] {
+        graph = graph.with_edge(TensorEdge::new(
+            id,
+            f32_tensor_descriptor_from_shape(&shape),
+        ));
+    }
+    graph = graph.with_node(
+        ExecutionNode::new(
+            ExecutionNodeId::new("test"),
+            OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+        )
+        .with_input(token_ids)
+        .with_input(mask.clone())
+        .with_output(output.clone()),
+    );
+    assert!(validate_encoder_graph_boundary(&graph, &request).is_ok());
+    let mut wrong = graph.clone();
+    wrong.phase = ExecutionGraphPhase::Prefill;
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+    wrong = graph.clone();
+    wrong.edges.get_mut(&output).unwrap().descriptor = f32_tensor_descriptor_from_shape(&[3, 1]);
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+    wrong = graph.clone();
+    wrong
+        .nodes
+        .values_mut()
+        .next()
+        .unwrap()
+        .inputs
+        .retain(|id| id != &mask);
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+    wrong = graph.clone();
+    let unexpected = TensorEdgeId::new("input.extra");
+    wrong = wrong.with_edge(TensorEdge::new(
+        unexpected,
+        f32_tensor_descriptor_from_shape(&[3]),
+    ));
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn fixed_silu_components_reject_unknown_and_incompatible_activations() {
     let fixtures: &[(&[u8], &[u8])] = &[
         (

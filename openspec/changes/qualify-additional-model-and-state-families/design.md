@@ -218,6 +218,10 @@ an older Component that cannot do so is rejected. Unbound, invalid, stale or
 incompatible configurations fail closed. The first profile uses physical
 zero-based positions and f32 tensors; arbitrary position IDs, batching,
 decision-head execution and checkpoint weight mapping remain separate work.
+The registered Component runtime can construct an encoder graph from an
+explicit architecture, encoder profile and caller-provided weight inventory;
+it checks input and output descriptors and releases temporary Component state
+even on failure. It does not yet load an encoder checkpoint or run inference.
 
 ### Typed decision results
 

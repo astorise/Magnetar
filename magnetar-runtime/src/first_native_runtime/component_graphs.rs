@@ -430,6 +430,176 @@ pub fn build_first_native_graphs_from_named_component_for_artifact(
     )
 }
 
+/// Inputs needed to request a single-sequence encoder graph from a registered
+/// Component. Weight shapes are the caller's actual, normalized graph-facing
+/// tensor inventory; this API does not load checkpoint weights.
+#[derive(Clone, Debug)]
+pub struct FirstNativeEncoderGraphRequest {
+    pub architecture: ModelArchitectureConfig,
+    pub encoder: crate::model_config_capability::EncoderGraphConfig,
+    pub weight_shapes: BTreeMap<String, Vec<u64>>,
+    pub identity: ModelComponentIdentity,
+    pub sequence_length: u64,
+}
+
+/// Builds an encoder graph using a trusted, registered Component. The graph
+/// takes f32 `input.token_ids` and `input.attention_mask` tensors of length T
+/// and produces f32 `hidden_states` of shape `[T, hidden_size]`. This only
+/// constructs and validates a graph; it does not load weights or execute it.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn build_first_native_encoder_graph_from_named_component(
+    digest: &ComponentDigest,
+    request: &FirstNativeEncoderGraphRequest,
+) -> Result<ExecutionGraph, E2eConformanceError> {
+    request
+        .architecture
+        .validate()
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: format!("invalid model architecture configuration: {error}"),
+        })?;
+    if request.sequence_length == 0 || request.sequence_length > request.encoder.max_positions {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "encoder sequence length is outside the declared position limit".into(),
+        });
+    }
+    let runtime = named_component_runtime(digest)?;
+    let mut manager = runtime.manager.lock().unwrap();
+    let instance = manager
+        .instantiate_prepared_component(runtime.definition)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let Some(key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
+    let result = (|| {
+        runtime
+            .model_config_capability
+            .bind_config(&key, request.architecture.clone());
+        runtime
+            .model_config_capability
+            .bind_encoder_config(&key, request.encoder.clone())
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            })?;
+        runtime.capability.prepare_session(
+            &key,
+            SessionContext {
+                component_id: request.identity.id.as_str().to_string(),
+                compatibility_key: format!(
+                    "encoder.{}.{}",
+                    request.identity.id, request.identity.version.0
+                ),
+                kv_namespace: "encoder".into(),
+                weight_shapes: request.weight_shapes.clone(),
+                output_edge_name: "hidden_states".into(),
+            },
+        );
+        let invocation = ComponentInvocation::new(
+            instance,
+            WitInterface::new(
+                "magnetar:model-component-graph/encoder-component-graph-producer",
+                "1.12.0",
+            ),
+            "build-encoder-graph",
+        )
+        .with_arguments(vec![ComponentValue::S64(request.sequence_length as i64)]);
+        let result = manager.invoke(invocation).map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let handle = expect_single_string_invocation_result(&result, "build-encoder-graph")?;
+        let graph = runtime
+            .capability
+            .take_graph(&key, &handle)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "build-encoder-graph handle did not resolve to a finished graph".into(),
+            })?;
+        require_declared_features_read(
+            &runtime.model_config_capability,
+            &key,
+            "build-encoder-graph",
+        )?;
+        validate_first_scope_graph(&graph)?;
+        validate_encoder_graph_boundary(&graph, request)?;
+        Ok(graph)
+    })();
+    // Host capability state must be retired on traps and validation failures
+    // as well as on success; a trapped Wasm instance is never reused.
+    runtime.capability.clear_session(&key);
+    runtime.model_config_capability.clear_config(&key);
+    let destroyed = manager.destroy_instance(instance).map_err(|error| {
+        E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        }
+    });
+    match result {
+        Ok(graph) => {
+            destroyed?;
+            Ok(graph)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_encoder_graph_boundary(
+    graph: &ExecutionGraph,
+    request: &FirstNativeEncoderGraphRequest,
+) -> Result<(), E2eConformanceError> {
+    let invalid = || E2eConformanceError::ModelComponentFailed {
+        reason: "encoder Component produced an incompatible graph boundary".into(),
+    };
+    if graph.phase != ExecutionGraphPhase::Encode {
+        return Err(invalid());
+    }
+    for (name, shape) in [
+        ("input.token_ids", vec![request.sequence_length]),
+        ("input.attention_mask", vec![request.sequence_length]),
+        (
+            "hidden_states",
+            vec![request.sequence_length, request.architecture.hidden_size],
+        ),
+    ] {
+        let id = TensorEdgeId::new(name);
+        let edge = graph.edges.get(&id).ok_or_else(invalid)?;
+        if edge.descriptor != f32_tensor_descriptor_from_shape(&shape) {
+            return Err(invalid());
+        }
+        let used = if name == "hidden_states" {
+            graph.nodes.values().any(|node| node.outputs.contains(&id))
+        } else {
+            graph.nodes.values().any(|node| node.inputs.contains(&id))
+        };
+        if !used {
+            return Err(invalid());
+        }
+    }
+    if graph.edges.keys().any(|id| {
+        id.as_str().starts_with("input.")
+            && !matches!(id.as_str(), "input.token_ids" | "input.attention_mask")
+    }) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Encoder graph construction fails closed when no Component engine is
+/// available; no unattested native fallback graph is synthesized.
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
+pub fn build_first_native_encoder_graph_from_named_component(
+    _digest: &ComponentDigest,
+    _request: &FirstNativeEncoderGraphRequest,
+) -> Result<ExecutionGraph, E2eConformanceError> {
+    Err(E2eConformanceError::ModelComponentFailed {
+        reason: "no Component engine is available on this build target".into(),
+    })
+}
+
 /// No Component Engine exists on this build target/feature combination
 /// (`wasm32`, or `wasmtime-component-engine` disabled) -- fails closed,
 /// structurally, exactly like [`first_native_component_graphs_for_prompt`]'s
