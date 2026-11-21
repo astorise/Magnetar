@@ -1,0 +1,29 @@
+package magnetar:decision@1.0.0;
+
+/// Portable result types for one question. Validation and execution remain
+/// the Runtime's responsibility.
+interface types {
+  /// Raw model score and post-processed probability, in the order supplied
+  /// by the caller or checkpoint. Scores are not required to be probabilities.
+  record scored-item {
+    score: f64,
+    probability: f64,
+  }
+
+  variant prediction {
+    selected-option(u32),
+    numeric-value(f64),
+    abstain,
+  }
+
+  record decision-result {
+    /// Exactly the real options, never padded options.
+    options: list<scored-item>,
+    prediction: prediction,
+    /// A statistic supplied by the model; this makes no calibration claim.
+    confidence: option<f64>,
+    /// Optional action distribution in checkpoint-defined order. Its
+    /// presence does not imply a policy threshold or an abstention.
+    actions: option<list<scored-item>>,
+  }
+}

@@ -2,13 +2,14 @@
 //! This test does not use checkpoint weights or the Magnetar runtime graph.
 
 use magnetar_component_laya::{
-    Calibrator, QuestionType,
+    Answer, Calibrator, QuestionType,
     head::{DecisionHead, LayerNorm as HeadNorm, Linear as HeadLinear, TransformerLayer},
 };
 use magnetar_component_modernbert::{
     AttentionKind,
     encoder_reference::{Encoder, EncoderLayer, LayerNorm as EncoderNorm, Linear as EncoderLinear},
 };
+use magnetar_runtime::{DecisionPrediction, DecisionResult, DecisionScore};
 
 fn pattern(name: &str, count: usize) -> Vec<f32> {
     let seed = name
@@ -215,5 +216,46 @@ fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
             &[case["action_probability"].as_f64().unwrap() as f32],
             "action probability",
         );
+        assert_eq!(
+            decision.option_scores.len(),
+            decision.decision.probabilities.len()
+        );
+        assert_eq!(
+            decision.action_scores.len(),
+            decision.action_probabilities.len()
+        );
+        let output = DecisionResult {
+            options: decision
+                .option_scores
+                .iter()
+                .zip(&decision.decision.probabilities)
+                .map(|(&score, &probability)| DecisionScore {
+                    score: score.into(),
+                    probability,
+                })
+                .collect(),
+            prediction: match decision.decision.answer {
+                Answer::Choice(index) => {
+                    DecisionPrediction::SelectedOption(index.try_into().unwrap())
+                }
+                Answer::Score(value) | Answer::Noul(value) => {
+                    DecisionPrediction::NumericValue(value)
+                }
+            },
+            confidence: decision.decision.confidence,
+            actions: Some(
+                decision
+                    .action_scores
+                    .iter()
+                    .zip(&decision.action_probabilities)
+                    .map(|(&score, &probability)| DecisionScore {
+                        score: score.into(),
+                        probability,
+                    })
+                    .collect(),
+            ),
+        };
+        output.validate().unwrap();
+        assert_eq!(output.options.len(), markers.len());
     }
 }

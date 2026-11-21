@@ -102,6 +102,18 @@ the existing gated forms and input positions. The separate portable
 `activation-relu-squared` Kernel feature. Other dtypes or Providers are not
 qualified by a CPU-only fixture.
 
+Selection uses sigmoid scores plus the learned bias, while expert mixture
+weights use unbiased scores. The `multiple` normalization mode divides by
+the selected-score sum plus `1e-20` only when more than one expert is used;
+the routed scaling factor is applied afterwards. Exact ties across a selection
+boundary are rejected because upstream does not specify their ordering.
+The portable routing tests cover top-1, top-2 and the published top-6 of 256,
+bias-driven selection changes, saturated scores, invalid values and ties.
+Synthetic Olala MoE-to-logit fixtures execute pinned upstream PyTorch classes;
+separately, tiny Kimi top-1/top-2 checkpoints exercise the same routing mode
+end to end through Hugging Face loading, a Component and both CPU Providers.
+Neither test qualifies Olala's full hybrid model or a GPU Provider.
+
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
 `recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.
@@ -206,6 +218,20 @@ an older Component that cannot do so is rejected. Unbound, invalid, stale or
 incompatible configurations fail closed. The first profile uses physical
 zero-based positions and f32 tensors; arbitrary position IDs, batching,
 decision-head execution and checkpoint weight mapping remain separate work.
+
+### Typed decision results
+
+The additive `magnetar:decision@1.0.0` types and their Rust counterpart
+represent one question without padded options. Each option has its raw
+finite score and probability in input order; the result distinguishes an
+option index, a finite numeric prediction and explicit abstention. An optional
+action distribution uses the checkpoint-declared order and does not imply an
+abstention threshold. Confidence, when supplied, is a statistic in `[0,1]`,
+not a calibration claim. Every present distribution must be nonempty, finite,
+nonnegative, at most one per entry, and sum to one within `1e-6`; an option
+prediction must be in range. Multiple questions can carry separate results
+with different option counts. This is a result contract, not a claim that
+the inference API can already load or execute a decision checkpoint.
 
 ### Identity, eligibility and recovery
 

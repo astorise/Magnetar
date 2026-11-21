@@ -20,6 +20,7 @@ pub mod compute;
 pub use magnetar_core::compute_types;
 pub use magnetar_provider_api::compute_support;
 pub mod conformance;
+pub mod decision;
 pub use magnetar_core::device;
 #[allow(dead_code)]
 mod e2e_conformance;
@@ -100,6 +101,7 @@ pub use component_wasmtime::*;
 pub use component_web::*;
 pub use compute::*;
 pub use conformance::*;
+pub use decision::*;
 pub use device::*;
 pub use e2e_conformance::{
     E2E_EXERCISED_OPERATORS, E2E_FIXTURE_VERSION, E2E_FIXTURE_WEIGHT_DIGEST,
