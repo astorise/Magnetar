@@ -230,6 +230,7 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
             qk_nope_head_dim: 128,
             qk_rope_head_dim: 64,
             v_head_dim: 128,
+            norm_eps: None,
         }),
         moe_layers: Some((0..27).map(|layer| layer >= 1).collect()),
         expert_routing: Some(ExpertRoutingConfig {
@@ -261,6 +262,9 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
     // A zero latent width.
     refused(|config| {
         config.latent_attention.as_mut().unwrap().kv_lora_rank = 0;
+    });
+    refused(|config| {
+        config.latent_attention.as_mut().unwrap().norm_eps = Some(f64::NAN);
     });
     // Expert layers for another layer count, or without experts.
     refused(|config| config.moe_layers = Some(vec![true; 26]));

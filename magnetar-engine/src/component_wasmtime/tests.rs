@@ -1595,6 +1595,7 @@ fn wasmtime_engine_lowers_the_1_7_0_latent_attention_routing_and_yarn_into_a_rea
             qk_nope_head_dim: 3,
             qk_rope_head_dim: 2,
             v_head_dim: 5,
+            norm_eps: None,
         }),
         moe_layers: Some(vec![false, true, true]),
         expert_routing: Some(crate::ExpertRoutingConfig {

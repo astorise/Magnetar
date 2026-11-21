@@ -411,7 +411,7 @@ fn optional_inputs_scalar_mul_and_the_layered_model_attributes_validate() {
             OperatorFamily::LinearAlgebra,
         ))
         .unwrap();
-    assert_eq!((moe.min_inputs, moe.inputs), (5, 6));
+    assert_eq!((moe.min_inputs, moe.inputs), (5, 7));
 
     for (operator, family, name, value) in [
         (

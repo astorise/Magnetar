@@ -364,6 +364,10 @@ top-k normalization setting.
 - **WHEN** a Component builds a graph without reading that mode
 - **THEN** the Runtime refuses the graph rather than guessing its top-1 behavior
 
+The same version SHALL expose a separately declared latent bottleneck
+normalization epsilon. When present, Components SHALL read and apply it for
+query and key/value latent norms instead of assuming the decoder-wide epsilon.
+
 ### Requirement: Production Graph Weights Come From The Artifact Inventory
 
 The Runtime SHALL validate a production Component's requested weight edges

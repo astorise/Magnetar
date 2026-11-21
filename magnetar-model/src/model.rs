@@ -858,13 +858,16 @@ impl RopeFrequencyScaling {
 /// values followed by `qk_rope_head_dim` rotated ones, the rotated key part
 /// being one head shared by every head; each value head is `v_head_dim`
 /// wide.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LatentAttentionConfig {
     pub q_lora_rank: Option<u32>,
     pub kv_lora_rank: u32,
     pub qk_nope_head_dim: u64,
     pub qk_rope_head_dim: u64,
     pub v_head_dim: u64,
+    /// Epsilon for the query/KV latent bottleneck norms when it differs
+    /// from the decoder-wide norm. `None` retains the previous contract.
+    pub norm_eps: Option<f64>,
 }
 
 /// How router logits become expert scores (`expert-scoring`, `1.7.0`).
@@ -1040,6 +1043,12 @@ impl ModelArchitectureConfig {
     /// scaling factor.
     fn validate_latent_attention_and_experts(&self) -> Result<(), String> {
         if let Some(mla) = &self.latent_attention {
+            if mla
+                .norm_eps
+                .is_some_and(|epsilon| !epsilon.is_finite() || epsilon <= 0.0)
+            {
+                return Err("latent norm epsilon must be finite and positive".into());
+            }
             if mla.kv_lora_rank == 0
                 || mla.q_lora_rank == Some(0)
                 || mla.qk_nope_head_dim == 0

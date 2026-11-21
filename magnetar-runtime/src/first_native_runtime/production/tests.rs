@@ -1127,6 +1127,7 @@ fn latent_attention_and_mixed_expert_layers_derive_their_weight_shapes() {
         qk_nope_head_dim: 128,
         qk_rope_head_dim: 64,
         v_head_dim: 128,
+        norm_eps: None,
     };
     let config = ModelArchitectureConfig {
         hidden_size: 2048,

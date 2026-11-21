@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:38435b803600a069769739c29f0be12128ccfa0672658438c009bfe45915074a"
+    value: "sha256:0176a5835761c6136ba4ed5460bcba8a4dff9d676326830bc8a555e92115b8e1"
 component:
   name: "magnetar.deepseek.real"
   version: "0.1.0"
@@ -19,6 +19,7 @@ compatibility:
     - deepseek_v2
     - deepseek_v3
     - deepseek2
+    - glm4_moe_lite
   artifact_formats:
     - huggingface
     - gguf
@@ -26,10 +27,10 @@ wit:
   imports:
     - package: "magnetar:model-component-graph"
       interface: "graph-builder"
-      version: "1.8.0"
+      version: "1.10.0"
     - package: "magnetar:model-component-graph"
       interface: "model-config"
-      version: "1.8.0"
+      version: "1.10.0"
   exports: []
 capabilities:
   requires: []

@@ -42,7 +42,7 @@ pub struct ModelConfigCapability {
 /// when the bound configuration declares one, a Component must have read
 /// it before its graph is accepted. Activation must always be read, so a
 /// Component can distinguish an unknown activation from a supported one.
-const FEATURE_FUNCTIONS: [&str; 8] = [
+const FEATURE_FUNCTIONS: [&str; 9] = [
     "layer-layout",
     "options",
     "multi-head-latent-attention",
@@ -51,6 +51,7 @@ const FEATURE_FUNCTIONS: [&str; 8] = [
     "hidden-activation",
     "rope-layers",
     "expert-normalization",
+    "latent-norm-epsilon",
 ];
 
 impl ModelConfigCapability {
@@ -105,6 +106,9 @@ impl ModelConfigCapability {
                     "expert-normalization" => config
                         .expert_routing
                         .is_some_and(|routing| routing.normalization.is_some()),
+                    "latent-norm-epsilon" => config
+                        .latent_attention
+                        .is_some_and(|mla| mla.norm_eps.is_some()),
                     "rope-layers" => config.rope_layers.is_some(),
                     // Even an absent activation is meaningful: a fixed-activation
                     // decoder must see and reject it instead of guessing.
@@ -438,6 +442,7 @@ impl HostCapability for ModelConfigCapability {
             | "mixture-of-experts-layers"
             | "expert-routing"
             | "expert-normalization"
+            | "latent-norm-epsilon"
             | "rope-layers"
             | "hidden-activation" => {
                 if !arguments.is_empty() {
@@ -483,6 +488,12 @@ impl HostCapability for ModelConfigCapability {
                                     .into(),
                                 ))
                             }),
+                    ),
+                    "latent-norm-epsilon" => ComponentValue::Option(
+                        config
+                            .latent_attention
+                            .and_then(|mla| mla.norm_eps)
+                            .map(|value| Box::new(ComponentValue::F64(value))),
                     ),
                     "hidden-activation" => ComponentValue::Option(
                         config

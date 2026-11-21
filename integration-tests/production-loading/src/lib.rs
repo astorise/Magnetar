@@ -37,6 +37,8 @@ mod tests_gguf_loading_e2e;
 #[cfg(test)]
 mod tests_gguf_real_checkpoint_smoke;
 #[cfg(test)]
+mod tests_glm_logits;
+#[cfg(test)]
 mod tests_mistral_logits;
 #[cfg(test)]
 mod tests_olmo3_logits;

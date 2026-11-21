@@ -92,6 +92,36 @@ fn expert_normalization_distinguishes_top_one_and_must_be_read() {
 }
 
 #[test]
+fn latent_norm_epsilon_must_be_read_when_declared() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.latent_attention = Some(LatentAttentionConfig {
+        q_lora_rank: Some(16),
+        kv_lora_rank: 16,
+        qk_nope_head_dim: 4,
+        qk_rope_head_dim: 4,
+        v_head_dim: 8,
+        norm_eps: Some(1e-6),
+    });
+    capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
+    capability
+        .call("a", "multi-head-latent-attention", &[])
+        .unwrap();
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec!["latent-norm-epsilon"]
+    );
+    assert_eq!(
+        capability.call("a", "latent-norm-epsilon", &[]).unwrap(),
+        vec![ComponentValue::Option(Some(Box::new(ComponentValue::F64(
+            1e-6
+        ))))]
+    );
+    assert!(capability.unread_declared_features("a").is_empty());
+}
+
+#[test]
 fn unbound_instance_is_rejected() {
     let capability = ModelConfigCapability::new();
     let error = capability
@@ -472,6 +502,7 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
         qk_nope_head_dim: 48,
         qk_rope_head_dim: 16,
         v_head_dim: 48,
+        norm_eps: None,
     });
     capability.bind_config("a", config.clone());
     capability.call("a", "hidden-activation", &[]).unwrap();
