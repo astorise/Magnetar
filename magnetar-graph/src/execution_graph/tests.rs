@@ -112,6 +112,17 @@ fn recurrent_edges_require_matched_fixed_state_and_fail_closed_in_planning() {
         invalid.validate(&catalog),
         Err(GraphError::LifecycleInvalid(_))
     ));
+    let mut invalid = graph.clone();
+    invalid
+        .edges
+        .get_mut(&output_id)
+        .unwrap()
+        .descriptor
+        .aliasing_intent = Some(crate::TensorAliasingKind::InputOutputAlias);
+    assert!(matches!(
+        invalid.validate(&catalog),
+        Err(GraphError::LifecycleInvalid(_))
+    ));
     let mut invalid = graph;
     invalid.edges.get_mut(&input_id).unwrap().kv_cache = Some(GraphKvCacheMetadata {
         cache_id: "kv".into(),

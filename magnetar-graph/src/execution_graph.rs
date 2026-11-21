@@ -650,6 +650,10 @@ fn validate_recurrent_edges<'a>(
             || edge.descriptor.view.is_some()
             || edge
                 .descriptor
+                .aliasing_intent
+                .is_some_and(|alias| alias != crate::TensorAliasingKind::NoAlias)
+            || edge
+                .descriptor
                 .storage_dtype
                 .as_ref()
                 .is_some_and(|dtype| *dtype != DTypeDescriptor::portable(ComputeDType::Float32))
