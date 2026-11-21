@@ -242,8 +242,8 @@ not Runtime-managed session state; graph-level recurrent execution stays
 disabled until the transactional lifecycle is implemented and tested.
 
 The Nemotron component also derives an invocation plan for the pinned Nano
-mixer geometry. Layer-0 checkpoint tensor names, shapes and dtypes were checked
-against the first real Safetensors shard header, including BF16 matrices and
+mixer geometry. Checkpoint tensor names, shapes and dtypes for all 23 Mamba
+layers were checked against 12 real Safetensors shard headers, including BF16 matrices and
 F32 A-log/D vectors. The source configuration's `time_step_min` and
 `time_step_max` initialize parameters; its default inference limit is zero to
 unbounded. This is a shape and conversion plan for the f32 operator, not
