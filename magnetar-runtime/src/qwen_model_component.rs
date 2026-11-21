@@ -372,6 +372,8 @@ pub struct FirstNativeModelConfig {
     pub rope: FirstNativeRopeConfig,
     /// The checkpoint's declared or format-defined MLP activation.
     pub hidden_activation: Option<String>,
+    /// Explicit per-layer Q/K rotary selection, when the artifact declares it.
+    pub rope_layers: Option<Vec<bool>>,
     pub rmsnorm_epsilon: f32,
     pub tied_embeddings: bool,
     /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term -- see
@@ -414,6 +416,7 @@ impl FirstNativeModelConfig {
             architecture,
             rope,
             hidden_activation: None,
+            rope_layers: None,
             rmsnorm_epsilon: 1e-6,
             tied_embeddings: false,
             attention_bias: false,
@@ -543,6 +546,14 @@ impl FirstNativeModelConfig {
         // and wrongly rejected every other real family for callers whose
         // `identity` does not (the generic production path's own identity).
         self.architecture.validate(identity)?;
+        if let Some(layers) = &self.rope_layers
+            && layers.len() != self.architecture.layer_count as usize
+        {
+            return Err(QwenComponentError::ConfigInvalid {
+                field: "rope_layers",
+                reason: "the per-layer RoPE selection must match the layer count".into(),
+            });
+        }
         if self.architecture.model_type != ModelComponentModelType::CausalLanguageModel {
             return Err(QwenComponentError::ConfigInvalid {
                 field: "model_type",

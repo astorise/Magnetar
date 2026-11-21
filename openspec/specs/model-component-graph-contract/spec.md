@@ -333,3 +333,18 @@ does not prove an older Component's activation semantics.
 - **WHEN** `hidden-activation` is absent or names a different activation
 - **THEN** graph production fails before inference
 
+### Requirement: Components Receive Per-Layer Rotary Selection
+
+`model-component-graph` version `1.9.0` SHALL expose an optional per-layer
+RoPE selection through `model-config`. A present list SHALL contain one value
+per decoder layer: true rotates Q/K and false keeps them position-independent.
+An older Component that does not read a declared list SHALL be refused.
+Segments SHALL use the original layer indices, and a NoPE layer SHALL cache
+the unrotated key for both prefill and cached decode.
+
+#### Scenario: A declared NoPE layer reaches an older Component
+
+- **GIVEN** a model configuration with a per-layer RoPE selection
+- **WHEN** graph production uses a Component that never reads that selection
+- **THEN** the Runtime refuses the graph rather than assuming all layers rotate
+

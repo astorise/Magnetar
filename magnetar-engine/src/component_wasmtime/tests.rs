@@ -426,6 +426,7 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             rope_theta: 10_000.0,
             rope_scaling_factor: None,
             rope_frequency_scaling: None,
+            rope_layers: None,
             hidden_activation: None,
             tie_word_embeddings: true,
             attention_bias: false,

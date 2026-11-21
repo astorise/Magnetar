@@ -18,6 +18,7 @@ fn sample_config() -> ModelArchitectureConfig {
         rope_theta: 1_000_000.0,
         rope_scaling_factor: None,
         rope_frequency_scaling: None,
+        rope_layers: None,
         hidden_activation: None,
         tie_word_embeddings: true,
         attention_bias: true,
@@ -31,6 +32,28 @@ fn sample_config() -> ModelArchitectureConfig {
         bos_token_id: None,
         eos_token_id: Some(151643),
     }
+}
+
+#[test]
+fn per_layer_rope_is_exposed_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.rope_layers = Some((0..24).map(|layer| layer % 4 != 3).collect());
+    capability.bind_config("a", config);
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec!["rope-layers"]
+    );
+    let result = capability.call("a", "rope-layers", &[]).unwrap();
+    let [ComponentValue::Option(Some(value))] = result.as_slice() else {
+        panic!("missing RoPE selection")
+    };
+    let ComponentValue::List(layers) = value.as_ref() else {
+        panic!("wrong RoPE selection type")
+    };
+    assert_eq!(layers.len(), 24);
+    assert_eq!(layers[3], ComponentValue::Bool(false));
+    assert!(capability.unread_declared_features("a").is_empty());
 }
 
 #[test]

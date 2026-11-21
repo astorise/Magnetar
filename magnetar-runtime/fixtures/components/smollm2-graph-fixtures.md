@@ -1,8 +1,8 @@
 # SmolLM2 test components
 
 `smollm2-graph.component.wasm` is built from the pinned `components/smollm`
-submodule with Rust 1.100.0 and `wasm-tools`. It reads the activation from
-`model-config@1.8.0` and rejects unknown or unsupported activations. The
+submodule with Rust 1.100.0 and `wasm-tools`. It reads activation and per-layer
+RoPE selection from `model-config@1.9.0` and rejects unknown or unsupported activations. The
 adjacent manifest pins its SHA-256. This is a test fixture, not a production
 release.
 

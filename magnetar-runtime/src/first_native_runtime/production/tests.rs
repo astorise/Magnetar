@@ -132,6 +132,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
             frequency_scaling: None,
         },
         hidden_activation: None,
+        rope_layers: None,
         rmsnorm_epsilon: 1e-6,
         tied_embeddings: false,
         attention_bias: false,

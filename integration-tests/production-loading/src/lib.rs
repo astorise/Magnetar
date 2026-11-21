@@ -53,4 +53,6 @@ mod tests_real_checkpoint_smoke;
 #[cfg(test)]
 mod tests_smollm2_logits;
 #[cfg(test)]
+mod tests_smollm3_logits;
+#[cfg(test)]
 mod tests_turboquant_kv_gains;

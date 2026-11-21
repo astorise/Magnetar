@@ -415,16 +415,16 @@ jobs:
           cargo build --locked --release --manifest-path components/smollm/Cargo.toml --target wasm32-unknown-unknown
           wasm-tools component new components/smollm/target/wasm32-unknown-unknown/release/magnetar_component_smollm.wasm -o "$RUNNER_TEMP/smollm2.component.wasm"
           wasm-tools validate "$RUNNER_TEMP/smollm2.component.wasm" --features component-model
-      - name: Run the freshly built SmolLM2 component in the Magnetar engine
+      - name: Run the freshly built SmolLM component in the Magnetar engine
         env:
           MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
-        run: cargo test --locked -p magnetar-engine --features wasmtime-component-engine smollm2_
+        run: cargo test --locked -p magnetar-engine --features wasmtime-component-engine smollm
       - name: Checkout SmolLM2 numerical test dependencies
         run: git submodule update --init -- providers/cpu providers/cuda loaders/huggingface loaders/gguf formats/gguf formats/safetensors
-      - name: Compare SmolLM2 prefill and decode with Transformers
+      - name: Compare SmolLM2 and SmolLM3 prefill and decode with Transformers
         env:
           MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
-        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading smollm2_tiny_prefill_and_cached_decode_match_transformers
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_smollm
       - name: Build the Mistral graph component
         shell: bash
         run: |

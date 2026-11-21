@@ -726,6 +726,10 @@ pub struct ModelArchitectureConfig {
     /// Component through `model-config`'s `rope-scaling` (`1.4.0`). The
     /// Component, not the Runtime, turns it into `rope` node attributes.
     pub rope_frequency_scaling: Option<RopeFrequencyScaling>,
+    /// Per-layer RoPE selection. `true` rotates Q/K and `false` leaves
+    /// them position-independent; `None` leaves the choice to the model
+    /// component's documented baseline. Exposed by model-config 1.9.0.
+    pub rope_layers: Option<Vec<bool>>,
     /// Checkpoint-declared MLP activation, normalized by ingestion. `None`
     /// means unknown, not an implicit SiLU choice. Exposed by model-config
     /// 1.8.0 so Components can reject unsupported activations.
@@ -906,6 +910,17 @@ impl ModelArchitectureConfig {
     /// must not overflow `u64`. Qwen-specific semantics are validated
     /// separately by the Qwen Component itself.
     pub fn validate(&self) -> Result<(), ModelArtifactError> {
+        if let Some(layers) = &self.rope_layers
+            && layers.len() != self.num_hidden_layers as usize
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!(
+                    "RoPE layer selection has {} entries for {} layers",
+                    layers.len(),
+                    self.num_hidden_layers
+                ),
+            });
+        }
         if let Some(activation) = self.hidden_activation.as_deref()
             && !matches!(activation, "silu" | "gelu" | "gelu_pytorch_tanh" | "relu")
         {

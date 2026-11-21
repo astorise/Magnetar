@@ -40,13 +40,14 @@ pub struct ModelConfigCapability {
 /// The functions whose feature a graph does not otherwise show:
 /// when the bound configuration declares one, a Component must have read
 /// it before its graph is accepted.
-const FEATURE_FUNCTIONS: [&str; 6] = [
+const FEATURE_FUNCTIONS: [&str; 7] = [
     "layer-layout",
     "options",
     "multi-head-latent-attention",
     "mixture-of-experts-layers",
     "expert-routing",
     "hidden-activation",
+    "rope-layers",
 ];
 
 impl ModelConfigCapability {
@@ -97,6 +98,7 @@ impl ModelConfigCapability {
                     "multi-head-latent-attention" => config.latent_attention.is_some(),
                     "mixture-of-experts-layers" => config.moe_layers.is_some(),
                     "expert-routing" => config.expert_routing.is_some(),
+                    "rope-layers" => config.rope_layers.is_some(),
                     // Preserve compatibility with older fixed-SiLU decoders.
                     // This cannot prove that an older Component actually uses
                     // SiLU; other declared activations must be read explicitly.
@@ -431,6 +433,7 @@ impl HostCapability for ModelConfigCapability {
             | "multi-head-latent-attention"
             | "mixture-of-experts-layers"
             | "expert-routing"
+            | "rope-layers"
             | "hidden-activation" => {
                 if !arguments.is_empty() {
                     return Err(rejected(
@@ -459,6 +462,7 @@ impl HostCapability for ModelConfigCapability {
                         encode_latent_attention(config.latent_attention.as_ref())
                     }
                     "mixture-of-experts-layers" => encode_moe_layers(config.moe_layers.as_deref()),
+                    "rope-layers" => encode_moe_layers(config.rope_layers.as_deref()),
                     "expert-routing" => encode_expert_routing(config.expert_routing.as_ref()),
                     "hidden-activation" => ComponentValue::Option(
                         config

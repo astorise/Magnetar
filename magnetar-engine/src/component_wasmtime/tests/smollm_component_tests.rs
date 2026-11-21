@@ -7,15 +7,18 @@ use super::*;
 
 const SMOLLM2_COMPONENT: &[u8] =
     include_bytes!("../../../../magnetar-runtime/fixtures/components/smollm2-graph.component.wasm");
+static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn smollm2_graph(
     export: &str,
-    argument: i64,
+    arguments: Vec<ComponentValue>,
     activation: Option<&str>,
+    rope_layers: Option<Vec<bool>>,
 ) -> Result<crate::ExecutionGraph, String> {
     let directory = std::env::temp_dir().join(format!(
-        "magnetar-smollm2-graph-{}-{export}-{}",
+        "magnetar-smollm2-graph-{}-{export}-{}-{}",
         std::process::id(),
         activation.unwrap_or("missing"),
+        NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let artifact = directory.join("smollm2.component.wasm");
@@ -28,11 +31,11 @@ fn smollm2_graph(
     let graph_builder = Arc::new(crate::GraphBuilderCapability::new());
     let model_config = Arc::new(crate::ModelConfigCapability::new());
     let mut engine = WasmtimeComponentEngine::new().unwrap();
-    let gb = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.8.0");
-    let mc = WitInterface::new("magnetar:model-component-graph/model-config", "1.8.0");
+    let gb = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.9.0");
+    let mc = WitInterface::new("magnetar:model-component-graph/model-config", "1.9.0");
     let exports = WitInterface::new(
         "magnetar:model-component-graph/model-component-graph-producer",
-        "1.8.0",
+        "1.9.0",
     );
     engine.register_capability(gb.clone(), graph_builder.clone() as Arc<dyn HostCapability>);
     engine.register_capability(mc.clone(), model_config.clone() as Arc<dyn HostCapability>);
@@ -101,6 +104,7 @@ fn smollm2_graph(
             rms_norm_eps: 1e-5,
             rope_theta: 100_000.0,
             hidden_activation: activation.map(str::to_string),
+            rope_layers,
             tie_word_embeddings: true,
             attention_bias: false,
             ..Default::default()
@@ -109,7 +113,7 @@ fn smollm2_graph(
     let result = engine.invoke(
         &instance,
         &ComponentInvocation::new(crate::ComponentInstanceId::new(301), exports, export)
-            .with_arguments(vec![ComponentValue::S64(argument)]),
+            .with_arguments(arguments),
     );
     let graph = match result {
         Ok(result) => {
@@ -137,7 +141,13 @@ fn smollm2_published_shapes_produce_prefill_and_cached_decode_graphs() {
         ),
         ("build-decode-graph", 4, crate::ExecutionGraphPhase::Decode),
     ] {
-        let graph = smollm2_graph(export, argument, Some("silu")).unwrap();
+        let graph = smollm2_graph(
+            export,
+            vec![ComponentValue::S64(argument)],
+            Some("silu"),
+            None,
+        )
+        .unwrap();
         assert_eq!(graph.phase, phase);
         assert_eq!(graph.nodes.len(), 483);
         assert!(
@@ -161,9 +171,71 @@ fn smollm2_component_refuses_unverified_or_unsupported_activation() {
     for export in ["build-prefill-graph", "build-decode-graph"] {
         for activation in [None, Some("gelu")] {
             assert!(
-                smollm2_graph(export, 4, activation).is_err(),
+                smollm2_graph(export, vec![ComponentValue::S64(4)], activation, None).is_err(),
                 "{export}: {activation:?}"
             );
         }
     }
+}
+
+#[test]
+fn smollm3_mixed_rope_and_nope_keep_key_cache_across_segments() {
+    let mask = (0..30).map(|layer| layer % 4 != 3).collect::<Vec<_>>();
+    for (export, arguments, append) in [
+        ("build-prefill-graph", vec![ComponentValue::S64(4)], false),
+        ("build-decode-graph", vec![ComponentValue::S64(4)], true),
+        (
+            "build-prefill-graph-segment",
+            vec![
+                ComponentValue::S64(4),
+                ComponentValue::U32(2),
+                ComponentValue::U32(5),
+            ],
+            false,
+        ),
+        (
+            "build-decode-graph-segment",
+            vec![
+                ComponentValue::S64(4),
+                ComponentValue::U32(2),
+                ComponentValue::U32(5),
+            ],
+            true,
+        ),
+    ] {
+        let graph = smollm2_graph(export, arguments, Some("silu"), Some(mask.clone())).unwrap();
+        assert!(
+            graph
+                .nodes
+                .contains_key(&crate::ExecutionNodeId::new("layer2.rope_q"))
+        );
+        assert!(
+            !graph
+                .nodes
+                .contains_key(&crate::ExecutionNodeId::new("layer3.rope_q"))
+        );
+        assert!(
+            !graph
+                .nodes
+                .contains_key(&crate::ExecutionNodeId::new("layer3.rope_k"))
+        );
+        let key = &graph.edges[&crate::TensorEdgeId::new("edge.layer3.k_proj")];
+        assert_eq!(
+            key.kv_cache.as_ref().unwrap().behavior,
+            if append {
+                crate::GraphKvCacheBehavior::Append
+            } else {
+                crate::GraphKvCacheBehavior::Output
+            }
+        );
+    }
+    assert!(
+        smollm2_graph(
+            "build-prefill-graph",
+            vec![ComponentValue::S64(4)],
+            Some("silu"),
+            Some(vec![true])
+        )
+        .is_err()
+    );
 }

@@ -68,6 +68,12 @@ fn mistral_component_reads_activation_and_per_layer_windows() {
             .filter(|node| node.operator.name() == "attention")
             .all(|node| !node.attributes.contains_key("window_size"))
     );
+    config.rope_layers = Some(vec![false; config.num_hidden_layers as usize]);
+    assert!(
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .is_err(),
+        "a pre-1.9 component must not ignore the declared per-layer positional encoding"
+    );
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

@@ -296,7 +296,7 @@ pub fn register_inference_component_artifact(
     // `1.7.0` (`express-latent-attention-forms`) adds latent attention,
     // mixed expert layers, expert routing and the YaRN RoPE case.
     for version in [
-        "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0",
+        "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0",
     ] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
