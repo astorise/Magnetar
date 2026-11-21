@@ -1595,6 +1595,53 @@ pub(super) fn dispatch_mamba3_mimo(
 ) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     let descriptors =
         [2, 8, 9, 10, 11].map(|index| f32_tensor_descriptor_from_shape(inputs[index].shape()));
+    dispatch_mamba3_multi(
+        ctx,
+        operation_id,
+        "mamba3-mimo",
+        inputs,
+        targets,
+        attributes,
+        descriptors,
+    )
+}
+
+/// Dispatch the projected mixer, whose first output flattens heads and channels.
+pub(super) fn dispatch_mamba3_mixer(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    inputs: Vec<NodeValue>,
+    targets: [OutputTarget; 5],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+    output_shape: [u64; 2],
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
+    let descriptors = [
+        f32_tensor_descriptor_from_shape(&output_shape),
+        f32_tensor_descriptor_from_shape(inputs[1].shape()),
+        f32_tensor_descriptor_from_shape(inputs[2].shape()),
+        f32_tensor_descriptor_from_shape(inputs[3].shape()),
+        f32_tensor_descriptor_from_shape(inputs[4].shape()),
+    ];
+    dispatch_mamba3_multi(
+        ctx,
+        operation_id,
+        "mamba3-mixer",
+        inputs,
+        targets,
+        attributes,
+        descriptors,
+    )
+}
+
+fn dispatch_mamba3_multi(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    operator: &str,
+    inputs: Vec<NodeValue>,
+    targets: [OutputTarget; 5],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+    descriptors: [TensorDescriptor; 5],
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     let resources: Vec<_> = inputs
         .into_iter()
         .enumerate()
@@ -1635,7 +1682,7 @@ pub(super) fn dispatch_mamba3_mimo(
     let result = dispatch_reference_cpu_operator_multi(
         ctx,
         operation_id,
-        dispatch_operator_id("mamba3-mimo", OperatorFamily::LinearAlgebra),
+        dispatch_operator_id(operator, OperatorFamily::LinearAlgebra),
         resources,
         outputs,
         attributes,

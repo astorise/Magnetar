@@ -136,6 +136,18 @@ outputs may not alias, every tensor must be finite, and unsupported dtypes,
 geometries or missing Kernel forms fail closed. This pure operator does not
 itself allocate, reset, commit or isolate a session's recurrent state.
 
+For the pinned single-group, biasless-projection Mamba-3 profile, the
+additive `mamba3-mixer@1` composes the learned input projections and Q/K
+RMS normalizations with that recurrence. It receives hidden states, four
+prior states, two input matrices, dt bias, two normalization weights, Q/K
+biases, three MIMO projections and the skip weight. It returns the flattened
+`[T,H*P]` activation and four next states. It requires `H*P = 2*hidden`,
+the upstream rotary fraction, positive epsilon and decay floor, and an
+explicit zero-centered normalization flag. More general grouping, optional
+projection forms, post-gate normalization or auxiliary linear branches are
+not assumed. As with `mamba3-mimo`, explicit state tensors do not establish
+Runtime-managed session state.
+
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
 `recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.

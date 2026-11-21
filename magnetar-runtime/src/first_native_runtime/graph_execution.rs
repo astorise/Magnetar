@@ -652,6 +652,71 @@ pub(super) fn dispatch_first_native_graph_node(
             let targets = [output_target, target(1), target(2), target(3), target(4)];
             dispatch_mamba3_mimo(ctx, node_id, inputs, targets, node.attributes.clone())
         }
+        "mamba3-mixer" => {
+            if inputs.len() != 16 || node.outputs.len() != 5 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 16 inputs and 5 outputs"),
+                });
+            }
+            let config = crate::operator_semantics::mamba3_mixer_from_attributes(&node.attributes)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let [tokens, hidden] = inputs[0].shape() else {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects rank-two hidden states"),
+                });
+            };
+            let width = config
+                .geometry
+                .heads
+                .checked_mul(config.geometry.head_dim)
+                .and_then(|width| u64::try_from(width).ok())
+                .filter(|&width| hidden.checked_mul(2) == Some(width) && *tokens > 0 && *hidden > 0)
+                .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has invalid hidden geometry"),
+                })?;
+            let output_shape = [*tokens, width];
+            if let Some(graph) = ctx.graph.as_ref() {
+                let expected: [&[u64]; 5] = [
+                    &output_shape,
+                    inputs[1].shape(),
+                    inputs[2].shape(),
+                    inputs[3].shape(),
+                    inputs[4].shape(),
+                ];
+                for (edge_id, shape) in node.outputs.iter().zip(expected) {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != shape {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' has an output with the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let target = |index: usize| -> OutputTarget {
+                (
+                    ctx.edge_resource(node.outputs[index].as_str()),
+                    resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                    ctx.output_owner(kv_cache_id),
+                )
+            };
+            let targets = [output_target, target(1), target(2), target(3), target(4)];
+            dispatch_mamba3_mixer(
+                ctx,
+                node_id,
+                inputs,
+                targets,
+                node.attributes.clone(),
+                output_shape,
+            )
+        }
         "affine-layernorm" => {
             if !(2..=3).contains(&inputs.len()) {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1584,6 +1649,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "moe-experts"
                 | "mamba2-mixer"
                 | "mamba3-mimo"
+                | "mamba3-mixer"
                 | "affine-layernorm"
                 | "slice-last"
                 | "row-scale"
@@ -1662,7 +1728,12 @@ pub(super) fn execute_first_native_graph_nodes(
         // cannot overwrite a live graph input, intermediate or model weight.
         if matches!(
             node.operator.name(),
-            "mamba2-mixer" | "mamba3-mimo" | "affine-layernorm" | "gelu-exact" | "slice-last"
+            "mamba2-mixer"
+                | "mamba3-mimo"
+                | "mamba3-mixer"
+                | "affine-layernorm"
+                | "gelu-exact"
+                | "slice-last"
         ) {
             for edge_id in &node.outputs {
                 let output_id = dispatch_ctx.edge_resource(edge_id.as_str());
@@ -2436,6 +2507,8 @@ pub(super) fn materialize_first_native_graph_bindings(
 mod encoder_ops_tests;
 #[cfg(test)]
 mod mamba2_tests;
+#[cfg(test)]
+mod mamba3_mixer_tests;
 #[cfg(test)]
 mod mamba3_tests;
 #[cfg(test)]

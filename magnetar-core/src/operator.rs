@@ -1369,6 +1369,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             5,
             ShapeRule::Any,
         ),
+        // Input projection, normalization and the explicit Mamba-3 states.
+        (
+            "mamba3-mixer",
+            OperatorFamily::LinearAlgebra,
+            16,
+            5,
+            ShapeRule::Any,
+        ),
         // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
         ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1577,7 +1585,10 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         if name == "encoder-attention" {
             spec.memory = OperatorMemoryBehavior::pure().with_workspace();
         }
-        if matches!(name, "encoder-attention" | "mamba2-mixer" | "mamba3-mimo") {
+        if matches!(
+            name,
+            "encoder-attention" | "mamba2-mixer" | "mamba3-mimo" | "mamba3-mixer"
+        ) {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
                 OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
@@ -1654,6 +1665,19 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "angles",
                 OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            ),
+        "mamba3-mixer" => default_attribute_schema("mamba3-mimo")
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "decay_floor",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "zero_centered_norm",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
             ),
         "mamba2-mixer" => OperatorAttributeSchema::default()
             .with_rule(
