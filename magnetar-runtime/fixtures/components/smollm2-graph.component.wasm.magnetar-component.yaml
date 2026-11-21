@@ -1,0 +1,45 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:7e549701a6815e5770a083951eb984c5af7d8f140bbc366e36d9530247f4621f"
+component:
+  name: "magnetar.smollm2.graph"
+  version: "0.1.0"
+  description: "SmolLM2 Llama-compatible graph test component"
+  role: "llama-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.2"
+compatibility:
+  architecture_families:
+    - llama
+  artifact_formats:
+    - huggingface
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.4.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.4.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/smollm2-graph.component.wasm"
+signatures: []

@@ -31,9 +31,9 @@
 [submodule "providers/wgpu"]
 	path = providers/wgpu
 	url = https://github.com/astorise/Magnetar-provider-WGPU.git
-[submodule "providers/npu"]
-	path = providers/npu
-	url = https://github.com/astorise/Magnetar-provider-NPU.git
+[submodule "providers/openvino"]
+	path = providers/openvino
+	url = https://github.com/astorise/Magnetar-provider-OpenVINO.git
 [submodule "providers/tpu"]
 	path = providers/tpu
 	url = https://github.com/astorise/Magnetar-provider-TPU.git
@@ -55,3 +55,24 @@
 [submodule "providers/qnn"]
 	path = providers/qnn
 	url = https://github.com/astorise/Magnetar-provider-qnn.git
+[submodule "components/glm"]
+	path = components/glm
+	url = https://github.com/astorise/Magnetar-component-GLM.git
+[submodule "components/olala"]
+	path = components/olala
+	url = https://github.com/astorise/Magnetar-component-Olala.git
+[submodule "components/kev"]
+	path = components/kev
+	url = https://github.com/astorise/Magnetar-component-Kev.git
+[submodule "components/laya"]
+	path = components/laya
+	url = https://github.com/astorise/Magnetar-component-Laya.git
+[submodule "components/modernbert"]
+	path = components/modernbert
+	url = https://github.com/astorise/Magnetar-component-ModernBERT.git
+[submodule "components/smollm"]
+	path = components/smollm
+	url = https://github.com/astorise/Magnetar-component-SmolLM.git
+[submodule "components/olmo"]
+	path = components/olmo
+	url = https://github.com/astorise/Magnetar-component-OLMo.git

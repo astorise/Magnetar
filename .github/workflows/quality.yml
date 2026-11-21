@@ -365,11 +365,10 @@ jobs:
           done < <(find magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-provider-api/src magnetar-engine/src magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
           exit "$fail"
 
-  # Component integration (task 15.6): Component submodules only, sparse
-  # checkout. Split out from the single consolidated `submodule-integration`
-  # job below now that `components/qwen` is real (task group 11);
-  # `components/nemotron`, `gemma`, `kimi`, `mistral` and `deepseek` are
-  # templates and pass trivially until they have real content of their own.
+  # Component integration (task 15.6): independently exercise each
+  # Component, then build and run the SmolLM2 test Component through the
+  # engine and production loader. Per-crate tests distinguish graph or
+  # reference implementations from qualified model inference.
   component-integration:
     name: quality / component integration
     runs-on: ubuntu-latest
@@ -377,7 +376,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout Component submodules
-        run: git submodule update --init -- components/qwen components/llama components/nemotron components/gemma components/kimi components/mistral components/deepseek
+        run: git submodule update --init -- components/qwen components/llama components/nemotron components/gemma components/kimi components/mistral components/deepseek components/glm components/olala components/kev components/laya components/modernbert components/smollm components/olmo
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -393,12 +392,42 @@ jobs:
             components/gemma/Cargo.toml \
             components/kimi/Cargo.toml \
             components/mistral/Cargo.toml \
-            components/deepseek/Cargo.toml
+            components/deepseek/Cargo.toml \
+            components/glm/Cargo.toml \
+            components/olala/Cargo.toml \
+            components/kev/Cargo.toml \
+            components/laya/Cargo.toml \
+            components/modernbert/Cargo.toml \
+            components/smollm/Cargo.toml \
+            components/olmo/Cargo.toml
           do
             echo "::group::$manifest"
             cargo test --locked --manifest-path "$manifest"
             echo "::endgroup::"
           done
+      - name: Install wasm-tools
+        uses: taiki-e/install-action@d270f69d9016a914699316c97c419c84d5e96475 # wasm-tools
+      - name: Build the SmolLM2 graph component
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          cargo build --locked --release --manifest-path components/smollm/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/smollm/target/wasm32-unknown-unknown/release/magnetar_component_smollm.wasm -o "$RUNNER_TEMP/smollm2-blocked.component.wasm"
+          cargo build --locked --release --manifest-path components/smollm/Cargo.toml --target wasm32-unknown-unknown --features test-only-assume-silu
+          wasm-tools component new components/smollm/target/wasm32-unknown-unknown/release/magnetar_component_smollm.wasm -o "$RUNNER_TEMP/smollm2.component.wasm"
+          wasm-tools validate "$RUNNER_TEMP/smollm2.component.wasm" --features component-model
+      - name: Run the freshly built SmolLM2 component in the Magnetar engine
+        env:
+          MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
+          MAGNETAR_SMOLLM2_BLOCKED_COMPONENT: ${{ runner.temp }}/smollm2-blocked.component.wasm
+        run: cargo test --locked -p magnetar-engine --features wasmtime-component-engine smollm2_
+      - name: Checkout SmolLM2 numerical test dependencies
+        run: git submodule update --init -- providers/cpu providers/cuda loaders/huggingface loaders/gguf formats/gguf formats/safetensors
+      - name: Compare SmolLM2 prefill and decode with Transformers
+        env:
+          MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading smollm2_tiny_prefill_and_cached_decode_match_transformers
 
   # Format integration (task 15.7): Format submodules only, sparse checkout.
   # `cargo test` already runs each crate's malformed-input corpus regression
@@ -457,7 +486,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout Provider submodules
-        run: git submodule update --init -- providers/cpu providers/cuda providers/rocm providers/metal providers/wgpu providers/npu providers/tpu providers/qnn
+        run: git submodule update --init -- providers/cpu providers/cuda providers/rocm providers/metal providers/wgpu providers/openvino providers/tpu providers/qnn
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -470,8 +499,8 @@ jobs:
         run: cargo test --locked --manifest-path providers/rocm/Cargo.toml
       - name: "Build and test the Metal Provider (unconditionally unavailable on every non-macOS platform)"
         run: cargo test --locked --manifest-path providers/metal/Cargo.toml
-      - name: "Build and test the NPU Provider (no Level Zero NPU driver here: exercises its graceful-unavailability path)"
-        run: cargo test --locked --manifest-path providers/npu/Cargo.toml
+      - name: "Build and test the OpenVINO repository's NPU Provider (no Level Zero NPU driver here: exercises its graceful-unavailability path)"
+        run: cargo test --locked --manifest-path providers/openvino/Cargo.toml
       - name: "Build and test the TPU Provider (no Coral Edge TPU attached here: exercises its graceful-unavailability path)"
         run: cargo test --locked --manifest-path providers/tpu/Cargo.toml
       - name: "Build and test the QNN (Qualcomm) Provider (no QNN SDK here: exercises its graceful-unavailability path)"
@@ -498,7 +527,7 @@ jobs:
       # `providers/rocm`'s `libloading` and `providers/wgpu`'s `wgpu`/
       # `pollster` are the identical class of new, dynamic-library-adjacent
       # dependency, each with their own `deny.toml` for the same reason.
-      # `providers/npu` and `providers/tpu` both use the same `libloading`
+      # `providers/openvino` and `providers/tpu` both use the same `libloading`
       # dependency as `providers/rocm`.
       - name: Check the CUDA Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/cuda/Cargo.toml check
@@ -506,8 +535,8 @@ jobs:
         run: cargo deny --manifest-path providers/rocm/Cargo.toml check
       - name: Check the WGPU Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/wgpu/Cargo.toml check
-      - name: Check the NPU Provider's own dependency graph (advisories, bans, licenses, sources)
-        run: cargo deny --manifest-path providers/npu/Cargo.toml check
+      - name: Check the OpenVINO repository's NPU Provider dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path providers/openvino/Cargo.toml check
       - name: Check the TPU Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/tpu/Cargo.toml check
       - name: Check the QNN (Qualcomm) Provider's own dependency graph (advisories, bans, licenses, sources)
@@ -544,6 +573,13 @@ jobs:
             components/kimi/Cargo.toml \
             components/mistral/Cargo.toml \
             components/deepseek/Cargo.toml \
+            components/glm/Cargo.toml \
+            components/olala/Cargo.toml \
+            components/kev/Cargo.toml \
+            components/laya/Cargo.toml \
+            components/modernbert/Cargo.toml \
+            components/smollm/Cargo.toml \
+            components/olmo/Cargo.toml \
             formats/gguf/Cargo.toml \
             formats/safetensors/Cargo.toml \
             providers/cpu/Cargo.toml \
@@ -551,7 +587,7 @@ jobs:
             providers/rocm/Cargo.toml \
             providers/metal/Cargo.toml \
             providers/wgpu/Cargo.toml \
-            providers/npu/Cargo.toml \
+            providers/openvino/Cargo.toml \
             providers/tpu/Cargo.toml \
             providers/qnn/Cargo.toml \
             loaders/huggingface/Cargo.toml \
