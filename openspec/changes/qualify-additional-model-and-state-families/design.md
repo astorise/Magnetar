@@ -114,6 +114,15 @@ separately, tiny Kimi top-1/top-2 checkpoints exercise the same routing mode
 end to end through Hugging Face loading, a Component and both CPU Providers.
 Neither test qualifies Olala's full hybrid model or a GPU Provider.
 
+An Olala-side f32 reference covers the preprocessed Mamba-3 MIMO recurrence:
+rotary angles, the SSM, the previous rotated key and previous input are four
+separate state tensors. The pure step preserves prior state on error and
+accepts explicit grouped Q/K, MIMO projections, decay, dt and trap values.
+Synthetic tests compare every output and state with the pinned upstream
+PyTorch prefill and cached-step implementations, including chunk continuation
+and zero-state reset. This reference does not implement the layer's learned
+projections, expose a graph operator, or provide Runtime-managed state.
+
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
 `recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.
