@@ -29,6 +29,8 @@ const BOUNDED_LOOP_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/bounded-loop.component.wat");
 const QWEN_GRAPH_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/qwen-graph.component.wat");
+const RECURRENT_STATE_COMPONENT: &[u8] =
+    include_bytes!("../../../magnetar-runtime/fixtures/components/recurrent-state.component.wasm");
 const CAPABILITY_ECHO_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/capability-echo.component.wat");
 /// The first real, minimal Qwen Model Component (task 11.4,
@@ -505,6 +507,104 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
         crate::GraphKvCacheBehavior::Output
     );
 
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wasmtime_engine_builds_and_validates_recurrent_state_graphs() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-recurrent-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("recurrent.component.wasm");
+    std::fs::write(&artifact, RECURRENT_STATE_COMPONENT).unwrap();
+    let capability = Arc::new(crate::GraphBuilderCapability::new());
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.11.0");
+    engine.register_capability(
+        interface.clone(),
+        capability.clone() as Arc<dyn HostCapability>,
+    );
+    let export_interface = WitInterface::new(
+        "magnetar:model-component-graph/model-component-graph-producer",
+        "1.11.0",
+    );
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(205),
+        metadata: crate::ComponentMetadata::new("recurrent", "1", "state graph probe")
+            .with_import(interface.clone())
+            .with_export(export_interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+    let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+    for (export, argument, expected_phase) in [
+        (
+            "build-prefill-graph",
+            1,
+            crate::ExecutionGraphPhase::Prefill,
+        ),
+        ("build-decode-graph", 3, crate::ExecutionGraphPhase::Decode),
+    ] {
+        capability.prepare_session(
+            instance.engine_key(),
+            crate::graph_builder_capability::SessionContext {
+                component_id: "recurrent".into(),
+                compatibility_key: "model-v1".into(),
+                kv_namespace: "probe".into(),
+                weight_shapes: BTreeMap::new(),
+                output_edge_name: "logits".into(),
+            },
+        );
+        let result = engine
+            .invoke(
+                &instance,
+                &ComponentInvocation::new(
+                    crate::ComponentInstanceId::new(205),
+                    export_interface.clone(),
+                    export,
+                )
+                .with_arguments(vec![ComponentValue::S64(argument)]),
+            )
+            .unwrap();
+        let [ComponentValue::String(handle)] = result.values.as_slice() else {
+            panic!("expected graph handle")
+        };
+        let graph = capability
+            .take_graph(instance.engine_key(), handle)
+            .unwrap();
+        assert_eq!(graph.phase, expected_phase);
+        graph.validate(&crate::default_graph_catalog()).unwrap();
+        let state: Vec<_> = graph
+            .edges
+            .values()
+            .filter_map(|edge| edge.recurrent_state.as_ref())
+            .collect();
+        assert_eq!(state.len(), 2);
+        assert!(state.iter().all(|metadata| metadata.layer == 2
+            && metadata.slot == "conv"
+            && metadata.compatibility_key == "model-v1"));
+        assert_ne!(state[0].behavior, state[1].behavior);
+        assert!(matches!(
+            crate::plan_execution_graph(
+                &graph,
+                &crate::default_graph_catalog(),
+                &crate::GraphPlanningPolicy::default(),
+                None
+            ),
+            Err(crate::GraphError::ProviderCapabilityUnavailable(_))
+        ));
+    }
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

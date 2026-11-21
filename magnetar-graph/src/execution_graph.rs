@@ -6,9 +6,9 @@
 //! any Provider dispatch.
 
 use crate::{
-    DTypeDescriptor, MemoryAllocationClass, OperatorAttributeValue, OperatorCatalog, OperatorError,
-    OperatorId, OperatorObservationKind, ResourceAffinity, TensorDescriptor, TensorLayoutKind,
-    initial_operator_catalog, layout_kind, validate_affinity_compatibility,
+    ComputeDType, DTypeDescriptor, MemoryAllocationClass, OperatorAttributeValue, OperatorCatalog,
+    OperatorError, OperatorId, OperatorObservationKind, ResourceAffinity, TensorDescriptor,
+    TensorLayoutKind, initial_operator_catalog, layout_kind, validate_affinity_compatibility,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -147,6 +147,8 @@ pub struct TensorEdge {
     pub consumers: BTreeSet<ExecutionNodeId>,
     pub kv_cache: Option<GraphKvCacheMetadata>,
     pub prefix_cache: Option<GraphPrefixCacheMetadata>,
+    /// Fixed-size state at a sequence boundary, distinct from KV history.
+    pub recurrent_state: Option<GraphRecurrentStateMetadata>,
 }
 
 impl TensorEdge {
@@ -165,6 +167,7 @@ impl TensorEdge {
             consumers: BTreeSet::new(),
             kv_cache: None,
             prefix_cache: None,
+            recurrent_state: None,
         }
     }
 
@@ -259,6 +262,23 @@ pub struct GraphKvCacheMetadata {
     pub cache_id: String,
     pub behavior: GraphKvCacheBehavior,
     pub paged: bool,
+    pub compatibility_key: String,
+}
+
+/// Whether an edge reads the prior committed state or produces its successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphRecurrentStateBehavior {
+    Input,
+    Output,
+}
+
+/// A Runtime-issued logical state identity; never a Provider handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphRecurrentStateMetadata {
+    pub resource_id: String,
+    pub layer: u32,
+    pub slot: String,
+    pub behavior: GraphRecurrentStateBehavior,
     pub compatibility_key: String,
 }
 
@@ -538,6 +558,7 @@ pub fn validate_execution_graph(
             )));
         }
     }
+    validate_recurrent_edges(graph, &derived_producers, &derived_consumers)?;
     // Reject a cycle (or a node input with no resolvable producer among
     // remaining unscheduled nodes) as part of validation itself, not only
     // when a caller happens to also plan the graph.
@@ -593,6 +614,120 @@ pub fn validate_execution_graph(
     })
 }
 
+fn validate_recurrent_edges<'a>(
+    graph: &'a ExecutionGraph,
+    producers: &BTreeMap<&TensorEdgeId, &ExecutionNodeId>,
+    consumers: &BTreeMap<&TensorEdgeId, BTreeSet<&ExecutionNodeId>>,
+) -> Result<(), GraphError> {
+    type Pair<'a> = (Option<&'a TensorEdge>, Option<&'a TensorEdge>);
+    let mut states: BTreeMap<&str, Pair<'a>> = BTreeMap::new();
+    let mut slots: BTreeMap<(u32, &str), &str> = BTreeMap::new();
+    for edge in graph
+        .edges
+        .values()
+        .filter(|edge| edge.recurrent_state.is_some())
+    {
+        let metadata = edge.recurrent_state.as_ref().expect("filtered above");
+        let slot_valid = !metadata.slot.is_empty()
+            && metadata.slot.len() <= 64
+            && metadata
+                .slot
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        let shape = &edge.descriptor.shape;
+        let shape_valid = !shape.dimensions.is_empty()
+            && shape.symbolic.is_none()
+            && !shape.dimensions.contains(&0)
+            && shape
+                .element_count()
+                .is_ok_and(|elements| elements <= 67_108_864);
+        if metadata.resource_id.is_empty()
+            || metadata.compatibility_key.is_empty()
+            || !slot_valid
+            || !shape_valid
+            || edge.descriptor.dtype != DTypeDescriptor::portable(ComputeDType::Float32)
+            || layout_kind(&edge.descriptor.layout) != TensorLayoutKind::Contiguous
+            || edge.descriptor.view.is_some()
+            || edge
+                .descriptor
+                .storage_dtype
+                .as_ref()
+                .is_some_and(|dtype| *dtype != DTypeDescriptor::portable(ComputeDType::Float32))
+            || edge
+                .descriptor
+                .compute_dtype
+                .as_ref()
+                .is_some_and(|dtype| *dtype != DTypeDescriptor::portable(ComputeDType::Float32))
+            || edge.kv_cache.is_some()
+            || edge.prefix_cache.is_some()
+            || edge.aliasing != TensorAliasing::None
+        {
+            return Err(GraphError::LifecycleInvalid(format!(
+                "invalid recurrent state edge '{}'",
+                edge.id
+            )));
+        }
+        if let Some(fingerprint) = &graph.fingerprint
+            && fingerprint != &metadata.compatibility_key
+        {
+            return Err(GraphError::LifecycleInvalid(format!(
+                "recurrent state '{}' has incompatible model identity",
+                metadata.resource_id
+            )));
+        }
+        if let Some(previous) =
+            slots.insert((metadata.layer, &metadata.slot), &metadata.resource_id)
+            && previous != metadata.resource_id
+        {
+            return Err(GraphError::LifecycleInvalid(format!(
+                "recurrent layer {} slot '{}' has multiple identities",
+                metadata.layer, metadata.slot
+            )));
+        }
+        let pair = states.entry(&metadata.resource_id).or_default();
+        match metadata.behavior {
+            GraphRecurrentStateBehavior::Input => {
+                if producers.contains_key(&edge.id)
+                    || !consumers.contains_key(&edge.id)
+                    || pair.0.replace(edge).is_some()
+                {
+                    return Err(GraphError::LifecycleInvalid(format!(
+                        "recurrent state '{}' must have one consumed input",
+                        metadata.resource_id
+                    )));
+                }
+            }
+            GraphRecurrentStateBehavior::Output => {
+                if !producers.contains_key(&edge.id) || pair.1.replace(edge).is_some() {
+                    return Err(GraphError::LifecycleInvalid(format!(
+                        "recurrent state '{}' must have one produced output",
+                        metadata.resource_id
+                    )));
+                }
+            }
+        }
+    }
+    for (identity, (input, output)) in states {
+        let (Some(input), Some(output)) = (input, output) else {
+            return Err(GraphError::LifecycleInvalid(format!(
+                "recurrent state '{identity}' requires an input and output"
+            )));
+        };
+        let in_meta = input.recurrent_state.as_ref().unwrap();
+        let out_meta = output.recurrent_state.as_ref().unwrap();
+        if input.descriptor != output.descriptor
+            || in_meta.layer != out_meta.layer
+            || in_meta.slot != out_meta.slot
+            || in_meta.compatibility_key != out_meta.compatibility_key
+        {
+            return Err(GraphError::LifecycleInvalid(format!(
+                "recurrent state '{identity}' input/output mismatch"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn plan_execution_graph(
     graph: &ExecutionGraph,
     catalog: &OperatorCatalog,
@@ -600,6 +735,15 @@ pub fn plan_execution_graph(
     planned_affinity: Option<&ResourceAffinity>,
 ) -> Result<ExecutionGraphPlan, GraphError> {
     graph.validate(catalog)?;
+    if graph
+        .edges
+        .values()
+        .any(|edge| edge.recurrent_state.is_some())
+    {
+        return Err(GraphError::ProviderCapabilityUnavailable(
+            "recurrent state lifecycle is not implemented by this execution planner".into(),
+        ));
+    }
     let mut steps = Vec::new();
     let mut observations = vec![GraphObservation::new(
         GraphObservationKind::GraphPlanningStarted,

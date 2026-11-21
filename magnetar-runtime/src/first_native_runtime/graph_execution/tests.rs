@@ -12,6 +12,71 @@ fn e2e_graph_nodes_transport_stays_tensor_value_typed() {
     );
 }
 
+#[test]
+fn recurrent_graph_planning_is_refused_before_allocating_resources() {
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut graph =
+        ExecutionGraph::new(ExecutionGraphId::new("state"), ExecutionGraphPhase::Decode);
+    let input = TensorEdgeId::new("state.in");
+    let output = TensorEdgeId::new("state.out");
+    let metadata = |behavior| GraphRecurrentStateMetadata {
+        resource_id: "state.layer0.conv".into(),
+        layer: 0,
+        slot: "conv".into(),
+        behavior,
+        compatibility_key: "model-v1".into(),
+    };
+    let mut input_edge = TensorEdge::new(input.clone(), f32_tensor_descriptor_from_shape(&[1, 2]));
+    input_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Input));
+    let mut output_edge =
+        TensorEdge::new(output.clone(), f32_tensor_descriptor_from_shape(&[1, 2]));
+    output_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Output));
+    graph = graph
+        .with_edge(input_edge)
+        .with_edge(output_edge)
+        .with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("update"),
+                OperatorId::magnetar("silu", 1, OperatorFamily::Activation),
+            )
+            .with_input(input)
+            .with_output(output),
+        );
+    graph.validate(&initial_operator_catalog()).unwrap();
+    let active_before = runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    let result = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        1,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    );
+    assert!(matches!(
+        result,
+        Err(E2eConformanceError::KernelCoverageMissing { .. })
+    ));
+    assert_eq!(
+        runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+            .count(),
+        active_before
+    );
+}
+
 /// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
 /// Decision 7) / 6.3: a failure in the Kernel's own execution/completion
 /// (here, `ctx.provider.complete_kernel` itself, injected via

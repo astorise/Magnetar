@@ -102,10 +102,19 @@ the existing gated forms and input positions. The separate portable
 `activation-relu-squared` Kernel feature. Other dtypes or Providers are not
 qualified by a CPU-only fixture.
 
-Hybrid recurrent state requires a separate additive graph Capability version,
-not KV aliases. A future graph-builder 1.11 state extension will declare each
-fixed-size layer/slot input and associate a same-shaped output with its
-Runtime-issued logical identity. Initial state is zero; continuing calls read
+Hybrid recurrent state uses an additive graph Capability version, not KV
+aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
+`recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.
+The host issues identities; slot names are 1-64 ASCII letters, digits, `_` or
+`-`, and fixed, nonempty f32 shapes are capped at 67,108,864 elements. Graph
+validation requires one consumed input and one produced output per identity,
+with matching descriptor, layer, slot and compatibility key. State edges cannot
+alias or be KV/prefix edges. Fingerprints include state metadata and fusion
+cannot remove a state edge. A real Wasmtime Component tests both graph phases;
+older Components continue linking through their original versions. Planning and
+execution explicitly reject these graphs while lifecycle support is absent.
+
+For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and
 component compatibility, layer, slot and dtype/shape, and never contain
 Provider handles in WIT. Outputs remain pending until the token/segment and

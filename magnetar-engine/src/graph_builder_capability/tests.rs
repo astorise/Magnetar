@@ -852,3 +852,296 @@ fn call_rejects_an_unknown_operation() {
         Err(ComponentError::CapabilityCallRejected { .. })
     ));
 }
+
+#[test]
+fn recurrent_state_slots_are_runtime_issued_paired_and_distinct_from_kv() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("state", context());
+    capability
+        .call(
+            "state",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("decode".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(3),
+            ],
+        )
+        .unwrap();
+    let declare = |slot: &str| -> String {
+        let result = capability
+            .call(
+                "state",
+                "recurrent-resource",
+                &[
+                    ComponentValue::S64(2),
+                    ComponentValue::String(slot.into()),
+                    shape(vec![2, 3]),
+                ],
+            )
+            .unwrap();
+        let ComponentValue::String(id) = &result[0] else {
+            panic!("expected resource identity")
+        };
+        id.clone()
+    };
+    let conv = declare("conv");
+    let ssm = declare("ssm");
+    assert_ne!(conv, ssm);
+    assert_eq!(conv, declare("conv"));
+    let build_state = |id: &str, name: &str| -> String {
+        let result = capability
+            .call(
+                "state",
+                "recurrent-input",
+                &[ComponentValue::String(id.into())],
+            )
+            .unwrap();
+        let ComponentValue::String(input) = &result[0] else {
+            panic!("expected input edge")
+        };
+        let result = capability
+            .call(
+                "state",
+                "add-node",
+                &[
+                    ComponentValue::String(name.into()),
+                    ComponentValue::String("silu".into()),
+                    ComponentValue::String("Activation".into()),
+                    ComponentValue::List(vec![]),
+                    ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                    shape(vec![2, 3]),
+                    ComponentValue::Option(None),
+                ],
+            )
+            .unwrap();
+        let ComponentValue::String(output) = &result[0] else {
+            panic!("expected output edge")
+        };
+        capability
+            .call(
+                "state",
+                "recurrent-output",
+                &[
+                    ComponentValue::String(id.into()),
+                    ComponentValue::String(output.clone()),
+                ],
+            )
+            .unwrap();
+        output.clone()
+    };
+    let conv_output = build_state(&conv, "conv");
+    let ssm_output = build_state(&ssm, "ssm");
+    let result = capability
+        .call(
+            "state",
+            "add-node",
+            &[
+                ComponentValue::String("merge".into()),
+                ComponentValue::String("add".into()),
+                ComponentValue::String("Tensor".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![
+                    ComponentValue::String(conv_output),
+                    ComponentValue::String(ssm_output),
+                ]),
+                shape(vec![2, 3]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(output) = &result[0] else {
+        panic!("expected output")
+    };
+    let result = capability
+        .call(
+            "state",
+            "finish-graph",
+            &[ComponentValue::String(output.clone())],
+        )
+        .unwrap();
+    let ComponentValue::String(handle) = &result[0] else {
+        panic!("expected handle")
+    };
+    let graph = capability.take_graph("state", handle).unwrap();
+    graph.validate(&initial_operator_catalog()).unwrap();
+    let slots: Vec<_> = graph
+        .edges
+        .values()
+        .filter_map(|edge| edge.recurrent_state.as_ref())
+        .collect();
+    assert_eq!(slots.len(), 4);
+    assert_eq!(
+        slots
+            .iter()
+            .filter(|state| state.behavior == GraphRecurrentStateBehavior::Input)
+            .count(),
+        2
+    );
+    assert_eq!(
+        slots
+            .iter()
+            .filter(|state| state.behavior == GraphRecurrentStateBehavior::Output)
+            .count(),
+        2
+    );
+    assert!(
+        graph
+            .edges
+            .values()
+            .filter(|edge| edge.recurrent_state.is_some())
+            .all(|edge| edge.kv_cache.is_none())
+    );
+}
+
+#[test]
+fn recurrent_state_rejects_forgery_bad_shapes_and_duplicate_bindings() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("state-bad", context());
+    capability
+        .call(
+            "state-bad",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    for (slot, dims) in [
+        ("bad.slot", vec![2, 3]),
+        ("valid", vec![0, 3]),
+        ("valid", vec![100_000_000]),
+    ] {
+        assert!(
+            capability
+                .call(
+                    "state-bad",
+                    "recurrent-resource",
+                    &[
+                        ComponentValue::S64(0),
+                        ComponentValue::String(slot.into()),
+                        shape(dims),
+                    ]
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-input",
+                &[ComponentValue::String("forged".into())]
+            )
+            .is_err()
+    );
+    let result = capability
+        .call(
+            "state-bad",
+            "recurrent-resource",
+            &[
+                ComponentValue::S64(0),
+                ComponentValue::String("conv".into()),
+                shape(vec![2, 3]),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(id) = &result[0] else {
+        panic!("expected identity")
+    };
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-resource",
+                &[
+                    ComponentValue::S64(0),
+                    ComponentValue::String("conv".into()),
+                    shape(vec![3, 3]),
+                ]
+            )
+            .is_err()
+    );
+    let result = capability
+        .call(
+            "state-bad",
+            "recurrent-input",
+            &[ComponentValue::String(id.clone())],
+        )
+        .unwrap();
+    let ComponentValue::String(input) = &result[0] else {
+        panic!("expected input")
+    };
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-input",
+                &[ComponentValue::String(id.clone())]
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-output",
+                &[
+                    ComponentValue::String(id.clone()),
+                    ComponentValue::String(input.clone()),
+                ]
+            )
+            .is_err()
+    );
+    let result = capability
+        .call(
+            "state-bad",
+            "add-node",
+            &[
+                ComponentValue::String("update".into()),
+                ComponentValue::String("silu".into()),
+                ComponentValue::String("Activation".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                shape(vec![2, 3]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(output) = &result[0] else {
+        panic!("expected output")
+    };
+    capability
+        .call(
+            "state-bad",
+            "recurrent-output",
+            &[
+                ComponentValue::String(id.clone()),
+                ComponentValue::String(output.clone()),
+            ],
+        )
+        .unwrap();
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-output",
+                &[
+                    ComponentValue::String(id.clone()),
+                    ComponentValue::String(output.clone()),
+                ]
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "finish-graph",
+                &[ComponentValue::String(output.clone())]
+            )
+            .is_err()
+    );
+}

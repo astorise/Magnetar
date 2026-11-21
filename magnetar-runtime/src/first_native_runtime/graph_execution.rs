@@ -1242,6 +1242,18 @@ pub(super) fn execute_first_native_graph_nodes(
     resource_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
+    // Recurrent edges are validated by the graph contract, but this executor
+    // does not yet own their transactional session lifecycle. Never treat them
+    // as ordinary inputs/outputs or KV history in the meantime.
+    if graph
+        .edges
+        .values()
+        .any(|edge| edge.recurrent_state.is_some())
+    {
+        return Err(InferenceApiError::KernelUnavailable {
+            reason: "recurrent state lifecycle is not implemented by this executor".into(),
+        });
+    }
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph

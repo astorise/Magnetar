@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.10.0;
+package magnetar:model-component-graph@1.11.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -94,6 +94,25 @@ interface graph-builder {
   /// Issues a Runtime-owned KV logical resource identity for `layer`/
   /// `role`, for use in a subsequent `add-node` call's `kv` argument.
   kv-resource: func(layer: u64, role: kv-cache-role) -> string;
+
+  /// Issues an opaque logical identity for a fixed-size recurrent slot at a
+  /// particular layer. Slot names are 1-64 ASCII letters, digits, `_` or `-`;
+  /// shapes have nonzero fixed dimensions and at most 67,108,864 f32 elements.
+  /// The same layer/slot must have the same shape throughout one graph.
+  /// These identities describe state, not Provider handles or KV caches.
+  /// Added in 1.11.0; current execution explicitly refuses graphs using it
+  /// until transactional recurrent-state lifecycle support is implemented.
+  recurrent-resource: func(layer: u64, slot: string, shape: tensor-shape) -> string;
+
+  /// Declares the prior committed value of a resource as an input edge.
+  /// A new sequence starts from zeros. Each resource must have exactly one
+  /// consumed input and one same-shaped output in the graph.
+  recurrent-input: func(resource-id: string) -> string;
+
+  /// Associates a node's output edge with the next value of a resource.
+  /// State is committed only with the accepted token/segment, atomically with
+  /// related KV updates; a failure must preserve the previous generation.
+  recurrent-output: func(resource-id: string, edge-id: string);
 
   /// Adds one graph node: `operator`/`family` name a portable Operator
   /// identity (never a Provider-specific Kernel name -- Requirement
