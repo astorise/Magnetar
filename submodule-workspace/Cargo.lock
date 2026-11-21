@@ -914,6 +914,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-component-laya"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "magnetar-component-modernbert"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "magnetar-core"
 version = "1.0.0"
 dependencies = [
@@ -1003,6 +1021,8 @@ dependencies = [
 name = "magnetar-integration-production-loading"
 version = "0.1.0"
 dependencies = [
+ "magnetar-component-laya",
+ "magnetar-component-modernbert",
  "magnetar-format-gguf",
  "magnetar-inference-qualification",
  "magnetar-integration-resident-provider",
