@@ -726,6 +726,10 @@ pub struct ModelArchitectureConfig {
     /// Component through `model-config`'s `rope-scaling` (`1.4.0`). The
     /// Component, not the Runtime, turns it into `rope` node attributes.
     pub rope_frequency_scaling: Option<RopeFrequencyScaling>,
+    /// Checkpoint-declared MLP activation, normalized by ingestion. `None`
+    /// means unknown, not an implicit SiLU choice. Exposed by model-config
+    /// 1.8.0 so Components can reject unsupported activations.
+    pub hidden_activation: Option<String>,
     pub tie_word_embeddings: bool,
     /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term, a real
     /// Hugging Face Qwen2/2.5 architectural default (not `config.json`-
@@ -902,6 +906,13 @@ impl ModelArchitectureConfig {
     /// must not overflow `u64`. Qwen-specific semantics are validated
     /// separately by the Qwen Component itself.
     pub fn validate(&self) -> Result<(), ModelArtifactError> {
+        if let Some(activation) = self.hidden_activation.as_deref()
+            && !matches!(activation, "silu" | "gelu" | "gelu_pytorch_tanh" | "relu")
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!("unsupported checkpoint activation '{activation}'"),
+            });
+        }
         let non_zero = [
             ("hidden_size", self.hidden_size),
             ("intermediate_size", self.intermediate_size),
@@ -1136,6 +1147,9 @@ impl ModelManifest {
             });
         }
         self.architecture.validate()?;
+        if let Some(config) = &self.architecture_config {
+            config.validate()?;
+        }
         if self.parts.values().any(|part| part.name.trim().is_empty()) {
             return Err(ModelArtifactError::InvalidManifest {
                 message: "artifact parts must have names".into(),

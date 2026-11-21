@@ -7,6 +7,71 @@ use super::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn mistral_component_reads_activation_and_per_layer_windows() {
+    let bytes = include_bytes!("../../../fixtures/components/mistral-real.component.wasm");
+    let manifest = include_bytes!(
+        "../../../fixtures/components/mistral-real.component.wasm.magnetar-component.yaml"
+    );
+    let digest = ComponentDigest::sha256(bytes);
+    let trust = ComponentTrustStore::default().trust_digest(&digest.value);
+    register_inference_component_artifact(bytes.to_vec(), manifest.to_vec(), &trust).unwrap();
+    let fixture = e2e_fixture().unwrap();
+    let mut config = architecture_config_from_first_native_model_config(&fixture.config);
+    config.hidden_activation = Some("silu".into());
+    config.layer_layout = Some(vec![
+        crate::LayerSpec {
+            sliding_window: Some(2),
+            head_dim: config.head_dim,
+            num_key_value_heads: config.num_key_value_heads,
+            rope_theta: config.rope_theta,
+            partial_rotary_factor: None,
+            value_from_key: false,
+            kv_source_layer: None,
+            intermediate_size: config.intermediate_size,
+        };
+        config.num_hidden_layers as usize
+    ]);
+    let (graphs, _, _) =
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .expect("the new component reads its required configuration");
+    for graph in [&graphs.prefill, &graphs.decode] {
+        let attention = graph
+            .nodes
+            .values()
+            .find(|node| node.operator.name() == "attention")
+            .unwrap();
+        assert_eq!(
+            attention.attributes.get("window_size"),
+            Some(&OperatorAttributeValue::Integer(2))
+        );
+    }
+    config.hidden_activation = None;
+    assert!(
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .is_err()
+    );
+    config.hidden_activation = Some("gelu".into());
+    assert!(
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .is_err()
+    );
+    config.hidden_activation = Some("silu".into());
+    config.layer_layout = None;
+    let (graphs, _, _) =
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .unwrap();
+    assert!(
+        graphs
+            .prefill
+            .nodes
+            .values()
+            .filter(|node| node.operator.name() == "attention")
+            .all(|node| !node.attributes.contains_key("window_size"))
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn e2e_two_segment_split_produces_identical_output_to_full_graph() {
     check_two_segment_split_produces_identical_output_to_full_graph().expect(
         "splitting a real forward pass into two segment Model Instances, bridged \
@@ -641,6 +706,27 @@ fn a_component_that_never_reads_a_declared_1_7_0_feature_is_refused() {
     };
     let error = build(&custom_routing).expect_err("unread expert routing is refused");
     assert!(error.contains("expert-routing"), "{error}");
+
+    // An old component can otherwise construct a full-attention graph with
+    // exactly the same weights as a checkpoint requiring a sliding window.
+    let windowed = ModelArchitectureConfig {
+        layer_layout: Some(vec![
+            crate::LayerSpec {
+                sliding_window: Some(2),
+                head_dim: dense.head_dim,
+                num_key_value_heads: dense.num_key_value_heads,
+                rope_theta: dense.rope_theta,
+                partial_rotary_factor: None,
+                value_from_key: false,
+                kv_source_layer: None,
+                intermediate_size: dense.intermediate_size,
+            };
+            dense.num_hidden_layers as usize
+        ]),
+        ..dense.clone()
+    };
+    let error = build(&windowed).expect_err("unread sliding window is refused");
+    assert!(error.contains("layer-layout"), "{error}");
 
     // A YaRN checkpoint: the Component's `1.5.0` view of `rope-scaling` has no
     // `yarn` case, so it cannot build an unscaled graph for it.

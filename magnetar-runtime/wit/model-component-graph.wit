@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.7.0;
+package magnetar:model-component-graph@1.8.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -360,6 +360,11 @@ interface model-config {
   /// when the mixture declares one. The Runtime refuses a graph built
   /// without reading this function when it is not `none`.
   expert-routing: func() -> option<expert-routing-config>;
+
+  /// Added in 1.8.0. The checkpoint's normalized MLP activation; `none`
+  /// means the source did not establish it. A Component must reject an
+  /// unknown value or an activation its graph does not implement.
+  hidden-activation: func() -> option<string>;
 }
 
 /// World a Model Component satisfies to produce graphs through this

@@ -311,6 +311,105 @@ fn invalid(reason: impl Into<String>) -> ReferenceCpuError {
     ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason)
 }
 
+/// `geodesic-residual@1`: apply a learned spherical residual update to each
+/// row along the final dimension. Inputs and output are f32, with f32
+/// accumulation; scale and bias are scalar tensors. `layer_index` is the
+/// original zero-based model layer, including when a graph is segmented.
+///
+/// For residual `x` and branch `g`, form `t = g - x * dot(x,g) /
+/// max(dot(x,x), 1e-12)`, `r = max(norm(x), 1e-6)`, and
+/// `n = max(norm(t), 1e-8)`. Set `a = min(n/r, pi/4)` then
+/// `theta = min((a*scale+bias)/(layer_index+1), pi/4)`. The result is
+/// `x*cos(theta) + (t/n)*r*sin(theta)`. The angle has no lower clamp.
+pub fn geodesic_residual(
+    residual: &HostTensor,
+    branch: &HostTensor,
+    scale: &HostTensor,
+    bias: &HostTensor,
+    layer_index: u32,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let shape = &residual.shape;
+    let width = shape.last().and_then(|width| usize::try_from(*width).ok());
+    let elements = shape.iter().try_fold(1usize, |count, dimension| {
+        usize::try_from(*dimension)
+            .ok()
+            .and_then(|d| count.checked_mul(d))
+    });
+    let scalar = |tensor: &HostTensor| {
+        (tensor.shape.is_empty() || tensor.shape == [1]) && tensor.data.len() == 1
+    };
+    if shape.is_empty()
+        || shape.contains(&0)
+        || residual.shape != branch.shape
+        || elements != Some(residual.data.len())
+        || residual.data.len() != branch.data.len()
+        || !scalar(scale)
+        || !scalar(bias)
+        || layer_index == u32::MAX
+    {
+        return Err(invalid(
+            "geodesic-residual has invalid tensor shapes or layer index",
+        ));
+    }
+    let width = width.ok_or_else(|| invalid("geodesic-residual row width is too large"))?;
+    let mut result = Vec::with_capacity(residual.data.len());
+    if residual
+        .data
+        .iter()
+        .chain(&branch.data)
+        .chain(&scale.data)
+        .chain(&bias.data)
+        .any(|x| !x.is_finite())
+    {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ExecutionFailed,
+            "non-finite geodesic-residual input",
+        ));
+    }
+    for (x, g) in residual
+        .data
+        .chunks_exact(width)
+        .zip(branch.data.chunks_exact(width))
+    {
+        let norm_squared: f32 = x.iter().map(|v| v * v).sum();
+        let dot: f32 = x.iter().zip(g).map(|(a, b)| a * b).sum();
+        let coefficient = dot / norm_squared.max(1e-12);
+        let tangent: Vec<f32> = x.iter().zip(g).map(|(a, b)| b - coefficient * a).collect();
+        let tangent_norm = tangent.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let safe_norm = tangent_norm.max(1e-8);
+        let radius = norm_squared.sqrt().max(1e-6);
+        let angle = (safe_norm / radius).min(std::f32::consts::FRAC_PI_4);
+        let theta = ((angle * scale.data[0] + bias.data[0]) / (layer_index + 1) as f32)
+            .min(std::f32::consts::FRAC_PI_4);
+        if !norm_squared.is_finite()
+            || !dot.is_finite()
+            || !coefficient.is_finite()
+            || !tangent_norm.is_finite()
+            || !theta.is_finite()
+        {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ExecutionFailed,
+                "non-finite geodesic-residual intermediate",
+            ));
+        }
+        let (sin, cos) = theta.sin_cos();
+        for (value, tangent) in x.iter().zip(tangent) {
+            let output = value * cos + (tangent / safe_norm) * radius * sin;
+            if !output.is_finite() {
+                return Err(ReferenceCpuError::new(
+                    ReferenceCpuErrorCode::ExecutionFailed,
+                    "non-finite geodesic-residual output",
+                ));
+            }
+            result.push(output);
+        }
+    }
+    Ok(HostTensor {
+        shape: shape.clone(),
+        data: result,
+    })
+}
+
 /// `activation` with `kind = "softcap"`: `cap * tanh(x / cap)`, `cap`
 /// finite and positive.
 pub fn softcap(input: &HostTensor, cap: f32) -> Result<HostTensor, ReferenceCpuError> {

@@ -18,6 +18,7 @@ fn sample_config() -> ModelArchitectureConfig {
         rope_theta: 1_000_000.0,
         rope_scaling_factor: None,
         rope_frequency_scaling: None,
+        hidden_activation: None,
         tie_word_embeddings: true,
         attention_bias: true,
         mixture_of_experts: None,
@@ -194,6 +195,58 @@ fn layer_layout_and_options_are_none_for_a_uniform_model() {
             ("per-layer-input-size".into(), ComponentValue::Option(None)),
         ])]
     );
+}
+
+#[test]
+fn declared_layer_layout_and_options_must_be_read_per_instance() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.layer_layout = Some(vec![
+        sample_layer(Some(32), None);
+        config.num_hidden_layers as usize
+    ]);
+    config.final_logit_softcapping = Some(30.0);
+    capability.bind_config("first", config.clone());
+    capability.bind_config("second", config);
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["layer-layout", "options"]
+    );
+    capability.call("first", "layer-layout", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["options"]
+    );
+    assert_eq!(
+        capability.unread_declared_features("second"),
+        vec!["layer-layout", "options"]
+    );
+    capability.call("first", "options", &[]).unwrap();
+    assert!(capability.unread_declared_features("first").is_empty());
+}
+
+#[test]
+fn activation_is_exposed_and_non_silu_requires_a_read() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.hidden_activation = Some("silu".into());
+    capability.bind_config("legacy", config.clone());
+    assert!(capability.unread_declared_features("legacy").is_empty());
+    config.hidden_activation = Some("gelu".into());
+    capability.bind_config("configured", config);
+    assert_eq!(
+        capability.unread_declared_features("configured"),
+        vec!["hidden-activation"]
+    );
+    assert_eq!(
+        capability
+            .call("configured", "hidden-activation", &[])
+            .unwrap(),
+        vec![ComponentValue::Option(Some(Box::new(
+            ComponentValue::String("gelu".into())
+        )))]
+    );
+    assert!(capability.unread_declared_features("configured").is_empty());
 }
 
 #[test]

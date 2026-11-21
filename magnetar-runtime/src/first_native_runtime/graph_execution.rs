@@ -613,6 +613,29 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "geodesic-residual" => {
+            if inputs.len() != 4 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 4 geodesic-residual inputs"),
+                });
+            }
+            let output_descriptor = f32_tensor_descriptor_from_shape(inputs[0].shape());
+            let resources = ["residual", "branch", "scale", "bias"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("geodesic-residual", OperatorFamily::Tensor),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "moe-experts" => {
             // A sixth input scales each expert's output
             // (`dispatch-layered-model-forms`).
@@ -1349,6 +1372,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "add"
                 | "mul"
                 | "residual-add"
+                | "geodesic-residual"
                 | "embedding"
                 | "rmsnorm"
                 | "rope"

@@ -1,0 +1,45 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:237fa43e1a68437f9a5e6529b9c9bebe415d11a219c0270ce5aa03e4ebf24159"
+component:
+  name: "magnetar.mistral.graph"
+  version: "0.1.0"
+  description: "Mistral decoder graph with validated activation and per-layer windows"
+  role: "mistral-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.2"
+compatibility:
+  architecture_families:
+    - mistral
+  artifact_formats:
+    - huggingface
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.8.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.8.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/mistral-real.component.wasm"
+signatures: []

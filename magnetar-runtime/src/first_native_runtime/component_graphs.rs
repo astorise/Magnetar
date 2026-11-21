@@ -295,7 +295,9 @@ pub fn register_inference_component_artifact(
     // version keep linking.
     // `1.7.0` (`express-latent-attention-forms`) adds latent attention,
     // mixed expert layers, expert routing and the YaRN RoPE case.
-    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"] {
+    for version in [
+        "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0",
+    ] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,
@@ -580,6 +582,11 @@ pub(super) fn build_first_native_graphs_with_runtime(
     ),
     E2eConformanceError,
 > {
+    config
+        .validate()
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: format!("invalid model architecture configuration: {error}"),
+        })?;
     let mut manager = manager.lock().unwrap();
 
     let instance = manager
@@ -717,6 +724,11 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
             "1.0.0",
         );
         let architecture_config = architecture_config_from_first_native_model_config(config);
+        architecture_config.validate().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: format!("invalid model architecture configuration: {error}"),
+            }
+        })?;
         let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
@@ -834,6 +846,11 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
             "1.0.0",
         );
         let architecture_config = architecture_config_from_first_native_model_config(config);
+        architecture_config.validate().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: format!("invalid model architecture configuration: {error}"),
+            }
+        })?;
         let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
@@ -1021,8 +1038,8 @@ pub(super) fn inference_component_runtime_limits() -> ComponentResourceLimits {
     }
 }
 
-/// Refuses a graph built while the bound configuration declares a `1.7.0`
-/// feature (latent attention, mixed expert layers, expert routing) that the
+/// Refuses a graph built while the bound configuration declares a
+/// per-layer layout, architecture option, or other feature that the
 /// Model Component never read (`express-latent-attention-forms`): a
 /// Component compiled against an earlier version cannot know of it, and a
 /// graph that ignores it computes another model.

@@ -11,6 +11,52 @@ use magnetar_runtime::{
 use std::{fs, sync::Arc};
 
 #[test]
+fn mistral_window_survives_real_bundle_ingestion() {
+    let dir = tempfile::tempdir().unwrap();
+    write_tiny_production_bundle(dir.path());
+    let path = dir.path().join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["model_type"] = "mistral".into();
+    config["hidden_act"] = "silu".into();
+    config["sliding_window"] = 2.into();
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::Tachyon("test:mistral".into()),
+        dir.path().to_path_buf(),
+    );
+    let ingested = HuggingFaceIngestor::new().ingest(&source).unwrap();
+    let config = ingested.manifest.architecture_config.unwrap();
+    assert_eq!(config.layer_layout.unwrap()[0].sliding_window, Some(2));
+}
+
+#[test]
+fn ingested_window_is_rejected_by_an_old_component_that_cannot_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    write_tiny_production_bundle(dir.path());
+    let path = dir.path().join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["layer_types"] = serde_json::json!(["sliding_attention"]);
+    config["sliding_window"] = 2.into();
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::Tachyon("test:windowed-qwen".into()),
+        dir.path().to_path_buf(),
+    );
+    let ingested = HuggingFaceIngestor::new().ingest(&source).unwrap();
+    let config = ingested.manifest.architecture_config.unwrap();
+    let component = crate::test_support::real_component_for_architecture_family("qwen2");
+    let error = magnetar_runtime::build_first_native_graphs_from_named_component(
+        &component,
+        &config,
+        &magnetar_runtime::e2e_fixture_identity(),
+        4,
+    )
+    .err()
+    .expect("a component predating layer-layout cannot implement the window");
+    assert!(error.to_string().contains("layer-layout"), "{error}");
+}
+
+#[test]
 fn tachyon_shaped_real_production_ingestion_loads_through_the_real_qwen_component() {
     register_real_qwen_component();
     let dir = tempfile::tempdir().unwrap();

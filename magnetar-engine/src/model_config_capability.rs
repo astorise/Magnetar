@@ -37,13 +37,16 @@ pub struct ModelConfigCapability {
     called: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
-/// The `1.7.0` functions whose feature a graph does not otherwise show:
+/// The functions whose feature a graph does not otherwise show:
 /// when the bound configuration declares one, a Component must have read
 /// it before its graph is accepted.
-const FEATURE_FUNCTIONS: [&str; 3] = [
+const FEATURE_FUNCTIONS: [&str; 6] = [
+    "layer-layout",
+    "options",
     "multi-head-latent-attention",
     "mixture-of-experts-layers",
     "expert-routing",
+    "hidden-activation",
 ];
 
 impl ModelConfigCapability {
@@ -69,9 +72,8 @@ impl ModelConfigCapability {
         self.called.lock().unwrap().remove(instance_key);
     }
 
-    /// The `1.7.0` functions carrying a feature the configuration bound to
-    /// `instance_key` declares (latent attention, mixed expert layers,
-    /// expert routing) that the Component has not called since the binding.
+    /// The functions carrying features the configuration bound to
+    /// `instance_key` declares that the Component has not called since the binding.
     /// A Component compiled against an earlier version cannot read them, so
     /// a graph it built for such a checkpoint would silently leave the
     /// feature out; the Runtime refuses that graph instead
@@ -87,9 +89,21 @@ impl ModelConfigCapability {
             .into_iter()
             .filter(|function| {
                 let declared = match *function {
+                    "layer-layout" => config.layer_layout.is_some(),
+                    "options" => {
+                        config.final_logit_softcapping.is_some()
+                            || config.per_layer_input_size.is_some()
+                    }
                     "multi-head-latent-attention" => config.latent_attention.is_some(),
                     "mixture-of-experts-layers" => config.moe_layers.is_some(),
-                    _ => config.expert_routing.is_some(),
+                    "expert-routing" => config.expert_routing.is_some(),
+                    // Preserve compatibility with older fixed-SiLU decoders.
+                    // This cannot prove that an older Component actually uses
+                    // SiLU; other declared activations must be read explicitly.
+                    _ => config
+                        .hidden_activation
+                        .as_deref()
+                        .is_some_and(|value| value != "silu"),
                 };
                 declared && !called.is_some_and(|called| called.contains(*function))
             })
@@ -416,7 +430,8 @@ impl HostCapability for ModelConfigCapability {
             | "options"
             | "multi-head-latent-attention"
             | "mixture-of-experts-layers"
-            | "expert-routing" => {
+            | "expert-routing"
+            | "hidden-activation" => {
                 if !arguments.is_empty() {
                     return Err(rejected(
                         instance_key,
@@ -445,6 +460,12 @@ impl HostCapability for ModelConfigCapability {
                     }
                     "mixture-of-experts-layers" => encode_moe_layers(config.moe_layers.as_deref()),
                     "expert-routing" => encode_expert_routing(config.expert_routing.as_ref()),
+                    "hidden-activation" => ComponentValue::Option(
+                        config
+                            .hidden_activation
+                            .as_ref()
+                            .map(|value| Box::new(ComponentValue::String(value.clone()))),
+                    ),
                     _ => encode_options(config),
                 };
                 drop(bound);

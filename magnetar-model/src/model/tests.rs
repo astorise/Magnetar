@@ -239,6 +239,7 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
         change(&mut config);
         assert!(config.validate().is_err(), "{config:?}");
     };
+    refused(|config| config.hidden_activation = Some("unknown-activation".into()));
     // A query/key head that is not nope + rope wide.
     refused(|config| config.head_dim = 128);
     // Fewer K/V heads than attention heads.

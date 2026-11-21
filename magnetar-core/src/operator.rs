@@ -202,6 +202,9 @@ pub enum ShapeRule {
     /// input may instead have shape `[1]`: one value broadcast to every
     /// element (`extend-portable-operator-attributes`).
     SameShapeOrScalar,
+    /// Two equally shaped nonempty vectors/row batches, followed by two
+    /// scalar parameters; the output has the first input's shape.
+    GeodesicResidual,
     Matmul,
     RmsNorm,
     RowBroadcastAdd,
@@ -1385,6 +1388,15 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::SameShape,
         ),
+        // A row-wise, learned geodesic residual update. Scale and bias are
+        // tensor inputs so each mixer/MLP keeps its own checkpoint weights.
+        (
+            "geodesic-residual",
+            OperatorFamily::Tensor,
+            4,
+            1,
+            ShapeRule::GeodesicResidual,
+        ),
         (
             "dtype-conversion",
             OperatorFamily::Tensor,
@@ -1477,6 +1489,15 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 OperatorDTypeContract::new(TensorRole::Accumulation, floats),
             ];
         }
+        if name == "geodesic-residual" {
+            // Only the f32 profile is qualified; other output dtypes need
+            // independently validated rounding and conversion semantics.
+            spec.dtype_contracts = vec![
+                OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Accumulation, [ComputeDType::Float32]),
+            ];
+        }
         catalog = catalog.with_operator(spec);
     }
     catalog
@@ -1484,6 +1505,10 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "geodesic-residual" => OperatorAttributeSchema::default().with_rule(
+            "layer_index",
+            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+        ),
         // `cache-latent-attention-history`: `a [T, G*K]` times `b` group by
         // group (`group_count = G`), each group's block `[K, N]` or, with
         // `transpose_b`, `[N, K]` used transposed, giving `[T, G*N]`
@@ -1886,6 +1911,32 @@ fn validate_shape_rule(
                 .ok_or_else(|| OperatorError::ShapeMismatch {
                     reason: "tensor shapes differ and the second input is not a [1] scalar".into(),
                 })
+        }
+        ShapeRule::GeodesicResidual => {
+            let input = &inputs[0].shape.dimensions;
+            if input.is_empty()
+                || input.contains(&0)
+                || inputs[1].shape.dimensions != *input
+                || outputs[0].shape.dimensions != *input
+                || !inputs[2..].iter().all(|tensor| {
+                    tensor.shape.dimensions.is_empty() || tensor.shape.dimensions == [1]
+                })
+            {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "geodesic residual expects equal nonempty input/output shapes and two scalar parameters".into(),
+                });
+            }
+            match attributes.get("layer_index") {
+                Some(OperatorAttributeValue::Integer(index))
+                    if (0..u32::MAX as i64).contains(index) =>
+                {
+                    Ok(())
+                }
+                _ => Err(OperatorError::OperatorAttributeInvalid {
+                    attribute: "layer_index".into(),
+                    reason: "must be a nonnegative original layer index below u32::MAX".into(),
+                }),
+            }
         }
         ShapeRule::Matmul => {
             if inputs.len() < 2 {
