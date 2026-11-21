@@ -717,6 +717,78 @@ pub(super) fn dispatch_first_native_graph_node(
                 output_shape,
             )
         }
+        "projected-differential-attention" => {
+            if inputs.len() != 17 || node.outputs.len() != 5 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 17 inputs and 5 outputs"),
+                });
+            }
+            let config =
+                crate::operator_semantics::projected_differential_attention_from_attributes(
+                    &node.attributes,
+                )
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let [tokens, _hidden] = inputs[0].shape() else {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects rank-two hidden states"),
+                });
+            };
+            let total = u64::try_from(config.past_length)
+                .ok()
+                .and_then(|n| n.checked_add(*tokens))
+                .filter(|&n| n > 0 && *tokens > 0)
+                .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has an invalid sequence length"),
+                })?;
+            let output_shape = [
+                *tokens,
+                (config.query_heads - config.kv_heads) as u64,
+                config.head_dim as u64,
+            ];
+            let history_shape = [total, config.kv_heads as u64, config.head_dim as u64];
+            if let Some(graph) = ctx.graph.as_ref() {
+                let shapes: [&[u64]; 5] = [
+                    &output_shape,
+                    inputs[1].shape(),
+                    inputs[2].shape(),
+                    &history_shape,
+                    &history_shape,
+                ];
+                for (edge_id, shape) in node.outputs.iter().zip(shapes) {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != shape {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' has an output with the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let target = |index: usize| -> OutputTarget {
+                (
+                    ctx.edge_resource(node.outputs[index].as_str()),
+                    resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                    ctx.output_owner(kv_cache_id),
+                )
+            };
+            let targets = [output_target, target(1), target(2), target(3), target(4)];
+            dispatch_projected_differential_attention(
+                ctx,
+                node_id,
+                inputs,
+                targets,
+                node.attributes.clone(),
+                output_shape,
+                history_shape,
+            )
+        }
         "token-shift" => {
             if inputs.len() != 4 || node.outputs.len() != 2 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1748,6 +1820,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "mamba3-mixer"
                 | "token-shift"
                 | "differential-attention"
+                | "projected-differential-attention"
                 | "affine-layernorm"
                 | "slice-last"
                 | "row-scale"
@@ -1831,6 +1904,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "mamba3-mixer"
                 | "token-shift"
                 | "differential-attention"
+                | "projected-differential-attention"
                 | "affine-layernorm"
                 | "gelu-exact"
                 | "slice-last"
@@ -2615,6 +2689,8 @@ mod mamba3_mixer_tests;
 mod mamba3_tests;
 #[cfg(test)]
 mod modernbert_graph_tests;
+#[cfg(test)]
+mod projected_differential_attention_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

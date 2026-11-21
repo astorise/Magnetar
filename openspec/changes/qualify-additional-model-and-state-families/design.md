@@ -169,6 +169,20 @@ and attention-output conversions; the contract never silently assumes that
 precision. This primitive does not project Q/K/V, update history, apply RoPE,
 or manage token-shift state and therefore does not qualify a full V block.
 
+For the pinned no-RoPE, biasless, Q/K-normalized and scalable-softmax profile,
+the `projected-differential-attention@1` composes Q and low-rank K/V
+projections, separate raw token shifts, Q/K RMS normalization, position scaling
+and differential attention. It takes hidden states, previous raw K/V, prior
+attention history (normalized K and shifted V), positions and eleven learned tensors, and returns the
+attention output, two next raw states and two updated histories. A zero past
+uses a single ignored history row because execution graphs require nonempty
+shapes; `past_length` explicitly states the number of valid rows. Positions
+must be contiguous from that length. A document reset is a new call with zero
+past and position zero, which suppresses any supplied prior raw state. Packed
+multi-document attention, RoPE, value embeddings, XSA and biased/CosNet
+projections are outside this profile and must not silently use it. These
+explicit tensors do not implement Runtime-managed recurrent or KV lifecycle.
+
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
 `recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.

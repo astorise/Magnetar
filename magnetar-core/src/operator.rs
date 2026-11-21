@@ -1387,6 +1387,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        (
+            "projected-differential-attention",
+            OperatorFamily::Attention,
+            17,
+            5,
+            ShapeRule::Any,
+        ),
         // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
         ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1603,6 +1610,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 | "mamba3-mixer"
                 | "token-shift"
                 | "differential-attention"
+                | "projected-differential-attention"
         ) {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
@@ -1658,6 +1666,35 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             )
             .with_rule(
                 "round_bfloat16",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "projected-differential-attention" => default_attribute_schema("differential-attention")
+            .with_rule(
+                "query_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "kv_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "rank",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "past_length",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "zero_centered_norm",
                 OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
             ),
         "affine-layernorm" => OperatorAttributeSchema::default().with_rule(

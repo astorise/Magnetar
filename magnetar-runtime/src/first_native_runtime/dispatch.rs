@@ -1595,10 +1595,10 @@ pub(super) fn dispatch_mamba3_mimo(
 ) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     let descriptors =
         [2, 8, 9, 10, 11].map(|index| f32_tensor_descriptor_from_shape(inputs[index].shape()));
-    dispatch_mamba3_multi(
+    dispatch_five_output(
         ctx,
         operation_id,
-        "mamba3-mimo",
+        dispatch_operator_id("mamba3-mimo", OperatorFamily::LinearAlgebra),
         inputs,
         targets,
         attributes,
@@ -1622,10 +1622,10 @@ pub(super) fn dispatch_mamba3_mixer(
         f32_tensor_descriptor_from_shape(inputs[3].shape()),
         f32_tensor_descriptor_from_shape(inputs[4].shape()),
     ];
-    dispatch_mamba3_multi(
+    dispatch_five_output(
         ctx,
         operation_id,
-        "mamba3-mixer",
+        dispatch_operator_id("mamba3-mixer", OperatorFamily::LinearAlgebra),
         inputs,
         targets,
         attributes,
@@ -1633,10 +1633,41 @@ pub(super) fn dispatch_mamba3_mixer(
     )
 }
 
-fn dispatch_mamba3_multi(
+/// Dispatch projected attention with distinct raw state and growing histories.
+pub(super) fn dispatch_projected_differential_attention(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
-    operator: &str,
+    inputs: Vec<NodeValue>,
+    targets: [OutputTarget; 5],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+    output_shape: [u64; 3],
+    history_shape: [u64; 3],
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
+    let descriptors = [
+        f32_tensor_descriptor_from_shape(&output_shape),
+        f32_tensor_descriptor_from_shape(inputs[1].shape()),
+        f32_tensor_descriptor_from_shape(inputs[2].shape()),
+        f32_tensor_descriptor_from_shape(&history_shape),
+        f32_tensor_descriptor_from_shape(&history_shape),
+    ];
+    dispatch_five_output(
+        ctx,
+        operation_id,
+        dispatch_operator_id(
+            "projected-differential-attention",
+            OperatorFamily::Attention,
+        ),
+        inputs,
+        targets,
+        attributes,
+        descriptors,
+    )
+}
+
+fn dispatch_five_output(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
     inputs: Vec<NodeValue>,
     targets: [OutputTarget; 5],
     attributes: BTreeMap<String, OperatorAttributeValue>,
@@ -1656,7 +1687,7 @@ fn dispatch_mamba3_multi(
         if aliases_input || targets[..index].iter().any(|other| other.0 == target.0) {
             return Err(InferenceApiError::GraphPlanningFailed {
                 reason: format!(
-                    "graph node '{operation_id}' aliases a Mamba-3 output with an input or another output"
+                    "graph node '{operation_id}' aliases a multi-output value with an input or another output"
                 ),
             });
         }
@@ -1682,7 +1713,7 @@ fn dispatch_mamba3_multi(
     let result = dispatch_reference_cpu_operator_multi(
         ctx,
         operation_id,
-        dispatch_operator_id(operator, OperatorFamily::LinearAlgebra),
+        operator,
         resources,
         outputs,
         attributes,
