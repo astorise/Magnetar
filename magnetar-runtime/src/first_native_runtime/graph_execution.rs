@@ -580,6 +580,46 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "mamba2-mixer" => {
+            if !(10..=13).contains(&inputs.len()) || node.outputs.len() != 3 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 10 to 13 inputs and 3 outputs"),
+                });
+            }
+            if let Some(graph) = ctx.graph.as_ref() {
+                for (index, edge_id) in node.outputs.iter().enumerate() {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != inputs[index].shape() {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' output {index} has the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let second: OutputTarget = (
+                ctx.edge_resource(node.outputs[1].as_str()),
+                resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                ctx.output_owner(kv_cache_id),
+            );
+            let third: OutputTarget = (
+                ctx.edge_resource(node.outputs[2].as_str()),
+                resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                ctx.output_owner(kv_cache_id),
+            );
+            dispatch_mamba2_mixer(
+                ctx,
+                node_id,
+                inputs,
+                [output_target, second, third],
+                node.attributes.clone(),
+            )
+        }
         "encoder-attention" => {
             if inputs.len() != 4 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1432,6 +1472,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "gated-matmul"
                 | "silu-mul"
                 | "moe-experts"
+                | "mamba2-mixer"
                 | "row-scale"
                 | "activation"
                 | "attention"
@@ -1500,6 +1541,24 @@ pub(super) fn execute_first_native_graph_nodes(
             && last_row_heads.contains(node_id)
         {
             last_row_only(&*dispatch_ctx.provider, &mut inputs[0], row)?;
+        }
+        // Host-visible inputs lose their source resource IDs when converted
+        // to NodeValue::Host. Check the original graph bindings before any
+        // Mamba output admission, so an edge-derived output ID cannot
+        // overwrite a live graph input, intermediate, or model weight.
+        if node.operator.name() == "mamba2-mixer" {
+            for edge_id in &node.outputs {
+                let output_id = dispatch_ctx.edge_resource(edge_id.as_str());
+                if bindings.values().any(|(id, _)| id == &output_id)
+                    || weight_bindings.values().any(|id| id == &output_id)
+                {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' output aliases a live tensor resource"
+                        ),
+                    });
+                }
+            }
         }
         dispatch_ctx
             .runtime
@@ -2256,5 +2315,7 @@ pub(super) fn materialize_first_native_graph_bindings(
     Ok(materialized_bindings)
 }
 
+#[cfg(test)]
+mod mamba2_tests;
 #[cfg(test)]
 mod tests;

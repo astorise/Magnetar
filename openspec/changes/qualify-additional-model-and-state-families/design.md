@@ -137,6 +137,26 @@ a recurrent slot; this form does not attach KV metadata. The old single-output
 `add-node` stays unchanged. Multi-output description alone does not enable
 recurrent execution or relax the unsupported behavior above.
 
+The initial experimental `mamba2-mixer@1` CPU operator is a pure function of
+one sequence and two explicit f32 state tensors. Inputs are `[T,H]` hidden
+states, `[C,K]` oldest-first convolution history, `[heads,head_dim,state_dim]`
+SSM state, `[H,P]` input projection, `[C,K]` depthwise convolution weights,
+`[heads]` dt bias, A-log and D, `[heads*head_dim]` gated-normalization weight,
+and `[heads*head_dim,H]` output projection. Boolean attributes explicitly
+declare an optional `[C]` convolution bias and optional `[P]`/`[H]` linear
+biases, appended in that order. `C = heads*head_dim + 2*groups*state_dim` and
+`P = heads*head_dim + C + heads`. Required attributes are integer `heads`,
+`head_dim`, `groups`, `state_dim`, `conv_kernel`, float `epsilon`, `dt_min`,
+and boolean `conv_bias`, `linear_bias`; optional float `dt_max` is finite when
+present and absent means unbounded. Epsilon is positive and the minimum dt is
+nonnegative. The three ordered outputs are `[T,H]` mixer output and
+same-shaped next convolution and SSM states. The CPU form follows the pinned
+Nemotron-H SiLU convolution, selective update and grouped gated RMS norm;
+Mamba-3 is a different operator. Invalid shapes, values, unsupported bias
+forms or missing Kernel support fail closed. Explicit state inputs/outputs are
+not Runtime-managed session state; graph-level recurrent execution stays
+disabled until the transactional lifecycle is implemented and tested.
+
 ### Experimental masked encoder attention
 
 ModernBERT's attention is bidirectional; its local window is symmetric and

@@ -1353,6 +1353,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // One sequence's Mamba-2 activation and explicit next conv/SSM states.
+        (
+            "mamba2-mixer",
+            OperatorFamily::LinearAlgebra,
+            13,
+            3,
+            ShapeRule::Any,
+        ),
         // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
         ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1525,6 +1533,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         spec.min_inputs = match name {
             "rmsnorm" => 1,
             "moe-experts" => 5,
+            "mamba2-mixer" => 10,
             "attention" => 3,
             _ => inputs,
         };
@@ -1543,6 +1552,8 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         }
         if name == "encoder-attention" {
             spec.memory = OperatorMemoryBehavior::pure().with_workspace();
+        }
+        if matches!(name, "encoder-attention" | "mamba2-mixer") {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
                 OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
@@ -1575,6 +1586,47 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "mamba2-mixer" => OperatorAttributeSchema::default()
+            .with_rule(
+                "heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "groups",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "state_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_kernel",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "dt_min",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "dt_max",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "conv_bias",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            )
+            .with_rule(
+                "linear_bias",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
         "encoder-attention" => OperatorAttributeSchema::default()
             .with_rule(
                 "head_count",

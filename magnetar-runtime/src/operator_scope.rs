@@ -464,7 +464,7 @@ fn validate_first_scope_attributes(
     }
 }
 
-const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 38] = [
+const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 39] = [
     required_now("embedding", OperatorFamily::Tensor, true),
     required_now("matmul", OperatorFamily::LinearAlgebra, true),
     required_now("rmsnorm", OperatorFamily::Normalization, true),
@@ -481,6 +481,7 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 38] = [
     // `execute-and-cache-moe-experts` F02: a routed mixture-of-experts MLP
     // and its shared expert's sigmoid-scaled output.
     first_decoder_optional("moe-experts", OperatorFamily::LinearAlgebra),
+    first_decoder_optional("mamba2-mixer", OperatorFamily::LinearAlgebra),
     first_decoder_optional("row-scale", OperatorFamily::Tensor),
     first_decoder_optional("geodesic-residual", OperatorFamily::Tensor),
     first_decoder_optional("encoder-attention", OperatorFamily::Attention),
