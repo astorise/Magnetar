@@ -2084,7 +2084,16 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         // never before. A failure anywhere before this point leaves the
         // pending writes unpromoted and the cache's committed bindings
         // untouched (task 7.4 abort/7.5 rollback).
-        state.layer_kv = self.promote_pending_kv_resources(runtime, &state)?;
+        state.layer_kv = match self.promote_pending_kv_resources(runtime, &state) {
+            Ok(layers) => layers,
+            Err(error) => {
+                // Promotion did not publish a new generation. Keep the
+                // original pending resources reachable for retry or request
+                // cleanup, including when the first prefill never committed.
+                self.store_pending_kv_state(request, state)?;
+                return Err(error);
+            }
+        };
         if generated_tokens_before_step.is_empty() {
             runtime.prefill_kv_cache_completed(&state.cache, request.prompt_token_count as u32)?;
         } else {

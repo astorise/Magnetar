@@ -6141,6 +6141,18 @@ pub(super) fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
     .map_err(E2eConformanceError::from)?;
     let _ = provider.release_tensor(&pending_v);
 
+    let active_owned_by_cache = |runtime: &Runtime| {
+        runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| {
+                allocation.state == MemoryAllocationState::Active
+                    && allocation.request.owner == MemoryAllocationOwner::Session(cache.to_string())
+            })
+            .count()
+    };
+    let allocations_before_failed_commit = active_owned_by_cache(&runtime);
+
     match engine.commit_generation_step(&mut runtime, &request, &generated, 2, &decode_step) {
         Err(InferenceApiError::KvCacheUnavailable { .. }) => {}
         Err(error) => {
@@ -6153,6 +6165,15 @@ pub(super) fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
                 reason: "commit succeeded despite a missing pending resource for one layer".into(),
             });
         }
+    }
+
+    let allocations_after_failed_commit = active_owned_by_cache(&runtime);
+    if allocations_after_failed_commit != allocations_before_failed_commit {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "a failed KV commit leaked an active allocation: before {allocations_before_failed_commit}, after {allocations_after_failed_commit}"
+            ),
+        });
     }
 
     let committed_after_failed_commit = runtime.kv_cache(&cache)?.layer_resources.clone();
