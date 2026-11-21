@@ -459,6 +459,11 @@ jobs:
         env:
           MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
         run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_smollm
+      - name: Compare block-FP8 weights with Transformers
+        env:
+          MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
+          MAGNETAR_DEEPSEEK_TEST_COMPONENT: ${{ runner.temp }}/deepseek.component.wasm
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_fp8_logits
       - name: Build the Mistral graph component
         shell: bash
         run: |

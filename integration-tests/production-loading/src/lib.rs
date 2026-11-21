@@ -29,6 +29,8 @@ mod tests_chunked_prefill;
 #[cfg(test)]
 mod tests_deepseek_v2_logits;
 #[cfg(test)]
+mod tests_fp8_logits;
+#[cfg(test)]
 mod tests_gemma4_logits;
 #[cfg(test)]
 mod tests_gguf_loading_e2e;
