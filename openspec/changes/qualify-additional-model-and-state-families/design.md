@@ -128,6 +128,15 @@ retirement need explicit tests before this experimental profile can run. The
 standalone Mamba-2 reference is evidence for numeric equations, not an
 implementation of this Runtime contract.
 
+Stateful scans naturally return their activation and several new state tensors
+from the same computation. The additive `graph-builder@1.11.0` also exposes
+`add-node-outputs` with the existing node identity, attributes and input list,
+plus a list of 1-16 output shapes and a returned edge for each output.
+Each output remains independently validated and may subsequently be bound to
+a recurrent slot; this form does not attach KV metadata. The old single-output
+`add-node` stays unchanged. Multi-output description alone does not enable
+recurrent execution or relax the unsupported behavior above.
+
 ### Experimental masked encoder attention
 
 ModernBERT's attention is bidirectional; its local window is symmetric and

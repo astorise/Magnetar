@@ -77,6 +77,92 @@ fn recurrent_graph_planning_is_refused_before_allocating_resources() {
     );
 }
 
+#[test]
+fn multiple_output_graph_executes_and_uses_both_results() {
+    let input = TensorEdgeId::new("input.data");
+    let left = TensorEdgeId::new("edge.split.0");
+    let right = TensorEdgeId::new("edge.split.1");
+    let logits = TensorEdgeId::new("logits");
+    let graph = ExecutionGraph::new(
+        ExecutionGraphId::new("multi-output"),
+        ExecutionGraphPhase::Prefill,
+    )
+    .with_edge(TensorEdge::new(
+        input.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 6]),
+    ))
+    .with_edge(TensorEdge::new(
+        left.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 3]),
+    ))
+    .with_edge(TensorEdge::new(
+        right.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 3]),
+    ))
+    .with_edge(TensorEdge::new(
+        logits.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 3]),
+    ))
+    .with_node(
+        ExecutionNode::new(
+            ExecutionNodeId::new("split"),
+            OperatorId::magnetar("split", 1, OperatorFamily::Tensor),
+        )
+        .with_input(input.clone())
+        .with_output(left.clone())
+        .with_output(right.clone()),
+    )
+    .with_node(
+        ExecutionNode::new(
+            ExecutionNodeId::new("output"),
+            OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+        )
+        .with_input(left)
+        .with_input(right)
+        .with_output(logits.clone()),
+    );
+    graph.validate(&initial_operator_catalog()).unwrap();
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        2,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    let values = HostTensor::new(
+        [2, 6],
+        (1..=12).map(|value| value as f32).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let (_, outputs, _, _) = execute_first_native_graph_materializing(
+        &mut runtime,
+        &fixture,
+        &instance,
+        &KvCacheId::new("multi-output").unwrap(),
+        &graph,
+        &mut plan,
+        BTreeMap::from([(input, values)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+        MaterializedEdges::Only(&["logits"]),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outputs[&logits].data, vec![5.0, 7.0, 9.0, 17.0, 19.0, 21.0]);
+}
+
 /// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
 /// Decision 7) / 6.3: a failure in the Kernel's own execution/completion
 /// (here, `ctx.provider.complete_kernel` itself, injected via

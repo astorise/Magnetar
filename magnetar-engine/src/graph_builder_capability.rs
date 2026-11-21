@@ -79,6 +79,14 @@ struct RecurrentResource {
     shape: ShapeDescriptor,
 }
 
+struct NodeDescription {
+    id: String,
+    operator: String,
+    family: OperatorFamily,
+    attributes: Vec<(String, OperatorAttributeValue)>,
+    inputs: Vec<String>,
+}
+
 /// Runtime-side [`HostCapability`] backing `graph-builder`. One instance is
 /// registered once on a `ComponentManager`/engine and shared across every
 /// Component instance that imports it; per-instance state (the graph under
@@ -215,6 +223,27 @@ fn decode_tensor_shape(value: &ComponentValue) -> Result<ShapeDescriptor, String
         decoded.push(expect_u64(dimension)?);
     }
     Ok(ShapeDescriptor::new(decoded))
+}
+
+fn decode_node_description(arguments: &[ComponentValue]) -> Result<NodeDescription, String> {
+    let id = expect_string(&arguments[0])?.to_string();
+    let operator = expect_string(&arguments[1])?.to_string();
+    let family = parse_operator_family(expect_string(&arguments[2])?)?;
+    let attributes = expect_list(&arguments[3])?
+        .iter()
+        .map(decode_attribute)
+        .collect::<Result<Vec<_>, _>>()?;
+    let inputs = expect_list(&arguments[4])?
+        .iter()
+        .map(|value| expect_string(value).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NodeDescription {
+        id,
+        operator,
+        family,
+        attributes,
+        inputs,
+    })
 }
 
 /// Every tensor this Capability's graphs carry is contiguous `float32` --
@@ -721,33 +750,8 @@ impl GraphBuilderCapability {
     ) -> Result<Vec<ComponentValue>, ComponentError> {
         expect_arity("add-node", 7, arguments)
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let node_id = expect_string(&arguments[0])
+        let description = decode_node_description(arguments)
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let operator = expect_string(&arguments[1])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let family = expect_string(&arguments[2])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let family = parse_operator_family(family)
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let attribute_values = expect_list(&arguments[3])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let mut attributes = Vec::with_capacity(attribute_values.len());
-        for value in attribute_values {
-            attributes.push(
-                decode_attribute(value)
-                    .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?,
-            );
-        }
-        let input_values = expect_list(&arguments[4])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let mut inputs = Vec::with_capacity(input_values.len());
-        for value in input_values {
-            inputs.push(
-                expect_string(value)
-                    .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?
-                    .to_string(),
-            );
-        }
         let output_shape = decode_tensor_shape(&arguments[5])
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
         let kv = match &arguments[6] {
@@ -765,6 +769,56 @@ impl GraphBuilderCapability {
             }
         };
 
+        let ids = self.insert_node(instance_key, description, vec![output_shape], kv, false)?;
+        Ok(vec![ComponentValue::String(
+            ids.into_iter().next().expect("one output"),
+        )])
+    }
+
+    fn add_node_outputs(
+        &self,
+        instance_key: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        expect_arity("add-node-outputs", 6, arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let description = decode_node_description(arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let values = expect_list(&arguments[5])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        if !(1..=16).contains(&values.len()) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "add-node-outputs requires 1-16 outputs",
+            ));
+        }
+        let shapes = values
+            .iter()
+            .map(decode_tensor_shape)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let ids = self.insert_node(instance_key, description, shapes, None, true)?;
+        Ok(vec![ComponentValue::List(
+            ids.into_iter().map(ComponentValue::String).collect(),
+        )])
+    }
+
+    fn insert_node(
+        &self,
+        instance_key: &str,
+        description: NodeDescription,
+        output_shapes: Vec<ShapeDescriptor>,
+        kv: Option<(String, GraphKvCacheBehavior)>,
+        multiple_outputs: bool,
+    ) -> Result<Vec<String>, ComponentError> {
+        let NodeDescription {
+            id: node_id,
+            operator,
+            family,
+            attributes,
+            inputs,
+        } = description;
         let mut sessions = self.sessions.lock().unwrap();
         // Read before `active_graph` takes a mutable borrow of `sessions`.
         let compatibility_key = sessions
@@ -781,7 +835,7 @@ impl GraphBuilderCapability {
                 ));
             }
         }
-        let node_node_id = ExecutionNodeId::new(node_id);
+        let node_node_id = ExecutionNodeId::new(&node_id);
         if graph.nodes.contains_key(&node_node_id) {
             return Err(rejected(
                 CAPABILITY_NAME,
@@ -789,39 +843,69 @@ impl GraphBuilderCapability {
                 format!("add-node: node '{node_id}' already exists"),
             ));
         }
-        let output_edge_id = TensorEdgeId::new(format!("edge.{node_id}"));
+        let output_edge_ids: Vec<_> = (0..output_shapes.len())
+            .map(|index| {
+                TensorEdgeId::new(if multiple_outputs {
+                    format!("edge.{node_id}.{index}")
+                } else {
+                    format!("edge.{node_id}")
+                })
+            })
+            .collect();
+        if output_edge_ids
+            .iter()
+            .any(|id| graph.edges.contains_key(id))
+        {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "add-node: output edge identity already exists",
+            ));
+        }
         let mut node = ExecutionNode::new(
             node_node_id.clone(),
-            OperatorId::magnetar(operator, 1, family),
+            OperatorId::magnetar(&operator, 1, family),
         );
         for input in &inputs {
             node = node.with_input(TensorEdgeId::new(input.as_str()));
         }
-        node = node.with_output(output_edge_id.clone());
+        for output in &output_edge_ids {
+            node = node.with_output(output.clone());
+        }
         for (name, value) in attributes {
             node = node.with_attribute(name, value);
         }
-        let mut output_edge =
-            TensorEdge::new(output_edge_id.clone(), descriptor_from_shape(output_shape))
-                .with_producer(node_node_id.clone());
-        if let Some((resource_id, behavior)) = kv {
-            output_edge.kv_cache = Some(GraphKvCacheMetadata {
-                cache_id: resource_id,
-                behavior,
-                paged: false,
-                compatibility_key,
-            });
-        }
+        let output_edges: Vec<_> = output_edge_ids
+            .iter()
+            .cloned()
+            .zip(output_shapes)
+            .map(|(id, shape)| {
+                let mut edge = TensorEdge::new(id, descriptor_from_shape(shape))
+                    .with_producer(node_node_id.clone());
+                if let Some((resource_id, behavior)) = &kv {
+                    edge.kv_cache = Some(GraphKvCacheMetadata {
+                        cache_id: resource_id.clone(),
+                        behavior: behavior.clone(),
+                        paged: false,
+                        compatibility_key: compatibility_key.clone(),
+                    });
+                }
+                edge
+            })
+            .collect();
         for input in &inputs {
             if let Some(edge) = graph.edges.get_mut(&TensorEdgeId::new(input.as_str())) {
                 edge.consumers.insert(node_node_id.clone());
             }
         }
         graph.nodes.insert(node_node_id, node);
-        graph.edges.insert(output_edge_id.clone(), output_edge);
-        Ok(vec![ComponentValue::String(
-            output_edge_id.as_str().to_string(),
-        )])
+        for edge in output_edges {
+            graph.edges.insert(edge.id.clone(), edge);
+        }
+        Ok(output_edge_ids
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect())
     }
 
     fn finish_graph(
@@ -949,6 +1033,7 @@ impl HostCapability for GraphBuilderCapability {
             "recurrent-input" => self.recurrent_input(instance_key, arguments),
             "recurrent-output" => self.recurrent_output(instance_key, arguments),
             "add-node" => self.add_node(instance_key, arguments),
+            "add-node-outputs" => self.add_node_outputs(instance_key, arguments),
             "finish-graph" => self.finish_graph(instance_key, arguments),
             other => Err(rejected(
                 CAPABILITY_NAME,

@@ -134,6 +134,20 @@ interface graph-builder {
     kv: option<kv-involvement>,
   ) -> string;
 
+  /// Adds one Operator with 1-16 independently addressable output edges.
+  /// Output shapes are in Operator order; each returned edge may be consumed
+  /// by later nodes or bound as a recurrent output. Unlike `add-node`, this
+  /// additive 1.11.0 form does not attach KV metadata. Arity and shapes are
+  /// validated against the portable Operator catalog at `finish-graph`.
+  add-node-outputs: func(
+    node-id: string,
+    operator: string,
+    family: string,
+    attributes: list<attribute>,
+    inputs: list<string>,
+    output-shapes: list<tensor-shape>,
+  ) -> list<string>;
+
   /// Declares `edge-id` as the graph's output (e.g. "logits"), finalizes
   /// and validates the graph, and returns an opaque graph handle the
   /// Runtime uses to look up the real `ExecutionGraph` it built. No further

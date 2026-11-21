@@ -10,8 +10,8 @@ wit_bindgen::generate!({
 });
 
 use magnetar::model_component_graph::graph_builder::{
-    GraphPhase, TensorShape, add_node, begin_graph, declare_input, finish_graph, recurrent_input,
-    recurrent_output, recurrent_resource,
+    GraphPhase, TensorShape, add_node, add_node_outputs, begin_graph, declare_input, finish_graph,
+    recurrent_input, recurrent_output, recurrent_resource,
 };
 
 fn graph(phase: GraphPhase, position: u64) -> String {
@@ -21,18 +21,83 @@ fn graph(phase: GraphPhase, position: u64) -> String {
     };
     let resource = recurrent_resource(2, "conv", &shape);
     let previous = recurrent_input(&resource);
+    let data = declare_input(
+        "data",
+        &TensorShape {
+            dimensions: vec![2, 6],
+        },
+    );
+    let halves = add_node_outputs(
+        "split",
+        "split",
+        "Tensor",
+        &[],
+        &[data],
+        &[
+            TensorShape {
+                dimensions: vec![2, 3],
+            },
+            TensorShape {
+                dimensions: vec![2, 3],
+            },
+        ],
+    );
     let next = add_node(
         "update",
-        "silu",
-        "Activation",
+        "add",
+        "Tensor",
         &[],
-        &[previous],
+        &[previous, halves[0].clone()],
         &shape,
         None,
     );
     recurrent_output(&resource, &next);
-    let data = declare_input("data", &shape);
-    let output = add_node("output", "add", "Tensor", &[], &[data, next], &shape, None);
+    let output = add_node(
+        "output",
+        "add",
+        "Tensor",
+        &[],
+        &[halves[1].clone(), next],
+        &shape,
+        None,
+    );
+    finish_graph(&output)
+}
+
+fn stateless_graph() -> String {
+    begin_graph(GraphPhase::Prefill, 2, 0);
+    let data = declare_input(
+        "data",
+        &TensorShape {
+            dimensions: vec![2, 6],
+        },
+    );
+    let halves = add_node_outputs(
+        "split",
+        "split",
+        "Tensor",
+        &[],
+        &[data],
+        &[
+            TensorShape {
+                dimensions: vec![2, 3],
+            },
+            TensorShape {
+                dimensions: vec![2, 3],
+            },
+        ],
+    );
+    let output = add_node(
+        "output",
+        "add",
+        "Tensor",
+        &[],
+        &halves,
+        &TensorShape {
+            dimensions: vec![2, 3],
+        },
+        None,
+    );
     finish_graph(&output)
 }
 
@@ -45,7 +110,7 @@ impl Guest for Component {
         graph(GraphPhase::Decode, position)
     }
     fn build_prefill_graph_segment(_: u64, _: u32, _: u32) -> String {
-        graph(GraphPhase::Prefill, 0)
+        stateless_graph()
     }
     fn build_decode_graph_segment(position: u64, _: u32, _: u32) -> String {
         graph(GraphPhase::Decode, position)
