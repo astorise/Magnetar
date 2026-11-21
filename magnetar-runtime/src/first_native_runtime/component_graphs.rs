@@ -879,6 +879,24 @@ fn validate_recurrent_graph_pair(
     Ok(())
 }
 
+/// Validate the WIT segment precondition before invoking a Component.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub(super) fn validate_segment_bounds(
+    config: &FirstNativeModelConfig,
+    start: u32,
+    end: u32,
+) -> Result<(), E2eConformanceError> {
+    if start > end || u64::from(end) > config.architecture.layer_count {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: format!(
+                "invalid decoder segment {start}..{end} for {} layers",
+                config.architecture.layer_count
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// [`build_first_native_graphs_with_runtime`]'s per-Device pipeline-
 /// placement counterpart (`add-real-multi-device-model-instance-
 /// placement`): builds a real *prefill-segment* Execution Graph for decoder
@@ -908,6 +926,7 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
     start_layer: u32,
     end_layer: u32,
 ) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    validate_segment_bounds(config, start_layer, end_layer)?;
     let mut manager = manager.lock().unwrap();
 
     let instance = manager
@@ -1029,6 +1048,7 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
     start_layer: u32,
     end_layer: u32,
 ) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    validate_segment_bounds(config, start_layer, end_layer)?;
     let mut manager = manager.lock().unwrap();
 
     let instance = manager

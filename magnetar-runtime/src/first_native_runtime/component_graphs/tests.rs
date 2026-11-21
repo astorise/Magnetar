@@ -7,6 +7,52 @@ use super::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn decoder_segments_reject_inverted_or_out_of_range_layers() {
+    let fixture = e2e_fixture().unwrap();
+    let count = fixture.config.architecture.layer_count as u32;
+    for (start, end) in [(0, 0), (0, count), (count, count)] {
+        validate_segment_bounds(&fixture.config, start, end).unwrap();
+    }
+    for (start, end) in [(1, 0), (0, count + 1), (count + 1, count + 1)] {
+        assert!(
+            build_first_native_prefill_graph_segment_for_config(
+                &fixture.config,
+                &fixture.identity,
+                2,
+                start,
+                end
+            )
+            .is_err(),
+            "accepted invalid prefill segment {start}..{end}"
+        );
+        assert!(
+            build_first_native_decode_graph_segment_for_config(
+                &fixture.config,
+                &fixture.identity,
+                2,
+                start,
+                end
+            )
+            .is_err(),
+            "accepted invalid decode segment {start}..{end}"
+        );
+        let loading = load_first_native_segment_with_provider_and_weights(
+            Arc::new(ReferenceCpuProvider::new()),
+            &fixture,
+            &fixture.weights,
+            start,
+            end,
+        );
+        assert!(matches!(
+            loading,
+            Err(E2eConformanceError::ModelComponentFailed { reason })
+                if reason.contains("invalid decoder segment")
+        ));
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn decoder_graph_pair_requires_matching_recurrent_schemas() {
     let make_graph = |phase| {
         let input_id = TensorEdgeId::new("state.in");
