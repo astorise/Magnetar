@@ -856,6 +856,177 @@ fn resident_production_model_bookkeeping_stays_bounded_across_requests() {
     }
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn failed_streaming_generation_releases_request_state_and_session() {
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let provider = Arc::new(ReferenceCpuProvider::new());
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        provider.clone(),
+    )
+    .unwrap();
+    // Run per node so removing a weight after the first token deterministically
+    // makes the next decode fail after a committed prefill.
+    model.step_replay.set_enabled(false);
+    model.set_prefill_buckets(Vec::new());
+    let weight = model
+        .runtime
+        .model_instances()
+        .instance(&model.instance)
+        .unwrap()
+        .definition()
+        .resource_bindings
+        .weights["layers.0.self_attn.q_proj"]
+        .clone();
+    let executor = provider.executor();
+    let saved = executor.read_tensor(&weight).unwrap();
+    let sessions_before = model.runtime.sessions().count();
+    let caches_before = model.runtime.kv_caches().caches().count();
+    let request = || ProductionGenerationRequest {
+        prompt: PromptInput::TokenIds(vec![5, 6, 7]),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(3),
+        max_generation_millis: None,
+    };
+    for observe_logits in [false, true] {
+        let mut removed = false;
+        let mut observed = 0;
+        let mut on_event = |event| {
+            if matches!(event, GenerationStreamEvent::Token { .. }) && !removed {
+                assert!(executor.release_tensor(&weight));
+                removed = true;
+            }
+            std::ops::ControlFlow::Continue(())
+        };
+        let result = if observe_logits {
+            model.generate_streaming_with_logits(request(), None, &mut on_event, &mut |_| {
+                observed += 1
+            })
+        } else {
+            model.generate_streaming(request(), None, &mut on_event)
+        };
+        assert!(removed, "the prefill produced a token");
+        assert_eq!(observed > 0, observe_logits);
+        assert!(
+            result.is_err(),
+            "decode should fail after its weight is removed"
+        );
+        assert_eq!(
+            model.runtime.sessions().count(),
+            sessions_before,
+            "failed request left a session"
+        );
+        assert_eq!(
+            model.runtime.kv_caches().caches().count(),
+            caches_before,
+            "failed request left a KV cache"
+        );
+        executor.write_tensor(weight.clone(), saved.clone());
+    }
+    model
+        .generate(request(), None)
+        .expect("later requests still succeed");
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn failed_generation_releases_session_before_a_first_commit() {
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let provider = Arc::new(ReferenceCpuProvider::new());
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        provider.clone(),
+    )
+    .unwrap();
+    model.set_prefill_buckets(Vec::new());
+    let weight = model
+        .runtime
+        .model_instances()
+        .instance(&model.instance)
+        .unwrap()
+        .definition()
+        .resource_bindings
+        .weights["layers.0.self_attn.q_proj"]
+        .clone();
+    let executor = provider.executor();
+    let saved = executor.read_tensor(&weight).unwrap();
+    assert!(executor.release_tensor(&weight));
+    let sessions_before = model.runtime.sessions().count();
+    let caches_before = model.runtime.kv_caches().caches().count();
+    let request = || ProductionGenerationRequest {
+        prompt: PromptInput::TokenIds(vec![5, 6, 7]),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(2),
+        max_generation_millis: None,
+    };
+    assert!(model.generate(request(), None).is_err());
+    assert_eq!(model.runtime.sessions().count(), sessions_before);
+    assert_eq!(model.runtime.kv_caches().caches().count(), caches_before);
+    executor.write_tensor(weight, saved);
+    model
+        .generate(request(), None)
+        .expect("a later request can succeed");
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn failed_request_preparation_closes_its_session() {
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        Arc::new(ReferenceCpuProvider::new()),
+    )
+    .unwrap();
+    let before = model.runtime.sessions().count();
+    let request = ProductionGenerationRequest {
+        prompt: PromptInput::ChatMessages(vec![ChatMessage::new("user", "hello")]),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(2),
+        max_generation_millis: None,
+    };
+    assert!(matches!(
+        model.generate(request, None),
+        Err(InferenceApiError::PolicyDenied { .. })
+    ));
+    assert_eq!(
+        model.runtime.sessions().count(),
+        before,
+        "tokenization failure left a session"
+    );
+    let invalid_token = ProductionGenerationRequest {
+        prompt: PromptInput::TokenIds(vec![u32::MAX]),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(2),
+        max_generation_millis: None,
+    };
+    assert!(matches!(
+        model.generate(invalid_token, None),
+        Err(InferenceApiError::TokenizationFailed { .. })
+    ));
+    assert_eq!(model.runtime.sessions().count(), before);
+    let valid_request = ProductionGenerationRequest {
+        prompt: PromptInput::TokenIds(vec![5, 6, 7]),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(2),
+        max_generation_millis: None,
+    };
+    model
+        .generate(valid_request, None)
+        .expect("a later request can succeed");
+}
+
 /// `attribute-redacted-inference-costs` A06 (tasks 2.2/2.3): a request that
 /// crosses graph build, input upload, dispatch, materialization, sampling
 /// and commit is attributed per step with leaves that never exceed the

@@ -1640,7 +1640,17 @@ impl ProductionLoadedModel {
             },
             &mut prepared.observer,
             &mut execution_plans,
-        )?;
+        );
+        let generation_result = match generation_result {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(self.cleanup_failed_request(
+                    &prepared.session,
+                    Some(&prepared.generation_request),
+                    error,
+                ));
+            }
+        };
         self.finish_generation(
             prepared.session,
             &prepared.generation_request,
@@ -1731,7 +1741,7 @@ impl ProductionLoadedModel {
                     &mut execution_plans,
                     &mut on_token,
                     on_logits,
-                )?
+                )
             }
             None => run_generation_loop_with_execution_plans_streaming(
                 &mut self.runtime,
@@ -1742,7 +1752,17 @@ impl ProductionLoadedModel {
                 &mut prepared.observer,
                 &mut execution_plans,
                 &mut on_token,
-            )?,
+            ),
+        };
+        let generation_result = match generation_result {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(self.cleanup_failed_request(
+                    &prepared.session,
+                    Some(&prepared.generation_request),
+                    error,
+                ));
+            }
         };
         let _ = on_event(GenerationStreamEvent::Finished {
             finish_reason: generation_result.output.finish_reason,
@@ -1807,138 +1827,185 @@ impl ProductionLoadedModel {
             .phase_ledger_mut()
             .begin_step(StepKind::RequestPreparation);
         let clock = self.runtime.phase_ledger().clock();
-        let session = create_inference_session(&mut self.runtime, session_request)?;
-        self.runtime
-            .phase_ledger_mut()
-            .record(clock, StepPhase::SessionCreate);
-        let clock = self.runtime.phase_ledger().clock();
-        let tokenized = tokenize_prompt_input(
-            &self.fixture.tokenizer,
-            prompt_tokenization_request(prompt),
-            chat_formatter,
-        )?;
-        stop_conditions.prepared_stop_sequences = stop_conditions
-            .stop_text_sequences
-            .iter()
-            .map(|text| self.fixture.tokenizer.resolve_stop_sequence(text))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(
-                |error: TokenizerError| InferenceApiError::TokenizationFailed {
-                    reason: error.to_string(),
-                },
-            )?;
-        self.runtime
-            .phase_ledger_mut()
-            .record(clock, StepPhase::Tokenize);
-        let observer = InferenceApiObserver::new();
-        let prompt_token_count = tokenized.token_ids.len() as u64;
-        // A bucketed prefill's graph and plan have its bucket's length
-        // (`replay-bucketed-prefill`), as the engine's step expects.
-        let clock = self.runtime.phase_ledger().clock();
-        let (graph_length, component_graphs) = loop {
-            let graph_length = self.graph_cache.prefill_graph_length(prompt_token_count);
-            let component_graphs = match self.graph_cache.get(graph_length) {
-                Some(graphs) => graphs,
-                None => {
-                    let graphs = Arc::new(
-                        match &self.component_digest {
-                            Some(digest) => {
-                                build_first_native_graphs_from_named_component_for_artifact(
-                                    digest,
-                                    &architecture_config_from_first_native_model_config(
-                                        &self.fixture.config,
-                                    ),
-                                    &self.fixture.manifest.tensors,
-                                    &self.fixture.identity,
-                                    graph_length,
-                                )
-                            }
-                            .map(|(graphs, _definition, _instance)| graphs),
-                            None => build_first_native_graphs_from_real_qwen_component(
-                                &self.fixture,
-                                graph_length,
-                            )
-                            .map(|(graphs, _definition, _instance)| graphs),
-                        }
-                        .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                            reason: error.to_string(),
-                        })
-                        .map(|graphs| {
-                            self.graph_cache
-                                .prepare(&self.runtime, graphs, graph_length)
-                        })?,
-                    );
-                    self.graph_cache.insert(graph_length, Arc::clone(&graphs));
-                    graphs
-                }
-            };
-            // A chunked prefill's later passes read the earlier passes' rows
-            // through the KV history alone (`chunk-long-prefills`): a graph
-            // whose attention reads K or V from elsewhere runs every prompt
-            // in one pass.
-            if graph_length < prompt_token_count
-                && !super::prefill_chunks::prefill_continues_history(&component_graphs.prefill)
-            {
-                self.graph_cache.set_prefill_chunk(0);
-                continue;
+        let session = match create_inference_session(&mut self.runtime, session_request) {
+            Ok(session) => session,
+            Err(error) => {
+                self.runtime.phase_ledger_mut().end_step();
+                return Err(error);
             }
-            // Padding rows are only invisible to KV history kept in place,
-            // where attention reads the first `key_count` rows: a graph whose
-            // KV edges have other readers runs at the prompt's exact length,
-            // outside every bucket and the chunk.
-            if (graph_length != prompt_token_count
-                || self.graph_cache.is_prefill_bucket(graph_length))
-                && !component_graphs
-                    .prefill_memo
-                    .kv_edges_feed_only_attention(&component_graphs.prefill)
-            {
-                self.graph_cache.set_prefill_buckets(Vec::new());
-                self.graph_cache.set_prefill_chunk(0);
-                continue;
-            }
-            break (graph_length, component_graphs);
         };
         self.runtime
             .phase_ledger_mut()
-            .record(clock, StepPhase::GraphBuild);
-        let clock = self.runtime.phase_ledger().clock();
-        let prepared_plans = component_graphs
-            .prepared_plans(
-                &self.runtime,
-                &self.instance,
-                graph_length,
-                &self.provider_binding,
-            )
-            .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                reason: error.to_string(),
-            })?;
-        let generation_request = build_generation_request(
-            GenerationRequestId::new("production-generation")?,
-            Some(session.clone()),
-            GenerationModelReference::ModelInstance(self.instance.clone()),
-            generation_tokenizer_reference(&self.fixture),
-            tokenized,
-            max_tokens,
-            parameters,
-            stop_conditions,
-            StreamingMode::TokenIds,
-        );
-        self.runtime
-            .phase_ledger_mut()
-            .record(clock, StepPhase::PlanPrepare);
-        let clock = self.runtime.phase_ledger().clock();
-        let generation_request = prepare_generation(&self.runtime, generation_request)?;
-        self.runtime
-            .phase_ledger_mut()
-            .record(clock, StepPhase::RequestValidate);
+            .record(clock, StepPhase::SessionCreate);
+        let result = (|| {
+            let clock = self.runtime.phase_ledger().clock();
+            let tokenized = tokenize_prompt_input(
+                &self.fixture.tokenizer,
+                prompt_tokenization_request(prompt),
+                chat_formatter,
+            )?;
+            stop_conditions.prepared_stop_sequences = stop_conditions
+                .stop_text_sequences
+                .iter()
+                .map(|text| self.fixture.tokenizer.resolve_stop_sequence(text))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(
+                    |error: TokenizerError| InferenceApiError::TokenizationFailed {
+                        reason: error.to_string(),
+                    },
+                )?;
+            self.runtime
+                .phase_ledger_mut()
+                .record(clock, StepPhase::Tokenize);
+            let observer = InferenceApiObserver::new();
+            let prompt_token_count = tokenized.token_ids.len() as u64;
+            // A bucketed prefill's graph and plan have its bucket's length
+            // (`replay-bucketed-prefill`), as the engine's step expects.
+            let clock = self.runtime.phase_ledger().clock();
+            let (graph_length, component_graphs) = loop {
+                let graph_length = self.graph_cache.prefill_graph_length(prompt_token_count);
+                let component_graphs = match self.graph_cache.get(graph_length) {
+                    Some(graphs) => graphs,
+                    None => {
+                        let graphs = Arc::new(
+                            match &self.component_digest {
+                                Some(digest) => {
+                                    build_first_native_graphs_from_named_component_for_artifact(
+                                        digest,
+                                        &architecture_config_from_first_native_model_config(
+                                            &self.fixture.config,
+                                        ),
+                                        &self.fixture.manifest.tensors,
+                                        &self.fixture.identity,
+                                        graph_length,
+                                    )
+                                }
+                                .map(|(graphs, _definition, _instance)| graphs),
+                                None => build_first_native_graphs_from_real_qwen_component(
+                                    &self.fixture,
+                                    graph_length,
+                                )
+                                .map(|(graphs, _definition, _instance)| graphs),
+                            }
+                            .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                                reason: error.to_string(),
+                            })
+                            .map(|graphs| {
+                                self.graph_cache
+                                    .prepare(&self.runtime, graphs, graph_length)
+                            })?,
+                        );
+                        self.graph_cache.insert(graph_length, Arc::clone(&graphs));
+                        graphs
+                    }
+                };
+                // A chunked prefill's later passes read the earlier passes' rows
+                // through the KV history alone (`chunk-long-prefills`): a graph
+                // whose attention reads K or V from elsewhere runs every prompt
+                // in one pass.
+                if graph_length < prompt_token_count
+                    && !super::prefill_chunks::prefill_continues_history(&component_graphs.prefill)
+                {
+                    self.graph_cache.set_prefill_chunk(0);
+                    continue;
+                }
+                // Padding rows are only invisible to KV history kept in place,
+                // where attention reads the first `key_count` rows: a graph whose
+                // KV edges have other readers runs at the prompt's exact length,
+                // outside every bucket and the chunk.
+                if (graph_length != prompt_token_count
+                    || self.graph_cache.is_prefill_bucket(graph_length))
+                    && !component_graphs
+                        .prefill_memo
+                        .kv_edges_feed_only_attention(&component_graphs.prefill)
+                {
+                    self.graph_cache.set_prefill_buckets(Vec::new());
+                    self.graph_cache.set_prefill_chunk(0);
+                    continue;
+                }
+                break (graph_length, component_graphs);
+            };
+            self.runtime
+                .phase_ledger_mut()
+                .record(clock, StepPhase::GraphBuild);
+            let clock = self.runtime.phase_ledger().clock();
+            let prepared_plans = component_graphs
+                .prepared_plans(
+                    &self.runtime,
+                    &self.instance,
+                    graph_length,
+                    &self.provider_binding,
+                )
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let generation_request = build_generation_request(
+                GenerationRequestId::new("production-generation")?,
+                Some(session.clone()),
+                GenerationModelReference::ModelInstance(self.instance.clone()),
+                generation_tokenizer_reference(&self.fixture),
+                tokenized,
+                max_tokens,
+                parameters,
+                stop_conditions,
+                StreamingMode::TokenIds,
+            );
+            self.runtime
+                .phase_ledger_mut()
+                .record(clock, StepPhase::PlanPrepare);
+            let clock = self.runtime.phase_ledger().clock();
+            let generation_request = prepare_generation(&self.runtime, generation_request)?;
+            self.runtime
+                .phase_ledger_mut()
+                .record(clock, StepPhase::RequestValidate);
+            self.runtime.phase_ledger_mut().end_step();
+            Ok(PreparedResidentProductionGeneration {
+                session: session.clone(),
+                generation_request,
+                prepared_plans,
+                observer,
+                max_generation_millis,
+            })
+        })();
+        match result {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => Err(self.cleanup_failed_request(&session, None, error)),
+        }
+    }
+
+    /// Retire request-owned state even when the generation loop returns early.
+    /// Preserve the original error unless cleanup itself also fails.
+    fn cleanup_failed_request(
+        &mut self,
+        session: &InferenceSessionId,
+        request: Option<&GenerationRequest>,
+        original: InferenceApiError,
+    ) -> InferenceApiError {
         self.runtime.phase_ledger_mut().end_step();
-        Ok(PreparedResidentProductionGeneration {
-            session,
-            generation_request,
-            prepared_plans,
-            observer,
-            max_generation_millis,
-        })
+        let release = match (self.runtime.model_execution_engine().cloned(), request) {
+            (Some(engine), Some(request)) => {
+                engine.release_request_state(&mut self.runtime, request)
+            }
+            _ => Ok(()),
+        };
+        let close = close_inference_session(&mut self.runtime, session);
+        let forget = if close.is_ok() {
+            self.runtime
+                .forget_closed_inference_session(session)
+                .map_err(InferenceApiError::from)
+        } else {
+            Ok(())
+        };
+        match release
+            .err()
+            .or_else(|| close.err())
+            .or_else(|| forget.err())
+        {
+            Some(cleanup) => InferenceApiError::GenerationFailed {
+                reason: format!("generation failed: {original}; cleanup failed: {cleanup}"),
+            },
+            None => original,
+        }
     }
 
     pub(super) fn finish_generation(
