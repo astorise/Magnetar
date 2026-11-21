@@ -48,6 +48,9 @@ const LAYER_LAYOUT_PROBE_COMPONENT: &str =
 const LATENT_ATTENTION_PROBE_COMPONENT: &str = include_str!(
     "../../../magnetar-runtime/fixtures/components/latent-attention-probe.component.wat"
 );
+const EXPERT_NORMALIZATION_PROBE_COMPONENT: &str = include_str!(
+    "../../../magnetar-runtime/fixtures/components/expert-normalization-probe.component.wat"
+);
 /// Imports `model-config@1.4.0`'s `rope-scaling`, whose variant has only the
 /// `banded` case, and returns the scaling's case (`run`).
 const BANDED_ONLY_PROBE_COMPONENT: &str = r#"
@@ -1535,6 +1538,36 @@ fn yarn_scaling() -> crate::RopeFrequencyScaling {
 }
 
 #[test]
+fn wasmtime_engine_lowers_expert_normalization_into_a_real_component() {
+    for (mode, expected) in [
+        (None, 0),
+        (Some(crate::ExpertNormalization::Never), 10),
+        (Some(crate::ExpertNormalization::MultipleExperts), 11),
+        (Some(crate::ExpertNormalization::Always), 12),
+    ] {
+        let config = crate::ModelArchitectureConfig {
+            expert_routing: Some(crate::ExpertRoutingConfig {
+                scoring: crate::ExpertScoring::Sigmoid,
+                groups: None,
+                routed_scaling_factor: 1.0,
+                selection_bias: true,
+                normalization: mode,
+                shared_expert_gated: false,
+            }),
+            ..Default::default()
+        };
+        let result = run_model_config_probe(
+            "expert-normalization-probe",
+            EXPERT_NORMALIZATION_PROBE_COMPONENT,
+            "1.10.0",
+            config,
+            &["run"],
+        );
+        assert_eq!(result, vec![Ok(expected)]);
+    }
+}
+
+#[test]
 fn wasmtime_engine_lowers_the_1_7_0_latent_attention_routing_and_yarn_into_a_real_component() {
     let u32_result = |value: u32| Ok::<u32, String>(value);
     let exports = ["mla", "layers", "routing", "rope"];
@@ -1573,6 +1606,7 @@ fn wasmtime_engine_lowers_the_1_7_0_latent_attention_routing_and_yarn_into_a_rea
             }),
             routed_scaling_factor: 2.5,
             selection_bias: true,
+            normalization: None,
             shared_expert_gated: false,
         }),
         ..Default::default()

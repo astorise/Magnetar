@@ -18,8 +18,9 @@ use std::sync::Mutex;
 
 use crate::component::{ComponentError, ComponentValue, HostCapability};
 use crate::{
-    ExpertGroupScore, ExpertRoutingConfig, ExpertScoring, LatentAttentionConfig, LayerSpec,
-    MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling,
+    ExpertGroupScore, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
+    LatentAttentionConfig, LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig,
+    RopeFrequencyScaling,
 };
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
@@ -41,7 +42,7 @@ pub struct ModelConfigCapability {
 /// when the bound configuration declares one, a Component must have read
 /// it before its graph is accepted. Activation must always be read, so a
 /// Component can distinguish an unknown activation from a supported one.
-const FEATURE_FUNCTIONS: [&str; 7] = [
+const FEATURE_FUNCTIONS: [&str; 8] = [
     "layer-layout",
     "options",
     "multi-head-latent-attention",
@@ -49,6 +50,7 @@ const FEATURE_FUNCTIONS: [&str; 7] = [
     "expert-routing",
     "hidden-activation",
     "rope-layers",
+    "expert-normalization",
 ];
 
 impl ModelConfigCapability {
@@ -100,6 +102,9 @@ impl ModelConfigCapability {
                     "multi-head-latent-attention" => config.latent_attention.is_some(),
                     "mixture-of-experts-layers" => config.moe_layers.is_some(),
                     "expert-routing" => config.expert_routing.is_some(),
+                    "expert-normalization" => config
+                        .expert_routing
+                        .is_some_and(|routing| routing.normalization.is_some()),
                     "rope-layers" => config.rope_layers.is_some(),
                     // Even an absent activation is meaningful: a fixed-activation
                     // decoder must see and reject it instead of guessing.
@@ -432,6 +437,7 @@ impl HostCapability for ModelConfigCapability {
             | "multi-head-latent-attention"
             | "mixture-of-experts-layers"
             | "expert-routing"
+            | "expert-normalization"
             | "rope-layers"
             | "hidden-activation" => {
                 if !arguments.is_empty() {
@@ -463,6 +469,21 @@ impl HostCapability for ModelConfigCapability {
                     "mixture-of-experts-layers" => encode_moe_layers(config.moe_layers.as_deref()),
                     "rope-layers" => encode_moe_layers(config.rope_layers.as_deref()),
                     "expert-routing" => encode_expert_routing(config.expert_routing.as_ref()),
+                    "expert-normalization" => ComponentValue::Option(
+                        config
+                            .expert_routing
+                            .and_then(|routing| routing.normalization)
+                            .map(|value| {
+                                Box::new(ComponentValue::Enum(
+                                    match value {
+                                        ExpertNormalization::Never => "never",
+                                        ExpertNormalization::MultipleExperts => "multiple-experts",
+                                        ExpertNormalization::Always => "always",
+                                    }
+                                    .into(),
+                                ))
+                            }),
+                    ),
                     "hidden-activation" => ComponentValue::Option(
                         config
                             .hidden_activation

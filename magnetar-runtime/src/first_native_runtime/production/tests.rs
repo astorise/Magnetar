@@ -1152,6 +1152,7 @@ fn latent_attention_and_mixed_expert_layers_derive_their_weight_shapes() {
             groups: None,
             routed_scaling_factor: 1.0,
             selection_bias: true,
+            normalization: None,
             shared_expert_gated: false,
         }),
         ..Default::default()

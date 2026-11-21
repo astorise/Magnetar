@@ -241,6 +241,7 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
             }),
             routed_scaling_factor: 1.0,
             selection_bias: false,
+            normalization: None,
             shared_expert_gated: false,
         }),
         ..Default::default()
@@ -305,5 +306,20 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
             .as_mut()
             .unwrap()
             .routed_scaling_factor = 0.0
+    });
+    refused(|config| {
+        config.expert_routing.as_mut().unwrap().normalization = Some(ExpertNormalization::Always);
+    });
+    refused(|config| {
+        let groups = config
+            .expert_routing
+            .as_mut()
+            .unwrap()
+            .groups
+            .as_mut()
+            .unwrap();
+        groups.count = 64;
+        groups.per_token = 6;
+        groups.score = ExpertGroupScore::TopTwoSum;
     });
 }

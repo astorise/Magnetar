@@ -142,11 +142,11 @@ use crate::memory::{
 use crate::operator::{
     ATTENTION_SCALE_FEATURE, ATTENTION_VALUE_HEAD_DIMENSION_FEATURE, CONCAT_HEADS_FEATURE,
     ConcatAxis, EMBEDDING_SCALE_FEATURE, MOE_EXPERTS_ACTIVATION_FEATURE,
-    MOE_PER_EXPERT_SCALE_FEATURE, OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec,
-    RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE,
-    ROPE_BANDED_FREQUENCY_SCALING_FEATURE, ROPE_PARTIAL_ROTARY_FEATURE,
-    ROPE_YARN_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling, RopeYarnFrequencyScaling,
-    TensorLayoutKind, TensorRole, concat_axis,
+    MOE_PER_EXPERT_SCALE_FEATURE, MOE_SIGMOID_ROUTING_FEATURE, OperatorAttributeValue,
+    OperatorFamily, OperatorId, OperatorSpec, RMSNORM_PER_HEAD_FEATURE,
+    RMSNORM_WITHOUT_WEIGHT_FEATURE, ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+    ROPE_PARTIAL_ROTARY_FEATURE, ROPE_YARN_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling,
+    RopeYarnFrequencyScaling, TensorLayoutKind, TensorRole, concat_axis,
 };
 pub use crate::operator_semantics::{
     MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE, MoeRouting, NATIVE_CPU_PROVIDER_NAME,
@@ -1496,7 +1496,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     let moe_experts = with_features(
         "moe-experts",
         OperatorFamily::LinearAlgebra,
-        &[MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE],
+        &[
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_PER_EXPERT_SCALE_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+        ],
     );
     // Honours the banded frequency-scaling attributes and partial rotation.
     let rope = with_features(
@@ -2656,23 +2660,55 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                let per_expert_scale = match invocation.inputs.len() {
-                    6 => Some(self.input_tensor(invocation, 5)?),
-                    _ => None,
-                };
-                crate::operator_semantics::moe_experts_local_with(
-                    &h,
-                    &logits,
-                    [&gate, &up, &down],
-                    routing,
-                    first,
-                    count,
-                    crate::operator_semantics::MoeExpertOptions {
-                        activation,
-                        per_expert_scale: per_expert_scale.as_ref(),
-                    },
+                let sigmoid = crate::operator_semantics::sigmoid_routing_from_attributes(
+                    &invocation.attributes,
+                    routing.top_k,
                 )
-                .map_err(KernelError::from)?
+                .map_err(KernelError::from)?;
+                let (bias, per_expert_scale) = match (sigmoid.is_some(), invocation.inputs.len()) {
+                    (false, 5) => (None, None),
+                    (false, 6) => (None, Some(self.input_tensor(invocation, 5)?)),
+                    (true, 6) => (Some(self.input_tensor(invocation, 5)?), None),
+                    (true, 7) => (
+                        Some(self.input_tensor(invocation, 5)?),
+                        Some(self.input_tensor(invocation, 6)?),
+                    ),
+                    _ => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "moe-experts input count does not match routing".into(),
+                        });
+                    }
+                };
+                let options = crate::operator_semantics::MoeExpertOptions {
+                    activation,
+                    per_expert_scale: per_expert_scale.as_ref(),
+                };
+                let output = if let (Some(sigmoid), Some(bias)) = (sigmoid, bias.as_ref()) {
+                    crate::operator_semantics::moe_experts_local_sigmoid_with(
+                        &h,
+                        &logits,
+                        [&gate, &up, &down],
+                        routing,
+                        first,
+                        count,
+                        crate::operator_semantics::MoeSigmoidExpertOptions {
+                            experts: options,
+                            routing: sigmoid,
+                            selection_bias: bias,
+                        },
+                    )
+                } else {
+                    crate::operator_semantics::moe_experts_local_with(
+                        &h,
+                        &logits,
+                        [&gate, &up, &down],
+                        routing,
+                        first,
+                        count,
+                        options,
+                    )
+                };
+                output.map_err(KernelError::from)?
             }
             "row-scale" => {
                 let x = self.input_tensor(invocation, 0)?;

@@ -58,6 +58,40 @@ fn per_layer_rope_is_exposed_and_must_be_read() {
 }
 
 #[test]
+fn expert_normalization_distinguishes_top_one_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    for (normalization, expected) in [
+        (ExpertNormalization::Never, "never"),
+        (ExpertNormalization::MultipleExperts, "multiple-experts"),
+        (ExpertNormalization::Always, "always"),
+    ] {
+        let mut config = sample_config();
+        config.expert_routing = Some(ExpertRoutingConfig {
+            scoring: ExpertScoring::Sigmoid,
+            groups: None,
+            routed_scaling_factor: 2.45,
+            selection_bias: true,
+            normalization: Some(normalization),
+            shared_expert_gated: false,
+        });
+        capability.bind_config("a", config);
+        capability.call("a", "hidden-activation", &[]).unwrap();
+        capability.call("a", "expert-routing", &[]).unwrap();
+        assert_eq!(
+            capability.unread_declared_features("a"),
+            vec!["expert-normalization"]
+        );
+        assert_eq!(
+            capability.call("a", "expert-normalization", &[]).unwrap(),
+            vec![ComponentValue::Option(Some(Box::new(
+                ComponentValue::Enum(expected.into())
+            )))]
+        );
+        assert!(capability.unread_declared_features("a").is_empty());
+    }
+}
+
+#[test]
 fn unbound_instance_is_rejected() {
     let capability = ModelConfigCapability::new();
     let error = capability

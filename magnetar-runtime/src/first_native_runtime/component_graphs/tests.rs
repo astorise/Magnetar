@@ -826,6 +826,7 @@ fn a_component_that_never_reads_a_declared_1_7_0_feature_is_refused() {
             groups: None,
             routed_scaling_factor: 2.0,
             selection_bias: false,
+            normalization: None,
             shared_expert_gated: true,
         }),
         ..routed

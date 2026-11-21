@@ -349,6 +349,21 @@ the unrotated key for both prefill and cached decode.
 - **WHEN** graph production uses a Component that never reads that selection
 - **THEN** the Runtime refuses the graph rather than assuming all layers rotate
 
+### Requirement: Components Receive Expert Normalization Semantics
+
+`model-component-graph` version `1.10.0` SHALL expose an optional expert
+normalization mode through `model-config`. The modes distinguish no
+normalization, normalization only when multiple experts are selected, and
+normalization even for top-1. The Runtime SHALL refuse a graph built without
+reading a declared mode. The mode SHALL agree with the checkpoint's declared
+top-k normalization setting.
+
+#### Scenario: A declared top-1 mode reaches an older Component
+
+- **GIVEN** a checkpoint whose expert normalization mode is explicit
+- **WHEN** a Component builds a graph without reading that mode
+- **THEN** the Runtime refuses the graph rather than guessing its top-1 behavior
+
 ### Requirement: Production Graph Weights Come From The Artifact Inventory
 
 The Runtime SHALL validate a production Component's requested weight edges

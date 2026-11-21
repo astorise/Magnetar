@@ -318,6 +318,10 @@ pub const MOE_EXPERTS_ACTIVATION_FEATURE: &str = "moe-experts-activation";
 /// sixth input, `per_expert_scale`.
 pub const MOE_PER_EXPERT_SCALE_FEATURE: &str = "per-expert-scale";
 
+/// Kernel support for selection-biased sigmoid routing, optional grouping,
+/// selected-score normalization and routed scaling.
+pub const MOE_SIGMOID_ROUTING_FEATURE: &str = "sigmoid-expert-routing";
+
 /// Kernel feature an `attention` Kernel advertises when it honours
 /// `value_head_dimension`: V rows and the output are that wide per head
 /// while Q and K rows stay `head_dimension` wide (multi-head latent
@@ -432,7 +436,22 @@ pub fn required_kernel_features(
             if !silu {
                 features.push(MOE_EXPERTS_ACTIVATION_FEATURE);
             }
-            if input_count > 5 {
+            // Any routing attribute requires the feature, even malformed or
+            // partial declarations: an older Kernel must never silently
+            // execute such a node with its baseline softmax routing.
+            let sigmoid_form = [
+                "routing_scoring",
+                "routing_normalization",
+                "routing_scale",
+                "routing_group_count",
+                "routing_group_selected",
+            ]
+            .iter()
+            .any(|name| present(name));
+            if sigmoid_form {
+                features.push(MOE_SIGMOID_ROUTING_FEATURE);
+            }
+            if input_count > if sigmoid_form { 6 } else { 5 } {
                 features.push(MOE_PER_EXPERT_SCALE_FEATURE);
             }
         }
@@ -1293,11 +1312,16 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // `execute-and-cache-moe-experts` F02: routed mixture of experts.
         // Inputs `h [T, H]`, router logits `[T, E]`, stacked expert
         // weights `gate [H, E*I]`, `up [H, E*I]`, `down [I, E*H]`; output
-        // `[T, H]`. See [`moe_experts_reference`].
+        // `[T, H]`. The sigmoid form adds a `[E]` selection-only bias, then
+        // an optional `[E]` output scale. Its `routing_scoring` is
+        // `sigmoid`, `routing_normalization` is `never`, `multiple`, or
+        // `always`, and `routing_scale` is positive. Optional paired group
+        // attributes rank groups by the sum of the top two biased scores.
+        // A tie across a group or expert selection boundary is refused.
         (
             "moe-experts",
             OperatorFamily::LinearAlgebra,
-            6,
+            7,
             1,
             ShapeRule::Any,
         ),
@@ -1459,7 +1483,8 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ]);
         spec.attributes = default_attribute_schema(name);
         // Optional trailing inputs: a scale-less RMSNorm, the experts'
-        // optional per-expert output scale, and latent K and V's projections.
+        // optional selection bias and per-expert output scale, and latent K
+        // and V's projections.
         spec.min_inputs = match name {
             "rmsnorm" => 1,
             "moe-experts" => 5,
@@ -1747,6 +1772,26 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "normalize_top_k",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+            )
+            .with_rule(
+                "routing_scoring",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            .with_rule(
+                "routing_normalization",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            .with_rule(
+                "routing_scale",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "routing_group_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "routing_group_selected",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             )
             .with_rule(
                 "expert_first",

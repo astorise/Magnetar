@@ -549,6 +549,33 @@ fn required_kernel_features_name_only_non_baseline_forms() {
         ),
         vec![MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE]
     );
+    let sigmoid = attributes(&[(
+        "routing_scoring",
+        OperatorAttributeValue::String("sigmoid".into()),
+    )]);
+    assert_eq!(
+        required_kernel_features("moe-experts", &sigmoid, 6),
+        vec![MOE_SIGMOID_ROUTING_FEATURE]
+    );
+    assert_eq!(
+        required_kernel_features("moe-experts", &sigmoid, 7),
+        vec![MOE_SIGMOID_ROUTING_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE]
+    );
+    for name in [
+        "routing_scale",
+        "routing_group_count",
+        "routing_group_selected",
+        "routing_normalization",
+    ] {
+        assert_eq!(
+            required_kernel_features(
+                "moe-experts",
+                &attributes(&[(name, OperatorAttributeValue::Boolean(false))]),
+                5
+            ),
+            vec![MOE_SIGMOID_ROUTING_FEATURE]
+        );
+    }
 }
 
 /// `express-latent-attention-forms`: the value width, head-wise `concat`

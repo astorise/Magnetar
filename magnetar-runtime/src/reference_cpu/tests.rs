@@ -3120,6 +3120,83 @@ fn moe_experts_gelu_activation_and_per_expert_scale() {
     );
 }
 
+#[test]
+fn sigmoid_moe_kernel_uses_biased_group_selection_and_unbiased_weights() {
+    // The selected experts and weights below come from the independent
+    // Transformers GLM router fixture. Every expert applies silu(1) and
+    // produces its one-based index, making incorrect selection observable.
+    let inputs = vec![
+        reference_cpu_host_tensor([1, 1], [1.0]),
+        reference_cpu_host_tensor([1, 8], [2.0, -1.0, 0.2, -2.0, 1.0, 0.1, -1.0, 0.4]),
+        reference_cpu_host_tensor([1, 8], [1.0; 8]),
+        reference_cpu_host_tensor([1, 8], [1.0; 8]),
+        reference_cpu_host_tensor([1, 8], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+        reference_cpu_host_tensor([8], [-0.9, 0.4, 0.0, 0.0, 0.0, 0.3, 0.1, 0.2]),
+    ];
+    let attributes = vec![
+        ("experts", OperatorAttributeValue::Integer(8)),
+        ("top_k", OperatorAttributeValue::Integer(2)),
+        ("routing_scoring", text("sigmoid")),
+        ("routing_normalization", text("always")),
+        ("routing_scale", float(2.45)),
+        ("routing_group_count", OperatorAttributeValue::Integer(2)),
+        ("routing_group_selected", OperatorAttributeValue::Integer(1)),
+    ];
+    let actual = invoke_extended("moe-experts", &inputs, &[1, 1], &attributes).unwrap();
+    let silu_one = 1.0 / (1.0 + (-1.0_f32).exp());
+    let expected = silu_one * (6.0 * 1.144_644_5 + 8.0 * 1.305_355_7);
+    assert_all_close(&actual.data, &[expected]);
+
+    // The seventh input is a distinct per-expert output scale.
+    let mut scaled_inputs = inputs.clone();
+    scaled_inputs.push(reference_cpu_host_tensor(
+        [8],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5],
+    ));
+    let scaled = invoke_extended("moe-experts", &scaled_inputs, &[1, 1], &attributes).unwrap();
+    let expected_scaled = silu_one * (6.0 * 2.0 * 1.144_644_5 + 8.0 * 0.5 * 1.305_355_7);
+    assert_all_close(&scaled.data, &[expected_scaled]);
+
+    let mut wrong_bias = inputs.clone();
+    wrong_bias[5] = reference_cpu_host_tensor([1, 8], [0.0; 8]);
+    assert!(invoke_extended("moe-experts", &wrong_bias, &[1, 1], &attributes).is_none());
+    assert!(invoke_extended("moe-experts", &inputs[..5], &[1, 1], &attributes).is_none());
+    let mut invalid = attributes.clone();
+    invalid[6].1 = OperatorAttributeValue::Integer(3);
+    assert!(invoke_extended("moe-experts", &inputs, &[1, 1], &invalid).is_none());
+    invalid = attributes.clone();
+    invalid[3].1 = text("unknown");
+    assert!(invoke_extended("moe-experts", &inputs, &[1, 1], &invalid).is_none());
+}
+
+#[test]
+fn sigmoid_moe_kernel_distinguishes_glm_and_olala_top_one() {
+    let inputs = vec![
+        reference_cpu_host_tensor([1, 1], [1.0]),
+        reference_cpu_host_tensor([1, 4], [0.3, -0.5, 2.0, -0.2]),
+        reference_cpu_host_tensor([1, 4], [1.0; 4]),
+        reference_cpu_host_tensor([1, 4], [1.0; 4]),
+        reference_cpu_host_tensor([1, 4], [1.0, 2.0, 3.0, 4.0]),
+        reference_cpu_host_tensor([4], [0.0, 1.0, -1.0, 0.1]),
+    ];
+    let mut attributes = vec![
+        ("experts", OperatorAttributeValue::Integer(4)),
+        ("top_k", OperatorAttributeValue::Integer(1)),
+        ("routing_scoring", text("sigmoid")),
+        ("routing_normalization", text("always")),
+        ("routing_scale", float(2.45)),
+        ("routing_group_count", OperatorAttributeValue::Integer(2)),
+        ("routing_group_selected", OperatorAttributeValue::Integer(2)),
+    ];
+    let glm = invoke_extended("moe-experts", &inputs, &[1, 1], &attributes).unwrap();
+    let silu_one = 1.0 / (1.0 + (-1.0_f32).exp());
+    assert_all_close(&glm.data, &[silu_one * 2.0 * 2.45]);
+    attributes[3].1 = text("multiple");
+    attributes.truncate(5);
+    let olala = invoke_extended("moe-experts", &inputs, &[1, 1], &attributes).unwrap();
+    assert_all_close(&olala.data, &[silu_one * 2.0 * 0.924_974_7]);
+}
+
 // `cache-latent-attention-history`: absorbed decode attention over a
 // latent history equals the expanded form's attention.
 

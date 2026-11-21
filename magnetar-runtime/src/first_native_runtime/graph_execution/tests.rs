@@ -1075,6 +1075,127 @@ fn geodesic_residual_graph_preserves_parameters_and_original_layer_indices() {
     }
 }
 
+/// Grouped sigmoid routing crosses graph planning, capability admission and
+/// dispatch with the bias and the optional output scale in distinct slots.
+#[test]
+fn sigmoid_moe_graph_dispatches_bias_and_scale() {
+    for with_scale in [false, true] {
+        let tensors = vec![
+            ("h", HostTensor::new([1, 1], vec![1.0]).unwrap()),
+            (
+                "router",
+                HostTensor::new([1, 8], vec![2.0, -1.0, 0.2, -2.0, 1.0, 0.1, -1.0, 0.4]).unwrap(),
+            ),
+            ("gate", HostTensor::new([1, 8], vec![1.0; 8]).unwrap()),
+            ("up", HostTensor::new([1, 8], vec![1.0; 8]).unwrap()),
+            (
+                "down",
+                HostTensor::new([1, 8], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap(),
+            ),
+            (
+                "bias",
+                HostTensor::new([8], vec![-0.9, 0.4, 0.0, 0.0, 0.0, 0.3, 0.1, 0.2]).unwrap(),
+            ),
+            (
+                "scale",
+                HostTensor::new([8], vec![1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5]).unwrap(),
+            ),
+        ];
+        let mut builder = FormsGraph {
+            graph: ExecutionGraph::new(
+                ExecutionGraphId::new("sigmoid-moe"),
+                ExecutionGraphPhase::Prefill,
+            ),
+        };
+        let inputs: Vec<_> = tensors
+            .iter()
+            .take(if with_scale { 7 } else { 6 })
+            .map(|(name, tensor)| builder.input(name, &tensor.shape))
+            .collect();
+        let output = builder.node(
+            "experts",
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            vec![
+                ("experts", OperatorAttributeValue::Integer(8)),
+                ("top_k", OperatorAttributeValue::Integer(2)),
+                (
+                    "routing_scoring",
+                    OperatorAttributeValue::String("sigmoid".into()),
+                ),
+                (
+                    "routing_normalization",
+                    OperatorAttributeValue::String("always".into()),
+                ),
+                ("routing_scale", OperatorAttributeValue::Float(2.45)),
+                ("routing_group_count", OperatorAttributeValue::Integer(2)),
+                ("routing_group_selected", OperatorAttributeValue::Integer(1)),
+            ],
+            inputs,
+            &[1, 1],
+        );
+        let mut graph = builder.graph;
+        let mut edge = graph.edges.remove(&output).unwrap();
+        edge.id = TensorEdgeId::new("logits");
+        graph.edges.insert(edge.id.clone(), edge);
+        graph
+            .nodes
+            .get_mut(&ExecutionNodeId::new("experts"))
+            .unwrap()
+            .outputs = vec![TensorEdgeId::new("logits")];
+        let fixture = e2e_fixture().expect("fixture builds");
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            1,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        let bindings = tensors
+            .into_iter()
+            .take(if with_scale { 7 } else { 6 })
+            .map(|(name, value)| (TensorEdgeId::new(format!("input.{name}")), value))
+            .collect();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("sigmoid-moe").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let silu_one = 1.0 / (1.0 + (-1.0_f32).exp());
+        let expected = if with_scale {
+            silu_one * (6.0 * 2.0 * 1.144_644_5 + 8.0 * 0.5 * 1.305_355_7)
+        } else {
+            silu_one * (6.0 * 1.144_644_5 + 8.0 * 1.305_355_7)
+        };
+        assert_logits_close(
+            &outputs[&TensorEdgeId::new("logits")].data,
+            &[expected],
+            "sigmoid routing graph",
+        );
+    }
+}
+
 const FORMS_ROWS: u64 = 3;
 const FORMS_VOCAB: u64 = 5;
 const FORMS_HEADS: u64 = 2;
@@ -1461,6 +1582,7 @@ fn the_reference_cpu_declares_every_layered_form() {
         ("rope", ROPE_PARTIAL_ROTARY_FEATURE),
         ("moe-experts", MOE_EXPERTS_ACTIVATION_FEATURE),
         ("moe-experts", MOE_PER_EXPERT_SCALE_FEATURE),
+        ("moe-experts", MOE_SIGMOID_ROUTING_FEATURE),
         // `express-latent-attention-forms`.
         ("attention", ATTENTION_VALUE_HEAD_DIMENSION_FEATURE),
         ("concat", CONCAT_HEADS_FEATURE),

@@ -905,8 +905,20 @@ pub struct ExpertRoutingConfig {
     /// A per-expert bias added to the scores to choose the experts, not to
     /// weight them.
     pub selection_bias: bool,
+    /// Explicit selected-score normalization, including top-1 behavior.
+    /// `None` retains the older Component contract's behavior. A declared
+    /// value must be read through `expert-normalization` (model-config 1.10).
+    pub normalization: Option<ExpertNormalization>,
     /// Whether the shared expert's output passes through a sigmoid gate.
     pub shared_expert_gated: bool,
+}
+
+/// When the selected expert scores are renormalized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpertNormalization {
+    Never,
+    MultipleExperts,
+    Always,
 }
 
 impl ModelArchitectureConfig {
@@ -1067,12 +1079,19 @@ impl ModelArchitectureConfig {
                     routing.routed_scaling_factor
                 ));
             }
+            if let Some(normalization) = routing.normalization
+                && (normalization != ExpertNormalization::Never) != moe.normalize_top_k
+            {
+                return Err("expert normalization conflicts with normalize_top_k".into());
+            }
             if let Some(groups) = &routing.groups {
                 let groups_ok = groups.count > 0
                     && moe.experts.is_multiple_of(groups.count)
                     && groups.per_token > 0
                     && groups.per_token <= groups.count
-                    && groups.per_token * (moe.experts / groups.count) >= moe.experts_per_token;
+                    && groups.per_token * (moe.experts / groups.count) >= moe.experts_per_token
+                    && (groups.score != ExpertGroupScore::TopTwoSum
+                        || moe.experts / groups.count >= 2);
                 if !groups_ok {
                     return Err(format!(
                         "{} experts cannot route {} per token from {} of {} groups",

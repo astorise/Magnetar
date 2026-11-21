@@ -9,6 +9,12 @@
 
 use crate::tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
 
+mod sigmoid_routing;
+pub use sigmoid_routing::{
+    ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
+    sigmoid_routing_from_attributes,
+};
+
 /// The optimized CPU Provider (`execute-quantized-weights-on-cpu`): like
 /// Reference CPU it executes in host memory.
 pub const NATIVE_CPU_PROVIDER_NAME: &str = "magnetar:provider/cpu-native";
@@ -180,11 +186,55 @@ pub struct MoeExpertOptions<'a> {
 pub fn moe_experts_local_with(
     h: &HostTensor,
     logits: &HostTensor,
+    weights: [&HostTensor; 3],
+    routing: MoeRouting,
+    first: u64,
+    count: u64,
+    options: MoeExpertOptions<'_>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    moe_experts_local_impl(h, logits, weights, routing, first, count, options, None)
+}
+
+/// The additional operands and options for selection-biased sigmoid routing.
+#[derive(Clone, Copy, Debug)]
+pub struct MoeSigmoidExpertOptions<'a> {
+    pub experts: MoeExpertOptions<'a>,
+    pub routing: SigmoidRouting,
+    pub selection_bias: &'a HostTensor,
+}
+
+/// [`moe_experts_local_with`] with selection-biased sigmoid routing.
+pub fn moe_experts_local_sigmoid_with(
+    h: &HostTensor,
+    logits: &HostTensor,
+    weights: [&HostTensor; 3],
+    routing: MoeRouting,
+    first: u64,
+    count: u64,
+    options: MoeSigmoidExpertOptions<'_>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    moe_experts_local_impl(
+        h,
+        logits,
+        weights,
+        routing,
+        first,
+        count,
+        options.experts,
+        Some((options.routing, options.selection_bias)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_experts_local_impl(
+    h: &HostTensor,
+    logits: &HostTensor,
     [gate, up, down]: [&HostTensor; 3],
     routing: MoeRouting,
     first: u64,
     count: u64,
     options: MoeExpertOptions<'_>,
+    sigmoid_routing: Option<(SigmoidRouting, &HostTensor)>,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let MoeRouting {
         experts,
@@ -234,6 +284,16 @@ pub fn moe_experts_local_with(
             scale.shape
         )));
     }
+    if let Some((sigmoid, bias)) = sigmoid_routing
+        && (sigmoid.top_k as u64 != top_k
+            || bias.shape != [experts]
+            || bias.data.len() as u64 != experts)
+    {
+        return Err(shape_error(format!(
+            "moe-experts expects a selection bias of [{experts}] and matching top-k, got {:?}",
+            bias.shape
+        )));
+    }
     let (first, count) = (first as usize, count as usize);
     let (hidden, intermediate) = (hidden as usize, intermediate as usize);
     let (gate_cols, down_cols) = (gate_cols as usize, down_cols as usize);
@@ -242,7 +302,11 @@ pub fn moe_experts_local_with(
     for token in 0..tokens as usize {
         let x = &h.data[token * hidden..(token + 1) * hidden];
         let row_logits = &logits.data[token * experts as usize..(token + 1) * experts as usize];
-        for (expert, weight) in moe_route(row_logits, top_k as usize, normalize) {
+        let selected = match sigmoid_routing {
+            Some((sigmoid, bias)) => sigmoid_moe_route(row_logits, &bias.data, sigmoid)?,
+            None => moe_route(row_logits, top_k as usize, normalize),
+        };
+        for (expert, weight) in selected {
             let weight = weight
                 * options
                     .per_expert_scale

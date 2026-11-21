@@ -637,16 +637,28 @@ pub(super) fn dispatch_first_native_graph_node(
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "moe-experts" => {
-            // A sixth input scales each expert's output
-            // (`dispatch-layered-model-forms`).
-            if !(5..=6).contains(&inputs.len()) {
+            // The sigmoid form adds a selection bias before the optional
+            // per-expert scale. The baseline sixth input remains the scale.
+            let sigmoid_form = matches!(
+                node.attributes.get("routing_scoring"),
+                Some(OperatorAttributeValue::String(scoring)) if scoring == "sigmoid"
+            );
+            let valid_inputs = if sigmoid_form { 6..=7 } else { 5..=6 };
+            if !valid_inputs.contains(&inputs.len()) {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 5 or 6 moe-experts inputs"),
+                    reason: format!(
+                        "graph node '{node_id}' has the wrong number of moe-experts inputs"
+                    ),
                 });
             }
             let (rows, cols) = inputs[0].rows_cols()?;
             let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, cols]);
-            let resources = ["h", "logits", "gate", "up", "down", "per_expert_scale"]
+            let mut roles = vec!["h", "logits", "gate", "up", "down"];
+            if sigmoid_form {
+                roles.push("selection_bias");
+            }
+            roles.push("per_expert_scale");
+            let resources = roles
                 .into_iter()
                 .zip(inputs)
                 .map(|(role, value)| node_input_resource(node_id, role, value))
