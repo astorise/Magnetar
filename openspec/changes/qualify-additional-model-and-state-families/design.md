@@ -175,6 +175,22 @@ its local radius is `local_attention / 2` at the pinned Transformers profile.
 This primitive does not by itself implement an encoder, padding-aware batching
 or Laya's learned decision head. Unsupported Providers do not advertise it.
 
+The f32 graph profile for an encoder also needs three additive, independently
+negotiated operators. `affine-layernorm@1` accepts `[T,H]` input, `[H]` scale
+and an optional trailing `[H]` bias, with a required positive finite `epsilon`;
+it returns `[T,H]` using population variance and f32 accumulation. The
+separate `gelu-exact@1` uses the erf form of GELU and preserves its input
+shape, avoiding the existing tanh-approximate `gelu@1` semantics. CPU
+implementations may numerically approximate erf but must match the independent
+f32 reference within the declared test tolerance; they must not substitute
+the distinct tanh GELU formula.
+`slice-last@1` accepts `[T,H]`, nonnegative integer `start`, and positive
+integer `width`, and returns `[T,width]` from the specified contiguous column
+range. All three reject malformed, non-finite or unsupported inputs, and no
+Provider advertises them without implementing their stated semantics. These
+operators enable exact graph construction; they do not themselves supply an
+encoder Component or a decision API.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

@@ -1379,6 +1379,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::SameShape,
         ),
         (
+            "affine-layernorm",
+            OperatorFamily::Normalization,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        (
             "rope",
             OperatorFamily::PositionEncoding,
             1,
@@ -1426,6 +1433,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::SameShape,
         ),
         (
+            "gelu-exact",
+            OperatorFamily::Activation,
+            1,
+            1,
+            ShapeRule::SameShape,
+        ),
+        (
             "silu",
             OperatorFamily::Activation,
             1,
@@ -1447,6 +1461,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::SameShapeOrScalar,
         ),
         ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
+        ("slice-last", OperatorFamily::Tensor, 1, 1, ShapeRule::Any),
         // `append-kv-history-in-place`: writes `rows` into `store` at
         // `row_offset`, in place; the output resource is the store itself.
         ("kv-write", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1534,6 +1549,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             "rmsnorm" => 1,
             "moe-experts" => 5,
             "mamba2-mixer" => 10,
+            "affine-layernorm" => 2,
             "attention" => 3,
             _ => inputs,
         };
@@ -1570,6 +1586,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 OperatorDTypeContract::new(TensorRole::Accumulation, floats),
             ];
         }
+        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last") {
+            spec.dtype_contracts = vec![
+                OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Accumulation, [ComputeDType::Float32]),
+            ];
+        }
         if name == "geodesic-residual" {
             // Only the f32 profile is qualified; other output dtypes need
             // independently validated rounding and conversion semantics.
@@ -1586,6 +1609,19 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "affine-layernorm" => OperatorAttributeSchema::default().with_rule(
+            "epsilon",
+            OperatorAttributeRule::required(OperatorAttributeKind::Float),
+        ),
+        "slice-last" => OperatorAttributeSchema::default()
+            .with_rule(
+                "start",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "width",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            ),
         "mamba2-mixer" => OperatorAttributeSchema::default()
             .with_rule(
                 "heads",

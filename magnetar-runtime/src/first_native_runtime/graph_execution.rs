@@ -620,6 +620,84 @@ pub(super) fn dispatch_first_native_graph_node(
                 node.attributes.clone(),
             )
         }
+        "affine-layernorm" => {
+            if !(2..=3).contains(&inputs.len()) {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' expects input, scale and optional bias"
+                    ),
+                });
+            }
+            let shape = inputs[0].shape().to_vec();
+            if let Some(graph) = ctx.graph.as_ref()
+                && graph
+                    .graph()
+                    .edges
+                    .get(&node.outputs[0])
+                    .is_none_or(|edge| edge.descriptor.shape.dimensions != shape)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' has an invalid affine-layernorm output shape"
+                    ),
+                });
+            }
+            let resources = inputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| node_input_resource(node_id, &format!("input{index}"), value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("affine-layernorm", OperatorFamily::Normalization),
+                resources,
+                f32_tensor_descriptor_from_shape(&shape),
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "slice-last" => {
+            if inputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects one slice input"),
+                });
+            }
+            let input = inputs.remove(0);
+            let (rows, columns) = input.rows_cols()?;
+            let (start, width) = crate::operator_semantics::slice_last_attributes(&node.attributes)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            if rows == 0 || start.checked_add(width).is_none_or(|end| end > columns) {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has an invalid slice range"),
+                });
+            }
+            let shape = [rows, width];
+            if let Some(graph) = ctx.graph.as_ref()
+                && graph
+                    .graph()
+                    .edges
+                    .get(&node.outputs[0])
+                    .is_none_or(|edge| edge.descriptor.shape.dimensions != shape)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has an invalid slice output shape"),
+                });
+            }
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("slice-last", OperatorFamily::Tensor),
+                vec![node_input_resource(node_id, "input", input)],
+                f32_tensor_descriptor_from_shape(&shape),
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "encoder-attention" => {
             if inputs.len() != 4 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -837,7 +915,7 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
-        "gelu" => {
+        "gelu" | "gelu-exact" => {
             if inputs.len() != 1 {
                 return Err(InferenceApiError::GraphPlanningFailed {
                     reason: format!("graph node '{node_id}' expects 1 gelu input"),
@@ -848,7 +926,7 @@ pub(super) fn dispatch_first_native_graph_node(
             dispatch_qwen_unary(
                 ctx,
                 node_id,
-                "gelu",
+                node.operator.name(),
                 OperatorFamily::Activation,
                 input,
                 node.attributes.clone(),
@@ -1473,11 +1551,14 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "silu-mul"
                 | "moe-experts"
                 | "mamba2-mixer"
+                | "affine-layernorm"
+                | "slice-last"
                 | "row-scale"
                 | "activation"
                 | "attention"
                 | "encoder-attention"
                 | "gelu"
+                | "gelu-exact"
                 | "silu"
                 | "add"
                 | "mul"
@@ -1543,10 +1624,13 @@ pub(super) fn execute_first_native_graph_nodes(
             last_row_only(&*dispatch_ctx.provider, &mut inputs[0], row)?;
         }
         // Host-visible inputs lose their source resource IDs when converted
-        // to NodeValue::Host. Check the original graph bindings before any
-        // Mamba output admission, so an edge-derived output ID cannot
-        // overwrite a live graph input, intermediate, or model weight.
-        if node.operator.name() == "mamba2-mixer" {
+        // to NodeValue::Host. Check the original graph bindings before
+        // admitting these pure operators' outputs, so an edge-derived ID
+        // cannot overwrite a live graph input, intermediate or model weight.
+        if matches!(
+            node.operator.name(),
+            "mamba2-mixer" | "affine-layernorm" | "gelu-exact" | "slice-last"
+        ) {
             for edge_id in &node.outputs {
                 let output_id = dispatch_ctx.edge_resource(edge_id.as_str());
                 if bindings.values().any(|(id, _)| id == &output_id)
@@ -2316,6 +2400,10 @@ pub(super) fn materialize_first_native_graph_bindings(
 }
 
 #[cfg(test)]
+mod encoder_ops_tests;
+#[cfg(test)]
 mod mamba2_tests;
+#[cfg(test)]
+mod modernbert_graph_tests;
 #[cfg(test)]
 mod tests;
