@@ -1584,6 +1584,70 @@ pub(super) fn dispatch_mamba2_mixer(
     result
 }
 
+/// Admit all outputs of the pure Mamba-3 recurrence atomically and roll back
+/// each admission if a later allocation or the Kernel submission fails.
+pub(super) fn dispatch_mamba3_mimo(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    inputs: Vec<NodeValue>,
+    targets: [OutputTarget; 5],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
+    let descriptors =
+        [2, 8, 9, 10, 11].map(|index| f32_tensor_descriptor_from_shape(inputs[index].shape()));
+    let resources: Vec<_> = inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| node_input_resource(operation_id, &format!("input{index}"), value))
+        .collect();
+    for (index, target) in targets.iter().enumerate() {
+        let aliases_input = resources.iter().any(|resource| match resource {
+            NodeInputResource::Fresh(id, ..) | NodeInputResource::Resident(id, ..) => {
+                id == &target.0
+            }
+        });
+        if aliases_input || targets[..index].iter().any(|other| other.0 == target.0) {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: format!(
+                    "graph node '{operation_id}' aliases a Mamba-3 output with an input or another output"
+                ),
+            });
+        }
+    }
+    let mut outputs = Vec::with_capacity(5);
+    for (index, (target, descriptor)) in targets.into_iter().zip(descriptors).enumerate() {
+        match resolve_output_target(
+            ctx,
+            &format!("{operation_id}.output{index}"),
+            descriptor,
+            Some(target),
+        ) {
+            Ok(output) => outputs.push(output),
+            Err(error) => {
+                for (id, _) in &outputs {
+                    rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), id);
+                }
+                return Err(error);
+            }
+        }
+    }
+    let admitted: Vec<_> = outputs.iter().map(|(id, _)| id.clone()).collect();
+    let result = dispatch_reference_cpu_operator_multi(
+        ctx,
+        operation_id,
+        dispatch_operator_id("mamba3-mimo", OperatorFamily::LinearAlgebra),
+        resources,
+        outputs,
+        attributes,
+    );
+    if result.is_err() {
+        for id in &admitted {
+            rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), id);
+        }
+    }
+    result
+}
+
 /// Both real Kernels behind this Operator (`providers/cpu::rmsnorm`,
 /// `providers/cuda::CudaKernels::rmsnorm`) derive `cols` from `input`'s own
 /// shape and accept a `[cols]`-shaped `weight` directly, broadcasting it

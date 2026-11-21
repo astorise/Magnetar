@@ -12,6 +12,8 @@ use crate::tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
 mod encoder_attention;
 mod encoder_ops;
 mod mamba2_mixer;
+mod mamba3_core;
+mod mamba3_mimo;
 mod sigmoid_routing;
 pub use encoder_attention::{
     EncoderAttention, encoder_attention, encoder_attention_from_attributes,
@@ -20,6 +22,8 @@ pub use encoder_ops::{
     affine_layernorm, affine_layernorm_epsilon, gelu_exact, slice_last, slice_last_attributes,
 };
 pub use mamba2_mixer::{Mamba2Mixer, mamba2_mixer, mamba2_mixer_from_attributes};
+pub use mamba3_core::Geometry as Mamba3Mimo;
+pub use mamba3_mimo::{mamba3_mimo, mamba3_mimo_from_attributes};
 pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,

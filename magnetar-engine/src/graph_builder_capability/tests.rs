@@ -1297,6 +1297,112 @@ fn multiple_output_nodes_preserve_each_edge_and_catalog_arity() {
 }
 
 #[test]
+fn builder_accepts_mamba3_eighteen_inputs_and_five_outputs() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("mamba3", context());
+    capability
+        .call(
+            "mamba3",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    let input_shapes = [
+        vec![1, 1, 1, 2],
+        vec![1, 1, 1, 2],
+        vec![1, 1, 1],
+        vec![1, 1, 1],
+        vec![1, 1],
+        vec![1, 1],
+        vec![1, 1],
+        vec![1, 1, 1],
+        vec![1, 1],
+        vec![1, 1, 2],
+        vec![1, 1, 2],
+        vec![1, 1],
+        vec![1, 1, 2],
+        vec![1, 1, 2],
+        vec![1, 1, 1],
+        vec![1, 1, 1],
+        vec![1, 1, 1],
+        vec![1],
+    ];
+    let mut inputs = Vec::new();
+    for (index, dimensions) in input_shapes.into_iter().enumerate() {
+        let result = capability
+            .call(
+                "mamba3",
+                "declare-input",
+                &[
+                    ComponentValue::String(format!("arg{index}")),
+                    shape(dimensions),
+                ],
+            )
+            .unwrap();
+        inputs.push(result[0].clone());
+    }
+    let attributes = [
+        ("heads", 1),
+        ("groups", 1),
+        ("rank", 1),
+        ("head_dim", 1),
+        ("state_dim", 2),
+        ("angles", 1),
+    ]
+    .into_iter()
+    .map(|(name, value)| {
+        ComponentValue::Record(vec![
+            ("name".into(), ComponentValue::String(name.into())),
+            (
+                "value".into(),
+                ComponentValue::Variant(
+                    "integer".into(),
+                    Some(Box::new(ComponentValue::S64(value))),
+                ),
+            ),
+        ])
+    })
+    .collect();
+    let result = capability
+        .call(
+            "mamba3",
+            "add-node-outputs",
+            &[
+                ComponentValue::String("mimo".into()),
+                ComponentValue::String("mamba3-mimo".into()),
+                ComponentValue::String("LinearAlgebra".into()),
+                ComponentValue::List(attributes),
+                ComponentValue::List(inputs),
+                ComponentValue::List(vec![
+                    shape(vec![1, 1, 1]),
+                    shape(vec![1, 1]),
+                    shape(vec![1, 1, 2]),
+                    shape(vec![1, 1, 2]),
+                    shape(vec![1, 1]),
+                ]),
+            ],
+        )
+        .unwrap();
+    let [ComponentValue::List(outputs)] = result.as_slice() else {
+        panic!("expected five outputs")
+    };
+    assert_eq!(outputs.len(), 5);
+    let finished = capability
+        .call("mamba3", "finish-graph", &[outputs[0].clone()])
+        .unwrap();
+    let [ComponentValue::String(handle)] = finished.as_slice() else {
+        panic!("expected graph handle")
+    };
+    let graph = capability.take_graph("mamba3", handle).unwrap();
+    assert_eq!(graph.nodes[&ExecutionNodeId::new("mimo")].outputs.len(), 5);
+    graph.validate(&initial_operator_catalog()).unwrap();
+}
+
+#[test]
 fn multiple_output_builder_rejects_empty_excess_and_colliding_edges() {
     let capability = GraphBuilderCapability::new();
     capability.prepare_session("multi-bad", context());

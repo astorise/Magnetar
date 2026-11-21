@@ -1361,6 +1361,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             3,
             ShapeRule::Any,
         ),
+        // Preprocessed Mamba-3 sequence and four independent next states.
+        (
+            "mamba3-mimo",
+            OperatorFamily::LinearAlgebra,
+            18,
+            5,
+            ShapeRule::Any,
+        ),
         // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
         ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1569,7 +1577,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         if name == "encoder-attention" {
             spec.memory = OperatorMemoryBehavior::pure().with_workspace();
         }
-        if matches!(name, "encoder-attention" | "mamba2-mixer") {
+        if matches!(name, "encoder-attention" | "mamba2-mixer" | "mamba3-mimo") {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
                 OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
@@ -1620,6 +1628,31 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             )
             .with_rule(
                 "width",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            ),
+        "mamba3-mimo" => OperatorAttributeSchema::default()
+            .with_rule(
+                "heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "groups",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "rank",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "state_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "angles",
                 OperatorAttributeRule::required(OperatorAttributeKind::Integer),
             ),
         "mamba2-mixer" => OperatorAttributeSchema::default()

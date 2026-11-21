@@ -120,8 +120,21 @@ separate state tensors. The pure step preserves prior state on error and
 accepts explicit grouped Q/K, MIMO projections, decay, dt and trap values.
 Synthetic tests compare every output and state with the pinned upstream
 PyTorch prefill and cached-step implementations, including chunk continuation
-and zero-state reset. This reference does not implement the layer's learned
-projections, expose a graph operator, or provide Runtime-managed state.
+and zero-state reset. This standalone reference does not implement the
+layer's learned projections or provide Runtime-managed state.
+
+The additive portable `mamba3-mimo@1` operator covers the same f32,
+single-sequence preprocessed recurrence without assuming a model family.
+Its 18 inputs are Q/K `[T,R,G,N]`, input/gate `[T,H,P]`, decay/dt/trap
+`[T,H]`, angle projection `[T,H,A]`, the four prior states (angle `[H,A]`,
+SSM `[H,P,N]`, key `[R,H,N]`, input `[H,P]`), Q/K biases `[R,H,N]`,
+three MIMO projections `[R,H,P]`, and skip `[H]`. Its five independent
+outputs are `[T,H,P]` and the four next states with matching shapes. Positive
+`H,G,R,P,N,A`, `H % G == 0`, even `N`, and `A <= N/2` are required; dt is
+positive, preprocessed decay nonpositive and trap in `[0,1]`. Inputs and
+outputs may not alias, every tensor must be finite, and unsupported dtypes,
+geometries or missing Kernel forms fail closed. This pure operator does not
+itself allocate, reset, commit or isolate a session's recurrent state.
 
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
