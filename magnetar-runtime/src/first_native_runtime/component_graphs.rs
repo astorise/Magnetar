@@ -829,7 +829,7 @@ pub(super) fn build_first_native_graphs_with_runtime(
 
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;
-        validate_recurrent_graph_pair(&prefill, &decode)?;
+        validate_recurrent_graph_pair(&prefill, &decode, config.num_hidden_layers)?;
         validate_rope_frequency_scaling(&prefill, config)?;
         validate_rope_frequency_scaling(&decode, config)?;
         Ok(FirstNativeComponentGraphs {
@@ -852,6 +852,7 @@ pub(super) fn build_first_native_graphs_with_runtime(
 fn validate_recurrent_graph_pair(
     prefill: &ExecutionGraph,
     decode: &ExecutionGraph,
+    layer_count: u32,
 ) -> Result<(), E2eConformanceError> {
     fn inputs(
         graph: &ExecutionGraph,
@@ -870,10 +871,39 @@ fn validate_recurrent_graph_pair(
     if prefill.phase != ExecutionGraphPhase::Prefill
         || decode.phase != ExecutionGraphPhase::Decode
         || inputs(prefill) != inputs(decode)
+        || prefill.edges.values().any(|edge| {
+            edge.recurrent_state
+                .as_ref()
+                .is_some_and(|state| state.layer >= layer_count)
+        })
     {
         return Err(E2eConformanceError::ModelComponentFailed {
             reason: "prefill and decode graphs have incompatible recurrent state schemas or phases"
                 .into(),
+        });
+    }
+    Ok(())
+}
+
+/// A segment may only read or produce state belonging to its own layers.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_segment_recurrent_scope(
+    graph: &ExecutionGraph,
+    phase: ExecutionGraphPhase,
+    start: u32,
+    end: u32,
+) -> Result<(), E2eConformanceError> {
+    if graph.phase != phase
+        || graph.edges.values().any(|edge| {
+            edge.recurrent_state
+                .as_ref()
+                .is_some_and(|state| state.layer < start || state.layer >= end)
+        })
+    {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason:
+                "segment graph has an incompatible phase or recurrent state outside its layer range"
+                    .into(),
         });
     }
     Ok(())
@@ -991,6 +1021,12 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
         )?;
 
         validate_first_scope_graph(&segment)?;
+        validate_segment_recurrent_scope(
+            &segment,
+            ExecutionGraphPhase::Prefill,
+            start_layer,
+            end_layer,
+        )?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
         Ok(segment)
     })();
@@ -1113,6 +1149,12 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
         )?;
 
         validate_first_scope_graph(&segment)?;
+        validate_segment_recurrent_scope(
+            &segment,
+            ExecutionGraphPhase::Decode,
+            start_layer,
+            end_layer,
+        )?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
         Ok(segment)
     })();

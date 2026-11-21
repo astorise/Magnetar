@@ -196,7 +196,9 @@ older Components continue linking through their original versions. Planning and
 execution explicitly reject these graphs while lifecycle support is absent.
 Before a decoder graph pair is returned, the Runtime also checks that prefill
 and decode declare the same state identities, layers, slots, compatibility
-keys and tensor descriptors; mismatched phases or schemas are rejected.
+keys and tensor descriptors; mismatched phases, schemas or out-of-range layers
+are rejected. Segment graphs may only read or produce recurrent states in
+their own declared layer interval.
 
 For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and

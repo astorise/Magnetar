@@ -87,7 +87,7 @@ fn decoder_graph_pair_requires_matching_recurrent_schemas() {
     for graph in [&prefill, &decode] {
         graph.validate(&initial_operator_catalog()).unwrap();
     }
-    validate_recurrent_graph_pair(&prefill, &decode).unwrap();
+    validate_recurrent_graph_pair(&prefill, &decode, 1).unwrap();
     for difference in ["shape", "slot", "compatibility", "missing"] {
         let mut incompatible = decode.clone();
         for edge in incompatible.edges.values_mut() {
@@ -108,11 +108,17 @@ fn decoder_graph_pair_requires_matching_recurrent_schemas() {
         }
         incompatible.validate(&initial_operator_catalog()).unwrap();
         assert!(
-            validate_recurrent_graph_pair(&prefill, &incompatible).is_err(),
+            validate_recurrent_graph_pair(&prefill, &incompatible, 1).is_err(),
             "accepted incompatible {difference}"
         );
     }
-    assert!(validate_recurrent_graph_pair(&decode, &prefill).is_err());
+    assert!(validate_recurrent_graph_pair(&decode, &prefill, 1).is_err());
+    assert!(validate_recurrent_graph_pair(&prefill, &decode, 0).is_err());
+    assert!(validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Prefill, 0, 1).is_ok());
+    assert!(
+        validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Prefill, 1, 2).is_err()
+    );
+    assert!(validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Decode, 0, 1).is_err());
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
