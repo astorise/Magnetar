@@ -16,6 +16,7 @@ mod mamba3_core;
 mod mamba3_mimo;
 mod mamba3_mixer;
 mod sigmoid_routing;
+mod token_shift;
 pub use encoder_attention::{
     EncoderAttention, encoder_attention, encoder_attention_from_attributes,
 };
@@ -30,6 +31,7 @@ pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,
 };
+pub use token_shift::token_shift;
 
 /// The optimized CPU Provider (`execute-quantized-weights-on-cpu`): like
 /// Reference CPU it executes in host memory.

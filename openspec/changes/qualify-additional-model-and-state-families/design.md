@@ -148,6 +148,16 @@ projection forms, post-gate normalization or auxiliary linear branches are
 not assumed. As with `mamba3-mimo`, explicit state tensors do not establish
 Runtime-managed session state.
 
+The portable `token-shift@1` operator expresses the previous-token mixing
+used by the pinned Olala attention profile without equating it to KV history.
+Its f32 inputs are raw values `[T,H,D]`, gate logits `[T,H]`, explicit
+document-start flags `[T]` (exactly zero or one), and the previous raw token
+`[H,D]`. The first output is `sigmoid(logit) * previous + (1-sigmoid(logit))
+* current`; at a document start it is exactly the current value. The second
+output is the last **raw**, not mixed, token. Both are fresh allocations.
+This operator can be used independently for keys and values, but does not
+manage their session state, KV attention history or a full attention layer.
+
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
 `recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.

@@ -717,6 +717,41 @@ pub(super) fn dispatch_first_native_graph_node(
                 output_shape,
             )
         }
+        "token-shift" => {
+            if inputs.len() != 4 || node.outputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 4 inputs and 2 outputs"),
+                });
+            }
+            if let Some(graph) = ctx.graph.as_ref() {
+                for (edge_id, input_index) in node.outputs.iter().zip([0, 3]) {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != inputs[input_index].shape() {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' has an output with the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let state_target = (
+                ctx.edge_resource(node.outputs[1].as_str()),
+                resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                ctx.output_owner(kv_cache_id),
+            );
+            dispatch_token_shift(
+                ctx,
+                node_id,
+                inputs,
+                [output_target, state_target],
+                node.attributes.clone(),
+            )
+        }
         "affine-layernorm" => {
             if !(2..=3).contains(&inputs.len()) {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1650,6 +1685,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "mamba2-mixer"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
+                | "token-shift"
                 | "affine-layernorm"
                 | "slice-last"
                 | "row-scale"
@@ -1731,6 +1767,7 @@ pub(super) fn execute_first_native_graph_nodes(
             "mamba2-mixer"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
+                | "token-shift"
                 | "affine-layernorm"
                 | "gelu-exact"
                 | "slice-last"
@@ -2515,3 +2552,5 @@ mod mamba3_tests;
 mod modernbert_graph_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod token_shift_tests;

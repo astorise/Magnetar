@@ -1377,6 +1377,8 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             5,
             ShapeRule::Any,
         ),
+        // Gate each token against the preceding raw value and retain it.
+        ("token-shift", OperatorFamily::Tensor, 4, 2, ShapeRule::Any),
         // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
         ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1587,7 +1589,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         }
         if matches!(
             name,
-            "encoder-attention" | "mamba2-mixer" | "mamba3-mimo" | "mamba3-mixer"
+            "encoder-attention" | "mamba2-mixer" | "mamba3-mimo" | "mamba3-mixer" | "token-shift"
         ) {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),

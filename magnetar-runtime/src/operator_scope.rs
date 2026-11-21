@@ -464,7 +464,7 @@ fn validate_first_scope_attributes(
     }
 }
 
-const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 44] = [
+const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 45] = [
     required_now("embedding", OperatorFamily::Tensor, true),
     required_now("matmul", OperatorFamily::LinearAlgebra, true),
     required_now("rmsnorm", OperatorFamily::Normalization, true),
@@ -484,6 +484,7 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 44] = [
     first_decoder_optional("mamba2-mixer", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba3-mimo", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba3-mixer", OperatorFamily::LinearAlgebra),
+    first_decoder_optional("token-shift", OperatorFamily::Tensor),
     first_decoder_optional("affine-layernorm", OperatorFamily::Normalization),
     first_decoder_optional("gelu-exact", OperatorFamily::Activation),
     first_decoder_optional("slice-last", OperatorFamily::Tensor),

@@ -1695,6 +1695,68 @@ fn dispatch_mamba3_multi(
     result
 }
 
+/// Admit both pure token-shift outputs together and discard them on failure.
+pub(super) fn dispatch_token_shift(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    inputs: Vec<NodeValue>,
+    targets: [OutputTarget; 2],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
+    let descriptors = [0, 3].map(|index| f32_tensor_descriptor_from_shape(inputs[index].shape()));
+    let resources: Vec<_> = inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| node_input_resource(operation_id, &format!("input{index}"), value))
+        .collect();
+    for (index, target) in targets.iter().enumerate() {
+        let aliases_input = resources.iter().any(|resource| match resource {
+            NodeInputResource::Fresh(id, ..) | NodeInputResource::Resident(id, ..) => {
+                id == &target.0
+            }
+        });
+        if aliases_input || targets[..index].iter().any(|other| other.0 == target.0) {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: format!(
+                    "graph node '{operation_id}' aliases a token-shift output with an input or another output"
+                ),
+            });
+        }
+    }
+    let mut outputs = Vec::with_capacity(2);
+    for (index, (target, descriptor)) in targets.into_iter().zip(descriptors).enumerate() {
+        match resolve_output_target(
+            ctx,
+            &format!("{operation_id}.output{index}"),
+            descriptor,
+            Some(target),
+        ) {
+            Ok(output) => outputs.push(output),
+            Err(error) => {
+                for (id, _) in &outputs {
+                    rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), id);
+                }
+                return Err(error);
+            }
+        }
+    }
+    let admitted: Vec<_> = outputs.iter().map(|(id, _)| id.clone()).collect();
+    let result = dispatch_reference_cpu_operator_multi(
+        ctx,
+        operation_id,
+        dispatch_operator_id("token-shift", OperatorFamily::Tensor),
+        resources,
+        outputs,
+        attributes,
+    );
+    if result.is_err() {
+        for id in &admitted {
+            rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), id);
+        }
+    }
+    result
+}
+
 /// Both real Kernels behind this Operator (`providers/cpu::rmsnorm`,
 /// `providers/cuda::CudaKernels::rmsnorm`) derive `cols` from `input`'s own
 /// shape and accept a `[cols]`-shaped `weight` directly, broadcasting it
