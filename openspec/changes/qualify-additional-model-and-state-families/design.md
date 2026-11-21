@@ -241,6 +241,14 @@ forms or missing Kernel support fail closed. Explicit state inputs/outputs are
 not Runtime-managed session state; graph-level recurrent execution stays
 disabled until the transactional lifecycle is implemented and tested.
 
+The Nemotron component also derives an invocation plan for the pinned Nano
+mixer geometry. Layer-0 checkpoint tensor names, shapes and dtypes were checked
+against the first real Safetensors shard header, including BF16 matrices and
+F32 A-log/D vectors. The source configuration's `time_step_min` and
+`time_step_max` initialize parameters; its default inference limit is zero to
+unbounded. This is a shape and conversion plan for the f32 operator, not
+checkpoint loading, BF16 numerical qualification or recurrent execution.
+
 ### Experimental masked encoder attention
 
 ModernBERT's attention is bidirectional; its local window is symmetric and
