@@ -989,8 +989,8 @@ fn first_native_dispatch_source_contains_no_provider_downcast() {
 /// `FirstNativeChatSession::turn`, and -- since
 /// `wire-inference-component-to-generic-registry` --
 /// `build_first_native_graphs_from_named_component`'s own no-engine
-/// fallback, the same fail-closed guarantee extended to a caller-registered
-/// Component instead of only the CLI's hardcoded singleton).
+/// fallback, plus the corresponding encoder graph entry point. These extend
+/// the same fail-closed guarantee to caller-registered Components.
 #[test]
 fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
     let source = FIRST_NATIVE_SOURCE;
@@ -1004,10 +1004,11 @@ fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
         .matches("no Component engine is available on this build target")
         .count();
     assert_eq!(
-        fail_closed_occurrences, 4,
-        "expected exactly the four documented production fail-closed stubs \
+        fail_closed_occurrences, 5,
+        "expected exactly the five documented production fail-closed stubs \
          (first_native_component_graphs_for_prompt, run_success_path_with_prompt, \
-         FirstNativeChatSession::turn, build_first_native_graphs_from_named_component) to share \
+         FirstNativeChatSession::turn, build_first_native_graphs_from_named_component, \
+         build_first_native_encoder_graph_from_named_component) to share \
          this exact structured error message when no strict Component engine is available; \
          found {fail_closed_occurrences}. If a call site was added or removed, update this count."
     );
