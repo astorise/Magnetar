@@ -591,6 +591,19 @@ impl KvCache {
         self.layout.append_tokens(count)
     }
 
+    /// Complete prefill atomically: a capacity or lifecycle failure must not
+    /// leave an empty cache stuck in the intermediate Prefilling state.
+    pub(crate) fn complete_prefill(&mut self, tokens: u32) -> Result<(), KvCacheError> {
+        let mut next = self.clone();
+        if next.lifecycle == KvCacheLifecycleState::Empty {
+            next.transition_to(KvCacheLifecycleState::Prefilling)?;
+        }
+        next.append_tokens(tokens)?;
+        next.transition_to(KvCacheLifecycleState::Ready)?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn seal(&mut self) -> Result<(), KvCacheError> {
         self.transition_to(KvCacheLifecycleState::Sealed)
     }
@@ -782,14 +795,7 @@ impl KvCacheManager {
     }
 
     pub fn prefill_completed(&mut self, id: &KvCacheId, tokens: u32) -> Result<(), KvCacheError> {
-        {
-            let cache = self.cache_mut(id)?;
-            if cache.lifecycle == KvCacheLifecycleState::Empty {
-                cache.transition_to(KvCacheLifecycleState::Prefilling)?;
-            }
-            cache.append_tokens(tokens)?;
-            cache.transition_to(KvCacheLifecycleState::Ready)?;
-        }
+        self.cache_mut(id)?.complete_prefill(tokens)?;
         self.observe(
             KvCacheObservationKind::PrefillCompleted,
             Some(id.clone()),

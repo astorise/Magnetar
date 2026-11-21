@@ -2078,6 +2078,22 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         _step: &RuntimeModelExecutionStep,
     ) -> Result<(), InferenceApiError> {
         let mut state = self.take_pending_kv_state(request)?;
+        // Validate the cache transition before promoting resources. A sealed
+        // or full cache must not replace the preceding committed generation.
+        // The same cache methods are used here and by the actual commit.
+        let validation = (|| -> Result<(), InferenceApiError> {
+            let mut candidate = runtime.kv_cache(&state.cache)?.clone();
+            if generated_tokens_before_step.is_empty() {
+                candidate.complete_prefill(request.prompt_token_count as u32)?;
+            } else {
+                candidate.append_tokens(1)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.store_pending_kv_state(request, state)?;
+            return Err(error);
+        }
         // Promote this step's pending KV resources to Runtime-owned,
         // committed bindings on the KvCache itself (task 7.1/7.3/7.4
         // commit) only now that sampling and token commit have succeeded --
