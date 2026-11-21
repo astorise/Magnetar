@@ -303,16 +303,13 @@ fn sealed_loading_memory_budget_failure_does_not_allocate() {
 
 #[test]
 fn host_tensors_from_artifact_bytes_rejects_unsupported_dtype() {
-    let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.a", vec![1], &[1.0]);
-    // I8 (not F32/F16/BF16/Q8_0/Q4_K/Q5_K) stays genuinely unsupported --
-    // Q8_0/Q4_K/Q5_K moved to their own dedicated dequantization tests
-    // once `support-gguf-quantized-tensor-dequantization` added real support for
-    // them (they no longer belong in this "still rejected" test).
-    metadata.storage_dtype = ModelDType::I8;
-
-    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
-        .expect_err("an unsupported dtype must be rejected");
-    assert_eq!(error.code, ModelLoadingErrorCode::StorageDTypeUnsupported);
+    for dtype in [ModelDType::I8, ModelDType::F8E4M3Fn] {
+        let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.a", vec![1], &[1.0]);
+        metadata.storage_dtype = dtype;
+        let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+            .expect_err("a dtype without a validated conversion must be rejected");
+        assert_eq!(error.code, ModelLoadingErrorCode::StorageDTypeUnsupported);
+    }
 }
 
 #[test]

@@ -345,6 +345,9 @@ pub enum ModelDType {
     I64,
     F16,
     Bf16,
+    /// Finite-only E4M3 (PyTorch `float8_e4m3fn` / Safetensors
+    /// `F8_E4M3`), distinct from E5M2 and E4M3FNUZ.
+    F8E4M3Fn,
     F32,
     F64,
     /// GGUF `block_q2_K`: 256 values in 84 bytes (2-bit quants, sixteen
@@ -395,6 +398,7 @@ impl ModelDType {
             "i64" | "int64" | "sint64" => Some(Self::I64),
             "f16" | "fp16" | "float16" => Some(Self::F16),
             "bf16" | "bfloat16" => Some(Self::Bf16),
+            "f8_e4m3" | "float8_e4m3fn" | "f8_e4m3fn" => Some(Self::F8E4M3Fn),
             "f32" | "fp32" | "float32" => Some(Self::F32),
             "f64" | "fp64" | "float64" => Some(Self::F64),
             "q2_k" | "q2k" => Some(Self::Q2K),
@@ -415,7 +419,7 @@ impl ModelDType {
         }
     }
 
-    pub const fn descriptor(self) -> DTypeDescriptor {
+    pub fn descriptor(self) -> DTypeDescriptor {
         match self {
             Self::Bool => DTypeDescriptor::portable(ComputeDType::Boolean),
             Self::U8 => DTypeDescriptor::portable(ComputeDType::UInt8),
@@ -428,6 +432,10 @@ impl ModelDType {
             Self::I64 => DTypeDescriptor::portable(ComputeDType::SInt64),
             Self::F16 => DTypeDescriptor::portable(ComputeDType::Float16),
             Self::Bf16 => DTypeDescriptor::portable(ComputeDType::BrainFloat16),
+            Self::F8E4M3Fn => DTypeDescriptor::ProviderSpecific {
+                id: "fp8-e4m3fn".into(),
+                size_bytes: 1,
+            },
             Self::F32 => DTypeDescriptor::portable(ComputeDType::Float32),
             Self::F64 => DTypeDescriptor::portable(ComputeDType::Float64),
             Self::Q2K
