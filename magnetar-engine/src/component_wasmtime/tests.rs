@@ -1659,3 +1659,4 @@ fn a_component_predating_yarn_cannot_receive_it() {
 }
 
 mod gemma_component_tests;
+mod smollm_component_tests;

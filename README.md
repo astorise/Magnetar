@@ -115,10 +115,11 @@ Implemented today:
   verify real Metal FFI, and `simdgroup_matrix`/AMX/MPS access `wgpu` cannot
   reach remains real future work there specifically for compute-bound
   (prefill) kernels; contributors with real Apple Silicon hardware welcome.
-  External NPU Provider (`providers/npu`): real device discovery only, via
-  Intel's oneAPI Level Zero API (`ZE_INIT_FLAG_VPU_ONLY`), gracefully
-  unavailable everywhere this repository's tooling can verify (no Intel
-  NPU hardware). External TPU Provider (`providers/tpu`): real device
+  External OpenVINO repository (`providers/openvino`): NPU device discovery
+  only, via Intel's oneAPI Level Zero API (`ZE_INIT_FLAG_VPU_ONLY`), gracefully
+  unavailable everywhere this repository's tooling can verify (no Intel NPU
+  hardware); OpenVINO execution is not implemented. External TPU Provider
+  (`providers/tpu`): real device
   discovery only, via Google Coral's `libedgetpu` API, targeting the real
   local Edge TPU accelerator (not Google Cloud TPU, a cloud service with
   no local device), gracefully unavailable everywhere this repository's
@@ -188,7 +189,7 @@ Deferred or unsupported for v1.0:
 - ROCm compute Kernels (`providers/rocm` does real device discovery only
   -- no AMD hardware exists in this repository's tooling to implement or
   verify compute)
-- NPU compute Kernels (`providers/npu` does real device discovery only,
+- NPU compute Kernels (`providers/openvino` does real device discovery only,
   via Intel's oneAPI Level Zero API -- no Intel NPU hardware exists in
   this repository's tooling to implement or verify compute)
 - Qualcomm compute Kernels (`providers/qnn` does backend discovery
@@ -528,7 +529,7 @@ unavailable placeholder, kept alive as real future work for the
 `simdgroup_matrix`/AMX/MPS-reliant compute-bound (prefill) kernels `wgpu`
 structurally cannot reach on Apple Silicon, with a call for contributors on
 real hardware. `add-npu-and-tpu-provider-skeletons` closed the remaining
-two additional-Providers items the same honest way: `providers/npu` is a
+two additional-Providers items the same honest way: `providers/openvino` is a
 real device-discovery skeleton via Intel's oneAPI Level Zero API
 (`ZE_INIT_FLAG_VPU_ONLY` scopes discovery to NPU/VPU-class devices
 specifically), and `providers/tpu` is a real device-discovery skeleton via

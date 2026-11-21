@@ -475,7 +475,7 @@ pub fn reject_experimental_flag_enabled_by_default(
 /// Feature Flags".
 ///
 /// `npu-provider`, `rocm-provider`, and `tpu-provider` (MAG-10) name the
-/// real `providers/npu` (Intel Level Zero), `providers/rocm` (AMD HIP),
+/// real `providers/openvino` (Intel Level Zero), `providers/rocm` (AMD HIP),
 /// and `providers/tpu` (Google Coral `libedgetpu`) submodules -- each a
 /// real device-discovery-only Provider with no compute Kernels yet and no
 /// matching hardware in this repository's own CI, so each stays disabled
@@ -483,10 +483,10 @@ pub fn reject_experimental_flag_enabled_by_default(
 /// (QNN backend discovery, no compute Kernels, nothing verified on Qualcomm
 /// hardware) is the first step toward `qnn-provider`, which stays disabled
 /// and unclaimed. `openvino-provider` remains a distinct, not-yet-implemented
-/// roadmap hardware family (see `magnetar_runtime::provider_roadmap::
-/// ProviderRoadmapHardwareFamily`) -- OpenVINO and Qualcomm QNN are not
-/// the same hardware `providers/npu` targets (Intel NPU via Level Zero),
-/// so they are not satisfied by it.
+/// roadmap execution profile (see `magnetar_runtime::provider_roadmap::
+/// ProviderRoadmapHardwareFamily`). The renamed `providers/openvino` submodule
+/// currently discovers Intel NPU drivers via Level Zero; it does not implement
+/// OpenVINO execution or Qualcomm QNN.
 pub fn provider_feature_flags() -> Vec<ReleaseFeatureFlag> {
     let required_only = "reference-cpu-provider";
     [
@@ -1260,7 +1260,7 @@ pub enum PublishingBoundaryCategory {
 ///   list any more; keeping them here would mean this policy module
 ///   blocked presenting work the project has already shipped.
 /// - Added `"rocm-compute-kernels"`, `"npu-compute-kernels"`, and
-///   `"tpu-compute-kernels"`: `providers/{rocm,npu,tpu}` do real device
+///   `"tpu-compute-kernels"`: `providers/{rocm,openvino,tpu}` do real device
 ///   discovery only -- no compute Kernels -- exactly matching
 ///   `README.md`'s "ROCm/NPU/TPU compute Kernels" deferred entries,
 ///   which this list did not previously name at all.
