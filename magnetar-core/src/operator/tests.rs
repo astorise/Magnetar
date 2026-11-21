@@ -561,6 +561,44 @@ fn required_kernel_features_name_only_non_baseline_forms() {
         required_kernel_features("moe-experts", &sigmoid, 7),
         vec![MOE_SIGMOID_ROUTING_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE]
     );
+    let relu_squared = attributes(&[
+        (
+            "activation",
+            OperatorAttributeValue::String("relu_squared".into()),
+        ),
+        (
+            "routing_scoring",
+            OperatorAttributeValue::String("sigmoid".into()),
+        ),
+    ]);
+    assert_eq!(
+        required_kernel_features("moe-experts", &relu_squared, 5),
+        vec![
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_RELU_SQUARED_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+        ]
+    );
+    assert_eq!(
+        required_kernel_features("moe-experts", &relu_squared, 6),
+        vec![
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_RELU_SQUARED_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+            MOE_PER_EXPERT_SCALE_FEATURE,
+        ]
+    );
+    assert_eq!(
+        required_kernel_features(
+            "activation",
+            &attributes(&[(
+                "kind",
+                OperatorAttributeValue::String("relu_squared".into())
+            )]),
+            1
+        ),
+        vec![ACTIVATION_RELU_SQUARED_FEATURE]
+    );
     for name in [
         "routing_scale",
         "routing_group_count",

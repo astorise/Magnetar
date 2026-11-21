@@ -151,6 +151,8 @@ pub enum MoeExpertActivation {
     Silu,
     /// `gelu_tanh(gate) * up` (`activation = "gelu_tanh"`).
     GeluTanh,
+    /// Ungated `relu(gate)²` (`activation = "relu_squared"`).
+    ReluSquared,
 }
 
 impl MoeExpertActivation {
@@ -160,14 +162,16 @@ impl MoeExpertActivation {
         match name {
             "silu" => Some(Self::Silu),
             "gelu_tanh" => Some(Self::GeluTanh),
+            "relu_squared" => Some(Self::ReluSquared),
             _ => None,
         }
     }
 
-    fn apply(self, gate: f32) -> f32 {
+    fn combine(self, gate: f32, up: f32) -> f32 {
         match self {
-            Self::Silu => gate * (1.0 / (1.0 + (-gate).exp())),
-            Self::GeluTanh => gelu_tanh(gate),
+            Self::Silu => gate * (1.0 / (1.0 + (-gate).exp())) * up,
+            Self::GeluTanh => gelu_tanh(gate) * up,
+            Self::ReluSquared => gate.max(0.0).powi(2),
         }
     }
 }
@@ -294,6 +298,15 @@ fn moe_experts_local_impl(
             bias.shape
         )));
     }
+    if options.activation == MoeExpertActivation::ReluSquared
+        && h.data
+            .iter()
+            .chain(gate.data.iter())
+            .chain(down.data.iter())
+            .any(|value| !value.is_finite())
+    {
+        return Err(shape_error("non-finite relu_squared expert input".into()));
+    }
     let (first, count) = (first as usize, count as usize);
     let (hidden, intermediate) = (hidden as usize, intermediate as usize);
     let (gate_cols, down_cols) = (gate_cols as usize, down_cols as usize);
@@ -319,9 +332,21 @@ fn moe_experts_local_impl(
                 let (mut g, mut u) = (0.0_f32, 0.0_f32);
                 for (k, &xk) in x.iter().enumerate() {
                     g += xk * gate.data[k * gate_cols + column];
-                    u += xk * up.data[k * gate_cols + column];
+                    if options.activation != MoeExpertActivation::ReluSquared {
+                        u += xk * up.data[k * gate_cols + column];
+                    }
                 }
-                *value = options.activation.apply(g) * u;
+                if options.activation == MoeExpertActivation::ReluSquared && !g.is_finite() {
+                    return Err(shape_error(
+                        "non-finite relu_squared expert projection".into(),
+                    ));
+                }
+                *value = options.activation.combine(g, u);
+                if options.activation == MoeExpertActivation::ReluSquared && !value.is_finite() {
+                    return Err(shape_error(
+                        "non-finite relu_squared expert activation".into(),
+                    ));
+                }
             }
             let row = &mut out[token * hidden..(token + 1) * hidden];
             for (c, slot) in row.iter_mut().enumerate() {
@@ -331,6 +356,9 @@ fn moe_experts_local_impl(
                     sum += a * down.data[j * down_cols + column];
                 }
                 *slot += weight * sum;
+                if options.activation == MoeExpertActivation::ReluSquared && !slot.is_finite() {
+                    return Err(shape_error("non-finite relu_squared expert output".into()));
+                }
             }
         }
     }
@@ -369,6 +397,22 @@ pub const MOE_EXPERT_COUNT_ATTRIBUTE: &str = "expert_count";
 pub fn gelu_tanh(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh())
+}
+
+/// Elementwise squared ReLU; non-finite inputs or outputs are rejected.
+pub fn relu_squared(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    let mut data = Vec::with_capacity(input.data.len());
+    for &x in &input.data {
+        let value = x.max(0.0).powi(2);
+        if !x.is_finite() || !value.is_finite() {
+            return Err(invalid("non-finite relu_squared input or output"));
+        }
+        data.push(value);
+    }
+    Ok(HostTensor {
+        shape: input.shape.clone(),
+        data,
+    })
 }
 
 fn invalid(reason: impl Into<String>) -> ReferenceCpuError {

@@ -322,6 +322,12 @@ pub const MOE_PER_EXPERT_SCALE_FEATURE: &str = "per-expert-scale";
 /// selected-score normalization and routed scaling.
 pub const MOE_SIGMOID_ROUTING_FEATURE: &str = "sigmoid-expert-routing";
 
+/// Ungated `relu(x)²` expert networks with compact two-weight operands.
+pub const MOE_RELU_SQUARED_FEATURE: &str = "moe-relu-squared";
+
+/// Elementwise `activation(kind = "relu_squared")`.
+pub const ACTIVATION_RELU_SQUARED_FEATURE: &str = "activation-relu-squared";
+
 /// Kernel feature an `attention` Kernel advertises when it honours
 /// `value_head_dimension`: V rows and the output are that wide per head
 /// while Q and K rows stay `head_dimension` wide (multi-head latent
@@ -397,6 +403,12 @@ pub fn required_kernel_features(
             }
         }
         "embedding" if present("scale") => features.push(EMBEDDING_SCALE_FEATURE),
+        "activation" => {
+            if matches!(attributes.get("kind"), Some(OperatorAttributeValue::String(kind)) if kind == "relu_squared")
+            {
+                features.push(ACTIVATION_RELU_SQUARED_FEATURE);
+            }
+        }
         "rmsnorm" => {
             if present("head_count") || present("head_dimension") {
                 features.push(RMSNORM_PER_HEAD_FEATURE);
@@ -436,6 +448,13 @@ pub fn required_kernel_features(
             if !silu {
                 features.push(MOE_EXPERTS_ACTIVATION_FEATURE);
             }
+            let relu_squared = matches!(
+                attributes.get("activation"),
+                Some(OperatorAttributeValue::String(name)) if name == "relu_squared"
+            );
+            if relu_squared {
+                features.push(MOE_RELU_SQUARED_FEATURE);
+            }
             // Any routing attribute requires the feature, even malformed or
             // partial declarations: an older Kernel must never silently
             // execute such a node with its baseline softmax routing.
@@ -451,7 +470,14 @@ pub fn required_kernel_features(
             if sigmoid_form {
                 features.push(MOE_SIGMOID_ROUTING_FEATURE);
             }
-            if input_count > if sigmoid_form { 6 } else { 5 } {
+            let base_inputs = if sigmoid_form && relu_squared {
+                5
+            } else if sigmoid_form {
+                6
+            } else {
+                5
+            };
+            if input_count > base_inputs {
                 features.push(MOE_PER_EXPERT_SCALE_FEATURE);
             }
         }
@@ -1318,6 +1344,8 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // `always`, and `routing_scale` is positive. Optional paired group
         // attributes rank groups by the sum of the top two biased scores.
         // A tie across a group or expert selection boundary is refused.
+        // `activation = "relu_squared"` selects an ungated sigmoid form:
+        // `h, logits, in, down, bias`, optionally followed by expert scale.
         (
             "moe-experts",
             OperatorFamily::LinearAlgebra,
@@ -1801,7 +1829,7 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
                 "expert_count",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             )
-            // The experts' gate activation: `silu` (absent) or `gelu_tanh`.
+            // Gate activation `silu`/`gelu_tanh`, or ungated `relu_squared`.
             .with_rule(
                 "activation",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),

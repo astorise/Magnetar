@@ -5,6 +5,18 @@
 
 use super::*;
 
+#[test]
+fn relu_squared_rejects_nonfinite_values_and_overflow() {
+    let input = HostTensor::new([4], vec![-2.0, -0.0, 0.5, 3.0]).unwrap();
+    assert_eq!(
+        relu_squared(&input).unwrap().data,
+        vec![0.0, 0.0, 0.25, 9.0]
+    );
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+        assert!(relu_squared(&HostTensor::new([1], vec![value]).unwrap()).is_err());
+    }
+}
+
 fn tensor(rows: u64, cols: u64, seed: u64) -> HostTensor {
     let data: Vec<f32> = (0..rows * cols)
         .map(|i| ((i * 37 + seed * 101) % 23) as f32 / 23.0 - 0.5)

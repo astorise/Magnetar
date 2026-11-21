@@ -85,6 +85,40 @@ Evidence (RTX 3060, GPU CI run 42186542821):
   - No Reference CPU or logit comparison yet. The checkpoint in f32 (about 5 GB) does not fit the runner next to the test.
   - The plain-text prompt is encoded without `<|begin_of_text|>`, the same `add_bos_token` gap as DeepSeek-R1-Distill.
 
+### Experimental Olala expert network and hybrid state
+
+At revision `b40f8165ee2254c18601220e19842600c6d91794`, Olala uses
+selection-biased sigmoid routing and an **ungated** expert network
+`W_out(relu(W_in(x))²)`, with optional routed input/output projections and a
+separate shared ReLU² MLP. The existing gated `silu(gate) * up` expert form
+cannot represent it. Extend portable `moe-experts@1` with
+`activation = "relu_squared"`: the explicitly selected sigmoid form takes
+`h`, logits, stacked `W_in`, stacked `W_out`, selection bias, and optionally
+per-expert scale. The ungated form requires a new `moe-relu-squared` Kernel
+feature as well as sigmoid routing and any other required feature; a Provider
+advertising the older generic activation feature alone is ineligible. Preserve
+the existing gated forms and input positions. The separate portable
+`activation@1` kind `relu_squared` requires its own
+`activation-relu-squared` Kernel feature. Other dtypes or Providers are not
+qualified by a CPU-only fixture.
+
+Hybrid recurrent state requires a separate additive graph Capability version,
+not KV aliases. A future graph-builder 1.11 state extension will declare each
+fixed-size layer/slot input and associate a same-shaped output with its
+Runtime-issued logical identity. Initial state is zero; continuing calls read
+the last committed generation. State slots are keyed by session, model and
+component compatibility, layer, slot and dtype/shape, and never contain
+Provider handles in WIT. Outputs remain pending until the token/segment and
+all matching KV changes commit together. Failed dispatch, sampling,
+cancellation, incompatible shape/affinity or unsupported Provider features
+must leave the prior committed generation unchanged. State reset and document
+boundaries clear only the relevant sequence, while close/expiry releases all
+its leases after in-flight work completes. Multi-output graph production,
+old/new component linking, cross-segment isolation and completion-safe
+retirement need explicit tests before this experimental profile can run. The
+standalone Mamba-2 reference is evidence for numeric equations, not an
+implementation of this Runtime contract.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

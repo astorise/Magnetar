@@ -910,6 +910,196 @@ struct FormsGraph {
     graph: ExecutionGraph,
 }
 
+/// Runs an entire Olala MoE including routed bottleneck, shared expert and
+/// logits head against the independently executed pinned PyTorch implementation.
+#[test]
+fn olala_relu_squared_moe_graph_matches_upstream_logits() {
+    #[derive(serde::Deserialize)]
+    struct TensorFixture {
+        shape: Vec<u64>,
+        data: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        top_k: i64,
+        scale: f64,
+        experts: i64,
+        tensors: BTreeMap<String, TensorFixture>,
+    }
+    let fixtures: Vec<Fixture> =
+        serde_json::from_str(include_str!("../../../fixtures/olala-moe-reference.json")).unwrap();
+    for expected in fixtures {
+        let mut builder = FormsGraph {
+            graph: ExecutionGraph::new(
+                ExecutionGraphId::new("olala-relu-squared"),
+                ExecutionGraphPhase::Prefill,
+            ),
+        };
+        let mut bindings = BTreeMap::new();
+        let mut input = |name: &str, builder: &mut FormsGraph| {
+            let tensor = &expected.tensors[name];
+            let id = builder.input(name, &tensor.shape);
+            bindings.insert(
+                id.clone(),
+                HostTensor::new(tensor.shape.clone(), tensor.data.clone()).unwrap(),
+            );
+            id
+        };
+        let hidden = input("hidden", &mut builder);
+        let router = input("router", &mut builder);
+        let routed_in = input("routed_in", &mut builder);
+        let expert_in = input("expert_in", &mut builder);
+        let expert_out = input("expert_out", &mut builder);
+        let bias = input("bias", &mut builder);
+        let routed_out = input("routed_out", &mut builder);
+        let shared_in = input("shared_in", &mut builder);
+        let shared_out = input("shared_out", &mut builder);
+        let head = input("head", &mut builder);
+        let router_logits = builder.node(
+            "router",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden.clone(), router],
+            &[4, 4],
+        );
+        let routed = builder.node(
+            "routed_in",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden.clone(), routed_in],
+            &[4, 3],
+        );
+        let routed = builder.node(
+            "experts",
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            vec![
+                ("experts", OperatorAttributeValue::Integer(expected.experts)),
+                ("top_k", OperatorAttributeValue::Integer(expected.top_k)),
+                (
+                    "activation",
+                    OperatorAttributeValue::String("relu_squared".into()),
+                ),
+                (
+                    "routing_scoring",
+                    OperatorAttributeValue::String("sigmoid".into()),
+                ),
+                (
+                    "routing_normalization",
+                    OperatorAttributeValue::String("multiple".into()),
+                ),
+                (
+                    "routing_scale",
+                    OperatorAttributeValue::Float(expected.scale),
+                ),
+            ],
+            vec![routed, router_logits, expert_in, expert_out, bias],
+            &[4, 3],
+        );
+        let routed = builder.node(
+            "routed_out",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![routed, routed_out],
+            &[4, 5],
+        );
+        let shared = builder.node(
+            "shared_in",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden, shared_in],
+            &[4, 6],
+        );
+        let shared = builder.node(
+            "shared_activation",
+            "activation",
+            OperatorFamily::Activation,
+            vec![(
+                "kind",
+                OperatorAttributeValue::String("relu_squared".into()),
+            )],
+            vec![shared],
+            &[4, 6],
+        );
+        let shared = builder.node(
+            "shared_out",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![shared, shared_out],
+            &[4, 5],
+        );
+        let combined = builder.node(
+            "combined",
+            "add",
+            OperatorFamily::Tensor,
+            vec![],
+            vec![routed, shared],
+            &[4, 5],
+        );
+        let result = builder.node(
+            "head",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![combined, head],
+            &[4, 7],
+        );
+        let mut graph = builder.graph;
+        let mut edge = graph.edges.remove(&result).unwrap();
+        edge.id = TensorEdgeId::new("logits");
+        graph.edges.insert(edge.id.clone(), edge);
+        graph
+            .nodes
+            .get_mut(&ExecutionNodeId::new("head"))
+            .unwrap()
+            .outputs = vec![TensorEdgeId::new("logits")];
+        let fixture = e2e_fixture().unwrap();
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            4,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("olala-moe").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = &outputs[&TensorEdgeId::new("logits")].data;
+        let reference = &expected.tensors["logits"].data;
+        for (&a, &b) in actual.iter().zip(reference) {
+            assert!((a - b).abs() < 2e-6, "top-{}: {a} != {b}", expected.top_k);
+        }
+    }
+}
+
 impl FormsGraph {
     fn input(&mut self, name: &str, shape: &[u64]) -> TensorEdgeId {
         let id = TensorEdgeId::new(format!("input.{name}"));
@@ -1589,6 +1779,8 @@ fn the_reference_cpu_declares_every_layered_form() {
         ("moe-experts", MOE_EXPERTS_ACTIVATION_FEATURE),
         ("moe-experts", MOE_PER_EXPERT_SCALE_FEATURE),
         ("moe-experts", MOE_SIGMOID_ROUTING_FEATURE),
+        ("moe-experts", MOE_RELU_SQUARED_FEATURE),
+        ("activation", ACTIVATION_RELU_SQUARED_FEATURE),
         // `express-latent-attention-forms`.
         ("attention", ATTENTION_VALUE_HEAD_DIMENSION_FEATURE),
         ("concat", CONCAT_HEADS_FEATURE),

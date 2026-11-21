@@ -643,7 +643,24 @@ pub(super) fn dispatch_first_native_graph_node(
                 node.attributes.get("routing_scoring"),
                 Some(OperatorAttributeValue::String(scoring)) if scoring == "sigmoid"
             );
-            let valid_inputs = if sigmoid_form { 6..=7 } else { 5..=6 };
+            let ungated = matches!(
+                node.attributes.get("activation"),
+                Some(OperatorAttributeValue::String(name)) if name == "relu_squared"
+            );
+            if ungated && !sigmoid_form {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' requires sigmoid routing for ungated relu_squared experts"
+                    ),
+                });
+            }
+            let valid_inputs = if ungated {
+                5..=6
+            } else if sigmoid_form {
+                6..=7
+            } else {
+                5..=6
+            };
             if !valid_inputs.contains(&inputs.len()) {
                 return Err(InferenceApiError::GraphPlanningFailed {
                     reason: format!(
@@ -653,7 +670,11 @@ pub(super) fn dispatch_first_native_graph_node(
             }
             let (rows, cols) = inputs[0].rows_cols()?;
             let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, cols]);
-            let mut roles = vec!["h", "logits", "gate", "up", "down"];
+            let mut roles = vec!["h", "logits", "gate"];
+            if !ungated {
+                roles.push("up");
+            }
+            roles.push("down");
             if sigmoid_form {
                 roles.push("selection_bias");
             }
