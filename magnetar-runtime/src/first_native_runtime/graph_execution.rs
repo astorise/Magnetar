@@ -830,6 +830,67 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "differential-attention" => {
+            if inputs.len() != 4 || node.outputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects q, k, v and lambda logits"),
+                });
+            }
+            crate::operator_semantics::differential_attention_from_attributes(&node.attributes)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let ([tokens, query_heads, width], [keys, kv_heads, key_width]) =
+                (inputs[0].shape(), inputs[1].shape())
+            else {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects rank-three q and k"),
+                });
+            };
+            if *tokens == 0
+                || *keys < *tokens
+                || *kv_heads == 0
+                || *width == 0
+                || *key_width != *width
+                || query_heads / kv_heads < 2
+                || !query_heads.is_multiple_of(*kv_heads)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' has invalid differential attention geometry"
+                    ),
+                });
+            }
+            let shape = [*tokens, query_heads - kv_heads, *width];
+            if let Some(graph) = ctx.graph.as_ref()
+                && graph
+                    .graph()
+                    .edges
+                    .get(&node.outputs[0])
+                    .is_none_or(|edge| edge.descriptor.shape.dimensions != shape)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' has an invalid differential attention output shape"
+                    ),
+                });
+            }
+            let resources = inputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| node_input_resource(node_id, &format!("input{index}"), value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("differential-attention", OperatorFamily::Attention),
+                resources,
+                f32_tensor_descriptor_from_shape(&shape),
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "encoder-attention" => {
             if inputs.len() != 4 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1686,6 +1747,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
+                | "differential-attention"
                 | "affine-layernorm"
                 | "slice-last"
                 | "row-scale"
@@ -1768,6 +1830,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
+                | "differential-attention"
                 | "affine-layernorm"
                 | "gelu-exact"
                 | "slice-last"
@@ -2540,6 +2603,8 @@ pub(super) fn materialize_first_native_graph_bindings(
     Ok(materialized_bindings)
 }
 
+#[cfg(test)]
+mod differential_attention_tests;
 #[cfg(test)]
 mod encoder_ops_tests;
 #[cfg(test)]

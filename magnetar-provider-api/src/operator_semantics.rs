@@ -9,6 +9,7 @@
 
 use crate::tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
 
+mod differential_attention;
 mod encoder_attention;
 mod encoder_ops;
 mod mamba2_mixer;
@@ -17,6 +18,9 @@ mod mamba3_mimo;
 mod mamba3_mixer;
 mod sigmoid_routing;
 mod token_shift;
+pub use differential_attention::{
+    DifferentialAttention, differential_attention, differential_attention_from_attributes,
+};
 pub use encoder_attention::{
     EncoderAttention, encoder_attention, encoder_attention_from_attributes,
 };

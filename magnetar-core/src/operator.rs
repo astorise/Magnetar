@@ -1379,6 +1379,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         ),
         // Gate each token against the preceding raw value and retain it.
         ("token-shift", OperatorFamily::Tensor, 4, 2, ShapeRule::Any),
+        // Causal signal/noise head attention over an explicit K/V history.
+        (
+            "differential-attention",
+            OperatorFamily::Attention,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
         // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
         ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1589,7 +1597,12 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         }
         if matches!(
             name,
-            "encoder-attention" | "mamba2-mixer" | "mamba3-mimo" | "mamba3-mixer" | "token-shift"
+            "encoder-attention"
+                | "mamba2-mixer"
+                | "mamba3-mimo"
+                | "mamba3-mixer"
+                | "token-shift"
+                | "differential-attention"
         ) {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
@@ -1630,6 +1643,23 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "differential-attention" => OperatorAttributeSchema::default()
+            .with_rule(
+                "scale",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "softcap",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "window_left",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "round_bfloat16",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
         "affine-layernorm" => OperatorAttributeSchema::default().with_rule(
             "epsilon",
             OperatorAttributeRule::required(OperatorAttributeKind::Float),

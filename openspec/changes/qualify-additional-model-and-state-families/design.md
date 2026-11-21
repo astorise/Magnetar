@@ -158,6 +158,17 @@ output is the last **raw**, not mixed, token. Both are fresh allocations.
 This operator can be used independently for keys and values, but does not
 manage their session state, KV attention history or a full attention layer.
 
+The experimental `differential-attention@1` core accepts already-normalized
+and position-scaled queries `[T,Hq,D]`, key/value history `[S,Hkv,D]` and
+per-token mixing logits `[T,Hkv]`. `S >= T`, `Hq` is a multiple of `Hkv`, and
+each KV head groups one noise head after one or more signal heads. It applies
+causal attention with an explicit score scale, optional left-window and score
+softcap, then subtracts sigmoid-weighted noise from each associated signal.
+An explicit bfloat16-rounding flag models the upstream eager attention's Q/K/V
+and attention-output conversions; the contract never silently assumes that
+precision. This primitive does not project Q/K/V, update history, apply RoPE,
+or manage token-shift state and therefore does not qualify a full V block.
+
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
 `recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.
