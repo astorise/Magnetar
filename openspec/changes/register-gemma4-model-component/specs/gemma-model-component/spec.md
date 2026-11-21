@@ -2,7 +2,7 @@
 
 ### Requirement: The Gemma 4 Model Component Is Shipped Under A Pinned Digest
 
-Magnetar SHALL ship the Gemma 4 Model Component built from the pinned `components/gemma` commit as `gemma-real.component.wasm`, with a manifest that declares its digest, its `model-component-graph` `1.6.0` imports (`graph-builder` and `model-config` only), the architecture families `gemma4`, `gemma4_text` and `gemma4_unified`, and the artifact formats `huggingface` and `gguf`.
+Magnetar SHALL ship the Gemma 4 Model Component built from the pinned `components/gemma` commit as `gemma-real.component.wasm`, with a manifest that declares its digest, its `model-component-graph` `1.8.0` imports (`graph-builder` and `model-config` only), the architecture families `gemma4`, `gemma4_text` and `gemma4_unified`, and the artifact formats `huggingface` and `gguf`. The Component SHALL refuse an unknown or unsupported checkpoint activation.
 
 #### Scenario: A Gemma 4 checkpoint selects the Component
 - **WHEN** a Gemma 4 Hugging Face bundle or `gemma4` GGUF file is ingested and loaded with the real Components registered

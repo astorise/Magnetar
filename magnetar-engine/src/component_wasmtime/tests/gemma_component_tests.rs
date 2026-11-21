@@ -28,21 +28,25 @@ fn gemma_graph(
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let artifact = directory.join("gemma.component.wasm");
-    std::fs::write(&artifact, GEMMA_REAL_COMPONENT).unwrap();
+    let bytes = match std::env::var_os("MAGNETAR_GEMMA_TEST_COMPONENT") {
+        Some(path) => std::fs::read(path).expect("fresh Gemma Component is readable"),
+        None => GEMMA_REAL_COMPONENT.to_vec(),
+    };
+    std::fs::write(&artifact, bytes).unwrap();
 
     let capability = Arc::new(crate::GraphBuilderCapability::new());
     let model_config_capability = Arc::new(crate::ModelConfigCapability::new());
     let mut engine = WasmtimeComponentEngine::new().unwrap();
-    let gb = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.6.0");
+    let gb = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.8.0");
     engine.register_capability(gb.clone(), capability.clone() as Arc<dyn HostCapability>);
-    let mc = WitInterface::new("magnetar:model-component-graph/model-config", "1.6.0");
+    let mc = WitInterface::new("magnetar:model-component-graph/model-config", "1.8.0");
     engine.register_capability(
         mc.clone(),
         model_config_capability.clone() as Arc<dyn HostCapability>,
     );
     let export_interface = WitInterface::new(
         "magnetar:model-component-graph/model-component-graph-producer",
-        "1.6.0",
+        "1.8.0",
     );
     let definition = ComponentDefinition {
         id: ComponentDefinitionId::new(300),
@@ -76,17 +80,23 @@ fn gemma_graph(
         },
     );
     model_config_capability.bind_config(instance.engine_key(), config);
-    let result = engine
-        .invoke(
-            &instance,
-            &ComponentInvocation::new(
-                crate::ComponentInstanceId::new(300),
-                export_interface,
-                export,
-            )
-            .with_arguments(args),
+    let result = engine.invoke(
+        &instance,
+        &ComponentInvocation::new(
+            crate::ComponentInstanceId::new(300),
+            export_interface,
+            export,
         )
-        .map_err(|e| format!("invoke: {e:?}"))?;
+        .with_arguments(args),
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = engine.destroy(instance);
+            let _ = std::fs::remove_dir_all(directory);
+            return Err(format!("invoke: {error:?}"));
+        }
+    };
     let [ComponentValue::String(handle)] = result.values.as_slice() else {
         return Err(format!("unexpected result {:?}", result.values));
     };
@@ -182,6 +192,7 @@ fn gemma_e2e_dense_with_shared_kv() {
         vocab_size: 16,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+        hidden_activation: Some("gelu_pytorch_tanh".into()),
         tie_word_embeddings: true,
         layer_layout: Some(layers),
         final_logit_softcapping: Some(30.0),
@@ -214,10 +225,30 @@ fn base_config(layers: Vec<crate::LayerSpec>) -> crate::ModelArchitectureConfig 
         vocab_size: 16,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+        hidden_activation: Some("gelu_pytorch_tanh".into()),
         tie_word_embeddings: true,
         layer_layout: Some(layers),
         final_logit_softcapping: Some(30.0),
         ..Default::default()
+    }
+}
+
+#[test]
+fn gemma_rejects_unknown_or_incompatible_activations() {
+    let layers = vec![spec(Some(4), 4, 1, None, false, None, 16)];
+    let weights = gemma_weights(&layers, 2, 8, 16);
+    for activation in [None, Some("silu"), Some("gelu")] {
+        let mut config = base_config(layers.clone());
+        config.hidden_activation = activation.map(str::to_string);
+        assert!(
+            gemma_graph(
+                config,
+                weights.clone(),
+                "build-prefill-graph",
+                vec![ComponentValue::S64(3)]
+            )
+            .is_err()
+        );
     }
 }
 
@@ -420,6 +451,7 @@ fn real_config(
         vocab_size: 262_144,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+        hidden_activation: Some("gelu_pytorch_tanh".into()),
         tie_word_embeddings: true,
         layer_layout: Some(layers),
         final_logit_softcapping: Some(30.0),

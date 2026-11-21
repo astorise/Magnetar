@@ -596,8 +596,9 @@ pub fn production_model_fixture(
     manifest.validate().map_err(E2eConformanceError::from)?;
     descriptor
         .validate_model_artifact(&manifest)
-        .map_err(QwenComponentError::from)
-        .map_err(E2eConformanceError::from)?;
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
     if config.chat_template_required && manifest.chat_template.is_none() {
         return Err(E2eConformanceError::ModelComponentFailed {
             reason: "chat template metadata required but not present in Model Artifact".into(),

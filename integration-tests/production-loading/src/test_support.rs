@@ -56,12 +56,13 @@ pub(crate) fn real_component_for_architecture_family(
         );
         let original = fs::read(&path).expect("checked-in real Component .wasm is readable");
         let override_path = match name {
+            "gemma-real" => std::env::var_os("MAGNETAR_GEMMA_TEST_COMPONENT"),
             "mistral-real" => std::env::var_os("MAGNETAR_MISTRAL_TEST_COMPONENT"),
             "olmo-real" => std::env::var_os("MAGNETAR_OLMO_TEST_COMPONENT"),
             _ => None,
         };
         let bytes = match override_path {
-            Some(path) => fs::read(path).expect("fresh Mistral Component is readable"),
+            Some(path) => fs::read(path).expect("fresh Model Component is readable"),
             None => original.clone(),
         };
         let original_digest = magnetar_runtime::ComponentDigest::sha256(&original);

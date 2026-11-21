@@ -19,6 +19,7 @@ compatibility:
     - smollm3
   artifact_formats:
     - huggingface
+    - gguf
 wit:
   imports:
     - package: "magnetar:model-component-graph"
