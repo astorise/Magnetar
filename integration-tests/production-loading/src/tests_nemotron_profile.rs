@@ -63,6 +63,20 @@ fn pinned_nemotron_mixer_plan_matches_the_runtime_operator_interface() {
         assert_eq!(semantic.groups, plan.groups);
         assert_eq!(semantic.dt_min, 0.0);
         assert_eq!(semantic.dt_max, f32::INFINITY);
+        let mut invalid_inputs = inputs.clone();
+        invalid_inputs[1] = descriptor(&vec![1, 1]);
+        assert!(
+            operator
+                .validate_invocation(&invalid_inputs, &outputs, &attributes)
+                .is_err()
+        );
+        let mut invalid_outputs = outputs.clone();
+        invalid_outputs[2] = descriptor(&vec![1, 1, 1]);
+        assert!(
+            operator
+                .validate_invocation(&inputs, &invalid_outputs, &attributes)
+                .is_err()
+        );
         attributes.remove("groups");
         assert!(
             operator

@@ -205,6 +205,8 @@ pub enum ShapeRule {
     /// Two equally shaped nonempty vectors/row batches, followed by two
     /// scalar parameters; the output has the first input's shape.
     GeodesicResidual,
+    /// One Mamba-2 mixer and its fixed-size convolution and SSM states.
+    Mamba2Mixer,
     Matmul,
     RmsNorm,
     RowBroadcastAdd,
@@ -1359,7 +1361,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             OperatorFamily::LinearAlgebra,
             13,
             3,
-            ShapeRule::Any,
+            ShapeRule::Mamba2Mixer,
         ),
         // Preprocessed Mamba-3 sequence and four independent next states.
         (
@@ -2174,6 +2176,112 @@ fn validate_concat_heads(
     Ok(())
 }
 
+/// Validate fixed Mamba-2 geometry before dispatch or allocating state. The
+/// numerical provider applies the same equations to actual tensor values.
+fn validate_mamba2_mixer_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(), OperatorError> {
+    let invalid = || OperatorError::ShapeMismatch {
+        reason: "invalid mamba2-mixer geometry, attributes or tensor shapes".into(),
+    };
+    let positive = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => Ok(*value as u64),
+        _ => Err(invalid()),
+    };
+    let boolean = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Boolean(value)) => Ok(*value),
+        _ => Err(invalid()),
+    };
+    let float = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Float(value))
+            if value.is_finite() && (*value as f32).is_finite() =>
+        {
+            Ok(*value as f32)
+        }
+        _ => Err(invalid()),
+    };
+    let heads = positive("heads")?;
+    let head_dim = positive("head_dim")?;
+    let groups = positive("groups")?;
+    let state_dim = positive("state_dim")?;
+    let kernel = positive("conv_kernel")?;
+    let epsilon = float("epsilon")?;
+    let dt_min = float("dt_min")?;
+    let dt_max = if attributes.contains_key("dt_max") {
+        float("dt_max")?
+    } else {
+        f32::INFINITY
+    };
+    let conv_bias = boolean("conv_bias")?;
+    let linear_bias = boolean("linear_bias")?;
+    if !heads.is_multiple_of(groups) || epsilon <= 0.0 || dt_min < 0.0 || dt_max < dt_min {
+        return Err(invalid());
+    }
+    let expected_count = 10 + usize::from(conv_bias) + 2 * usize::from(linear_bias);
+    if inputs.len() != expected_count {
+        return Err(OperatorError::InputArityInvalid {
+            expected: expected_count,
+            actual: inputs.len(),
+        });
+    }
+    let [tokens, hidden] = inputs[0].shape.dimensions.as_slice() else {
+        return Err(invalid());
+    };
+    if *tokens == 0 || *hidden == 0 {
+        return Err(invalid());
+    }
+    let inner = heads.checked_mul(head_dim).ok_or_else(invalid)?;
+    let conv = groups
+        .checked_mul(state_dim)
+        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| inner.checked_add(value))
+        .ok_or_else(invalid)?;
+    let projection = inner
+        .checked_add(conv)
+        .and_then(|value| value.checked_add(heads))
+        .ok_or_else(invalid)?;
+    let mut expected = vec![
+        vec![*tokens, *hidden],
+        vec![conv, kernel],
+        vec![heads, head_dim, state_dim],
+        vec![*hidden, projection],
+        vec![conv, kernel],
+        vec![heads],
+        vec![heads],
+        vec![heads],
+        vec![inner],
+        vec![inner, *hidden],
+    ];
+    if conv_bias {
+        expected.push(vec![conv]);
+    }
+    if linear_bias {
+        expected.extend([vec![projection], vec![*hidden]]);
+    }
+    let valid = |tensor: &TensorDescriptor, shape: &[u64]| {
+        tensor.shape.symbolic.is_none()
+            && tensor.shape.dimensions == shape
+            && shape
+                .iter()
+                .try_fold(1u64, |total, dim| total.checked_mul(*dim))
+                .is_some_and(|elements| elements <= 67_108_864)
+    };
+    if !inputs
+        .iter()
+        .zip(&expected)
+        .all(|(tensor, shape)| valid(tensor, shape))
+        || !outputs
+            .iter()
+            .zip(&expected[..3])
+            .all(|(tensor, shape)| valid(tensor, shape))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn validate_shape_rule(
     rule: &ShapeRule,
     inputs: &[TensorDescriptor],
@@ -2182,6 +2290,7 @@ fn validate_shape_rule(
 ) -> Result<(), OperatorError> {
     match rule {
         ShapeRule::Any => Ok(()),
+        ShapeRule::Mamba2Mixer => validate_mamba2_mixer_shape(inputs, outputs, attributes),
         ShapeRule::Rank(rank) => inputs
             .iter()
             .chain(outputs)

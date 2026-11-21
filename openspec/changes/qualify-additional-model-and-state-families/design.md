@@ -240,6 +240,8 @@ Mamba-3 is a different operator. Invalid shapes, values, unsupported bias
 forms or missing Kernel support fail closed. Explicit state inputs/outputs are
 not Runtime-managed session state; graph-level recurrent execution stays
 disabled until the transactional lifecycle is implemented and tested.
+The Operator catalog validates state, weight and output shapes, bias-dependent
+arity and numerical attributes before a graph can be accepted for planning.
 
 The Nemotron component also derives an invocation plan for the pinned Nano
 mixer geometry. Checkpoint tensor names, shapes and dtypes for all 23 Mamba

@@ -9,6 +9,100 @@ use crate::{ShapeDescriptor, TensorDescriptor};
 use crate::compute_types::LayoutDescriptor;
 
 #[test]
+fn mamba2_mixer_validates_state_shapes_biases_and_numerics_before_dispatch() {
+    let catalog = initial_operator_catalog();
+    let spec = catalog
+        .get(&OperatorId::magnetar(
+            "mamba2-mixer",
+            1,
+            OperatorFamily::LinearAlgebra,
+        ))
+        .unwrap();
+    let tensor = |shape: &[u64]| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(shape.to_vec()),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        )
+    };
+    for conv_bias in [false, true] {
+        for linear_bias in [false, true] {
+            let mut inputs = vec![
+                tensor(&[3, 6]),
+                tensor(&[10, 2]),
+                tensor(&[2, 2, 3]),
+                tensor(&[6, 16]),
+                tensor(&[10, 2]),
+                tensor(&[2]),
+                tensor(&[2]),
+                tensor(&[2]),
+                tensor(&[4]),
+                tensor(&[4, 6]),
+            ];
+            if conv_bias {
+                inputs.push(tensor(&[10]));
+            }
+            if linear_bias {
+                inputs.extend([tensor(&[16]), tensor(&[6])]);
+            }
+            let outputs = vec![tensor(&[3, 6]), tensor(&[10, 2]), tensor(&[2, 2, 3])];
+            let mut attrs = BTreeMap::from([
+                ("heads".into(), OperatorAttributeValue::Integer(2)),
+                ("head_dim".into(), OperatorAttributeValue::Integer(2)),
+                ("groups".into(), OperatorAttributeValue::Integer(1)),
+                ("state_dim".into(), OperatorAttributeValue::Integer(3)),
+                ("conv_kernel".into(), OperatorAttributeValue::Integer(2)),
+                ("epsilon".into(), OperatorAttributeValue::Float(1e-5)),
+                ("dt_min".into(), OperatorAttributeValue::Float(0.0)),
+                (
+                    "conv_bias".into(),
+                    OperatorAttributeValue::Boolean(conv_bias),
+                ),
+                (
+                    "linear_bias".into(),
+                    OperatorAttributeValue::Boolean(linear_bias),
+                ),
+            ]);
+            spec.validate_invocation(&inputs, &outputs, &attrs).unwrap();
+            for index in [1, 2, 3, 4, 9] {
+                let mut bad = inputs.clone();
+                bad[index] = tensor(&[1]);
+                assert!(spec.validate_invocation(&bad, &outputs, &attrs).is_err());
+            }
+            let mut bad_outputs = outputs.clone();
+            bad_outputs[2] = tensor(&[2, 2, 4]);
+            assert!(
+                spec.validate_invocation(&inputs, &bad_outputs, &attrs)
+                    .is_err()
+            );
+            let mut missing = inputs.clone();
+            missing.pop();
+            assert!(
+                spec.validate_invocation(&missing, &outputs, &attrs)
+                    .is_err()
+            );
+            for (key, invalid) in [
+                ("groups", OperatorAttributeValue::Integer(3)),
+                ("state_dim", OperatorAttributeValue::Integer(i64::MAX)),
+                ("epsilon", OperatorAttributeValue::Float(0.0)),
+                ("dt_min", OperatorAttributeValue::Float(-0.1)),
+                ("dt_max", OperatorAttributeValue::Float(-0.1)),
+            ] {
+                let previous = attrs.insert(key.into(), invalid);
+                assert!(
+                    spec.validate_invocation(&inputs, &outputs, &attrs).is_err(),
+                    "{key}"
+                );
+                if let Some(previous) = previous {
+                    attrs.insert(key.into(), previous);
+                } else {
+                    attrs.remove(key);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn geodesic_residual_requires_matching_tensors_scalar_parameters_and_layer_index() {
     let catalog = initial_operator_catalog();
     let spec = catalog
