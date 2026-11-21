@@ -975,6 +975,135 @@ struct FormsGraph {
     graph: ExecutionGraph,
 }
 
+#[test]
+fn bidirectional_encoder_attention_graph_matches_pinned_modernbert_reference() {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        mask: Vec<f32>,
+        radius: Option<i64>,
+        scale: Option<f64>,
+        output: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        tokens: u64,
+        heads: u64,
+        head_dim: u64,
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        cases: Vec<Case>,
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../fixtures/encoder-attention-reference.json"
+    ))
+    .unwrap();
+    let width = fixture.heads * fixture.head_dim;
+    for case in fixture.cases {
+        let mut builder = FormsGraph {
+            graph: ExecutionGraph::new(
+                ExecutionGraphId::new("encoder-attention"),
+                ExecutionGraphPhase::Prefill,
+            ),
+        };
+        let q = builder.input("q", &[fixture.tokens, width]);
+        let k = builder.input("k", &[fixture.tokens, width]);
+        let v = builder.input("v", &[fixture.tokens, width]);
+        let mask = builder.input("mask", &[fixture.tokens]);
+        let mut attributes = vec![
+            (
+                "head_count",
+                OperatorAttributeValue::Integer(fixture.heads as i64),
+            ),
+            (
+                "head_dimension",
+                OperatorAttributeValue::Integer(fixture.head_dim as i64),
+            ),
+        ];
+        if let Some(radius) = case.radius {
+            attributes.push(("local_radius", OperatorAttributeValue::Integer(radius)));
+        }
+        if let Some(scale) = case.scale {
+            attributes.push(("scale", OperatorAttributeValue::Float(scale)));
+        }
+        let output = builder.node(
+            "encoder",
+            "encoder-attention",
+            OperatorFamily::Attention,
+            attributes,
+            vec![q, k, v, mask],
+            &[fixture.tokens, width],
+        );
+        let mut graph = builder.graph;
+        let mut edge = graph.edges.remove(&output).unwrap();
+        edge.id = TensorEdgeId::new("logits");
+        graph.edges.insert(edge.id.clone(), edge);
+        graph
+            .nodes
+            .get_mut(&ExecutionNodeId::new("encoder"))
+            .unwrap()
+            .outputs = vec![TensorEdgeId::new("logits")];
+        let model = e2e_fixture().unwrap();
+        let mut runtime = build_runtime_trusting_fixture(&model);
+        let (instance, _) = load_fixture_instance(&model, &mut runtime).unwrap();
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            fixture.tokens,
+            PreparedExecutionPlanGeneration::new(1),
+            &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+        )
+        .unwrap();
+        let shape = [fixture.tokens, width];
+        let bindings = BTreeMap::from([
+            (
+                TensorEdgeId::new("input.q"),
+                HostTensor::new(shape, fixture.q.clone()).unwrap(),
+            ),
+            (
+                TensorEdgeId::new("input.k"),
+                HostTensor::new(shape, fixture.k.clone()).unwrap(),
+            ),
+            (
+                TensorEdgeId::new("input.v"),
+                HostTensor::new(shape, fixture.v.clone()).unwrap(),
+            ),
+            (
+                TensorEdgeId::new("input.mask"),
+                HostTensor::new([fixture.tokens], case.mask).unwrap(),
+            ),
+        ]);
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &model,
+            &instance,
+            &KvCacheId::new("encoder").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = &outputs[&TensorEdgeId::new("logits")].data;
+        assert_eq!(actual.len(), case.output.len());
+        for (&a, &b) in actual.iter().zip(&case.output) {
+            assert!((a - b).abs() < 2e-6, "{}: {a} != {b}", case.name);
+        }
+    }
+}
+
 /// Runs an entire Olala MoE including routed bottleneck, shared expert and
 /// logits head against the independently executed pinned PyTorch implementation.
 #[test]

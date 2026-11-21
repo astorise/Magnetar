@@ -128,6 +128,24 @@ retirement need explicit tests before this experimental profile can run. The
 standalone Mamba-2 reference is evidence for numeric equations, not an
 implementation of this Runtime contract.
 
+### Experimental masked encoder attention
+
+ModernBERT's attention is bidirectional; its local window is symmetric and
+inclusive, unlike the decoder's causal window. Define a separate portable
+`encoder-attention@1` with f32 `q`, `k`, `v` of shape `[T, heads * head_dim]`
+and a `[T]` key-validity mask whose values are exactly 0 or 1. Output has the
+same shape as `q`; padded queries are still evaluated as upstream does, but
+only valid keys contribute. An optional nonnegative `local_radius` admits
+keys with `abs(query_index-key_index) <= local_radius`; absent means global.
+Every query must have at least one admitted key, otherwise fail explicitly.
+The optional finite positive `scale` defaults to `1/sqrt(head_dim)`. Position
+encoding is supplied by the Component before attention; this single-sequence
+form does not infer positions, concatenate documents or silently repurpose a
+decoder KV cache. ModernBERT's default position IDs are physical indices and
+its local radius is `local_attention / 2` at the pinned Transformers profile.
+This primitive does not by itself implement an encoder, padding-aware batching
+or Laya's learned decision head. Unsupported Providers do not advertise it.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

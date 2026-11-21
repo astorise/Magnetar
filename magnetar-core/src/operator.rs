@@ -1380,6 +1380,15 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // Q, K and V; with `latent_kv_width`, the latent K and V's key and
         // value projections (`chunk-latent-prefills`).
         ("attention", OperatorFamily::Attention, 5, 1, ShapeRule::Any),
+        // Single-sequence bidirectional attention with a binary key mask and
+        // an optional inclusive symmetric local radius.
+        (
+            "encoder-attention",
+            OperatorFamily::Attention,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
         (
             "paged-attention",
             OperatorFamily::Attention,
@@ -1532,6 +1541,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 .with_workspace()
                 .with_paged_kv_cache();
         }
+        if name == "encoder-attention" {
+            spec.memory = OperatorMemoryBehavior::pure().with_workspace();
+            spec.dtype_contracts = vec![
+                OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Accumulation, [ComputeDType::Float32]),
+            ];
+        }
         if matches!(
             family,
             OperatorFamily::Normalization | OperatorFamily::Activation
@@ -1558,6 +1575,23 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "encoder-attention" => OperatorAttributeSchema::default()
+            .with_rule(
+                "head_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dimension",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "local_radius",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "scale",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            ),
         "geodesic-residual" => OperatorAttributeSchema::default().with_rule(
             "layer_index",
             OperatorAttributeRule::required(OperatorAttributeKind::Integer),

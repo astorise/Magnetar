@@ -9,7 +9,11 @@
 
 use crate::tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
 
+mod encoder_attention;
 mod sigmoid_routing;
+pub use encoder_attention::{
+    EncoderAttention, encoder_attention, encoder_attention_from_attributes,
+};
 pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,

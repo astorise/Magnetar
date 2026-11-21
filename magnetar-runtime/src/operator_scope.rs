@@ -464,7 +464,7 @@ fn validate_first_scope_attributes(
     }
 }
 
-const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 37] = [
+const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 38] = [
     required_now("embedding", OperatorFamily::Tensor, true),
     required_now("matmul", OperatorFamily::LinearAlgebra, true),
     required_now("rmsnorm", OperatorFamily::Normalization, true),
@@ -483,6 +483,7 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 37] = [
     first_decoder_optional("moe-experts", OperatorFamily::LinearAlgebra),
     first_decoder_optional("row-scale", OperatorFamily::Tensor),
     first_decoder_optional("geodesic-residual", OperatorFamily::Tensor),
+    first_decoder_optional("encoder-attention", OperatorFamily::Attention),
     // `express-latent-attention-forms`: queries and keys joined head by head.
     first_decoder_optional("concat", OperatorFamily::Tensor),
     first_decoder_optional("activation", OperatorFamily::Activation),

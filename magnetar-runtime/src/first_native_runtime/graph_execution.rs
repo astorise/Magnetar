@@ -580,6 +580,29 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "encoder-attention" => {
+            if inputs.len() != 4 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects q, k, v and a key mask"),
+                });
+            }
+            let output_descriptor = f32_tensor_descriptor_from_shape(inputs[0].shape());
+            let resources = ["q", "k", "v", "key_mask"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("encoder-attention", OperatorFamily::Attention),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "attention" => {
             // Five inputs: latent K and V and their key and value
             // projections (`latent_kv_width`, `chunk-latent-prefills`).
@@ -1412,6 +1435,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "row-scale"
                 | "activation"
                 | "attention"
+                | "encoder-attention"
                 | "gelu"
                 | "silu"
                 | "add"

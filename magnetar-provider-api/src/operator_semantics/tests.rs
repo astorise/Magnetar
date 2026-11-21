@@ -4,6 +4,8 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
+use crate::operator::OperatorAttributeValue;
+use std::collections::BTreeMap;
 
 #[test]
 fn relu_squared_rejects_nonfinite_values_and_overflow() {
@@ -15,6 +17,64 @@ fn relu_squared_rejects_nonfinite_values_and_overflow() {
     for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
         assert!(relu_squared(&HostTensor::new([1], vec![value]).unwrap()).is_err());
     }
+}
+
+#[test]
+fn encoder_attention_rejects_bad_masks_empty_windows_and_invalid_configuration() {
+    let q = HostTensor::new([3, 2], vec![0.0; 6]).unwrap();
+    let v = HostTensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 90.0, 90.0]).unwrap();
+    let config = EncoderAttention {
+        heads: 1,
+        head_dim: 2,
+        local_radius: Some(1),
+        scale: None,
+    };
+    let valid = HostTensor::new([3], vec![1.0, 1.0, 0.0]).unwrap();
+    assert_eq!(
+        encoder_attention(&q, &q, &v, &valid, config).unwrap().data,
+        vec![2.0, 3.0, 2.0, 3.0, 3.0, 4.0]
+    );
+    for mask in [
+        vec![0.0, 0.0, 0.0],
+        vec![1.0, 0.5, 0.0],
+        vec![1.0, f32::NAN, 0.0],
+        vec![1.0, 0.0, 0.0],
+    ] {
+        assert!(
+            encoder_attention(&q, &q, &v, &HostTensor::new([3], mask).unwrap(), config).is_err()
+        );
+    }
+    assert!(
+        encoder_attention(&q, &q, &v, &valid, EncoderAttention { heads: 2, ..config }).is_err()
+    );
+    assert!(
+        encoder_attention(
+            &q,
+            &q,
+            &v,
+            &valid,
+            EncoderAttention {
+                scale: Some(f32::NAN),
+                ..config
+            }
+        )
+        .is_err()
+    );
+    let bad = HostTensor::new([3, 2], vec![f32::INFINITY; 6]).unwrap();
+    assert!(encoder_attention(&bad, &q, &v, &valid, config).is_err());
+    let mut attributes = BTreeMap::from([
+        ("head_count".into(), OperatorAttributeValue::Integer(1)),
+        ("head_dimension".into(), OperatorAttributeValue::Integer(2)),
+        ("local_radius".into(), OperatorAttributeValue::Integer(-1)),
+    ]);
+    assert!(encoder_attention_from_attributes(&attributes).is_err());
+    attributes.insert("local_radius".into(), OperatorAttributeValue::Integer(0));
+    assert_eq!(
+        encoder_attention_from_attributes(&attributes)
+            .unwrap()
+            .local_radius,
+        Some(0)
+    );
 }
 
 fn tensor(rows: u64, cols: u64, seed: u64) -> HostTensor {
