@@ -764,14 +764,13 @@ pub(super) fn build_first_native_graphs_with_runtime(
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
+    let Some(engine_key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
     let result = (|| {
-        let engine_key = manager
-            .engine_instance_key(instance)
-            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
-                reason: "component instance has no engine key".into(),
-            })?
-            .to_string();
-
         let export_interface = WitInterface::new(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
@@ -830,10 +829,9 @@ pub(super) fn build_first_native_graphs_with_runtime(
 
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;
+        validate_recurrent_graph_pair(&prefill, &decode)?;
         validate_rope_frequency_scaling(&prefill, config)?;
         validate_rope_frequency_scaling(&decode, config)?;
-        capability.clear_session(&engine_key);
-        model_config_capability.clear_config(&engine_key);
         Ok(FirstNativeComponentGraphs {
             prefill_node_count: prefill.nodes.len(),
             decode_node_count: decode.nodes.len(),
@@ -841,8 +839,44 @@ pub(super) fn build_first_native_graphs_with_runtime(
             decode,
         })
     })();
+    capability.clear_session(&engine_key);
+    model_config_capability.clear_config(&engine_key);
     let _ = manager.destroy_instance(instance);
     result.map(|graphs| (graphs, definition, instance))
+}
+
+/// Both phases must describe the same fixed-size slots before they can ever
+/// share a session. Each individual graph has already been validated by the
+/// graph-builder, including its input/output pair for every slot.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_recurrent_graph_pair(
+    prefill: &ExecutionGraph,
+    decode: &ExecutionGraph,
+) -> Result<(), E2eConformanceError> {
+    fn inputs(
+        graph: &ExecutionGraph,
+    ) -> BTreeMap<&str, (&GraphRecurrentStateMetadata, &TensorDescriptor)> {
+        graph
+            .edges
+            .values()
+            .filter_map(|edge| {
+                let state = edge.recurrent_state.as_ref()?;
+                (state.behavior == GraphRecurrentStateBehavior::Input)
+                    .then_some((state.resource_id.as_str(), (state, &edge.descriptor)))
+            })
+            .collect()
+    }
+
+    if prefill.phase != ExecutionGraphPhase::Prefill
+        || decode.phase != ExecutionGraphPhase::Decode
+        || inputs(prefill) != inputs(decode)
+    {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "prefill and decode graphs have incompatible recurrent state schemas or phases"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 /// [`build_first_native_graphs_with_runtime`]'s per-Device pipeline-
@@ -881,14 +915,13 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
+    let Some(engine_key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
     let result = (|| {
-        let engine_key = manager
-            .engine_instance_key(instance)
-            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
-                reason: "component instance has no engine key".into(),
-            })?
-            .to_string();
-
         let export_interface = WitInterface::new(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
@@ -940,10 +973,10 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
 
         validate_first_scope_graph(&segment)?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
-        capability.clear_session(&engine_key);
-        model_config_capability.clear_config(&engine_key);
         Ok(segment)
     })();
+    capability.clear_session(&engine_key);
+    model_config_capability.clear_config(&engine_key);
     let _ = manager.destroy_instance(instance);
     result.map(|graph| (graph, definition, instance))
 }
@@ -1003,14 +1036,13 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
+    let Some(engine_key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
     let result = (|| {
-        let engine_key = manager
-            .engine_instance_key(instance)
-            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
-                reason: "component instance has no engine key".into(),
-            })?
-            .to_string();
-
         let export_interface = WitInterface::new(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
@@ -1062,10 +1094,10 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
 
         validate_first_scope_graph(&segment)?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
-        capability.clear_session(&engine_key);
-        model_config_capability.clear_config(&engine_key);
         Ok(segment)
     })();
+    capability.clear_session(&engine_key);
+    model_config_capability.clear_config(&engine_key);
     let _ = manager.destroy_instance(instance);
     result.map(|graph| (graph, definition, instance))
 }

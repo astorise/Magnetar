@@ -7,6 +7,193 @@ use super::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn decoder_graph_pair_requires_matching_recurrent_schemas() {
+    let make_graph = |phase| {
+        let input_id = TensorEdgeId::new("state.in");
+        let output_id = TensorEdgeId::new("state.out");
+        let state = |behavior| GraphRecurrentStateMetadata {
+            resource_id: "model.state.layer0.conv".into(),
+            layer: 0,
+            slot: "conv".into(),
+            behavior,
+            compatibility_key: "component-v1".into(),
+        };
+        let mut input =
+            TensorEdge::new(input_id.clone(), f32_tensor_descriptor_from_shape(&[2, 3]));
+        input.recurrent_state = Some(state(GraphRecurrentStateBehavior::Input));
+        let mut output =
+            TensorEdge::new(output_id.clone(), f32_tensor_descriptor_from_shape(&[2, 3]));
+        output.recurrent_state = Some(state(GraphRecurrentStateBehavior::Output));
+        ExecutionGraph::new(ExecutionGraphId::new("pair-test"), phase)
+            .with_edge(input)
+            .with_edge(output)
+            .with_node(
+                ExecutionNode::new(
+                    ExecutionNodeId::new("update"),
+                    OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+                )
+                .with_input(input_id)
+                .with_output(output_id),
+            )
+    };
+    let prefill = make_graph(ExecutionGraphPhase::Prefill);
+    let decode = make_graph(ExecutionGraphPhase::Decode);
+    for graph in [&prefill, &decode] {
+        graph.validate(&initial_operator_catalog()).unwrap();
+    }
+    validate_recurrent_graph_pair(&prefill, &decode).unwrap();
+    for difference in ["shape", "slot", "compatibility", "missing"] {
+        let mut incompatible = decode.clone();
+        for edge in incompatible.edges.values_mut() {
+            match difference {
+                "shape" => edge.descriptor = f32_tensor_descriptor_from_shape(&[2, 4]),
+                "slot" => {
+                    let state = edge.recurrent_state.as_mut().unwrap();
+                    state.slot = "ssm".into();
+                    state.resource_id = "model.state.layer0.ssm".into();
+                }
+                "compatibility" => {
+                    edge.recurrent_state.as_mut().unwrap().compatibility_key =
+                        "another-component".into();
+                }
+                "missing" => edge.recurrent_state = None,
+                _ => unreachable!(),
+            }
+        }
+        incompatible.validate(&initial_operator_catalog()).unwrap();
+        assert!(
+            validate_recurrent_graph_pair(&prefill, &incompatible).is_err(),
+            "accepted incompatible {difference}"
+        );
+    }
+    assert!(validate_recurrent_graph_pair(&decode, &prefill).is_err());
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn failed_decoder_graph_builds_release_host_capability_state() {
+    struct RecordingCapability {
+        inner: Arc<dyn HostCapability>,
+        keys: Arc<Mutex<Vec<String>>>,
+        reject_weights: bool,
+    }
+    impl HostCapability for RecordingCapability {
+        fn call(
+            &self,
+            key: &str,
+            operation: &str,
+            arguments: &[ComponentValue],
+        ) -> Result<Vec<ComponentValue>, ComponentError> {
+            self.keys.lock().unwrap().push(key.to_string());
+            if self.reject_weights && operation == "weight-edge" {
+                return Err(ComponentError::CapabilityCallRejected {
+                    capability: "graph-builder".into(),
+                    instance_key: key.into(),
+                    message: "injected missing weight".into(),
+                });
+            }
+            self.inner.call(key, operation, arguments)
+        }
+    }
+
+    let graph = Arc::new(GraphBuilderCapability::new());
+    let config = Arc::new(ModelConfigCapability::new());
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().unwrap(),
+    ));
+    manager.set_resource_limits(inference_component_runtime_limits());
+    manager
+        .set_trust_store(ComponentTrustStore::default().trust_digest(QWEN_REAL_COMPONENT_DIGEST));
+    for (name, inner) in [
+        (
+            "magnetar:model-component-graph/graph-builder",
+            graph.clone() as Arc<dyn HostCapability>,
+        ),
+        (
+            "magnetar:model-component-graph/model-config",
+            config.clone() as Arc<dyn HostCapability>,
+        ),
+    ] {
+        manager.provide_capability(
+            WitInterface::new(name, "1.8.0"),
+            Arc::new(RecordingCapability {
+                inner,
+                keys: keys.clone(),
+                reject_weights: name.ends_with("graph-builder"),
+            }),
+        );
+    }
+    let definition = manager
+        .prepare_pushed_package(qwen_real_component_package().unwrap())
+        .unwrap();
+    let manager = Mutex::new(manager);
+    let fixture = e2e_fixture().unwrap();
+    let architecture = architecture_config_from_first_native_model_config(&fixture.config);
+    for stage in ["full", "prefill-segment", "decode-segment"] {
+        keys.lock().unwrap().clear();
+        let failed = match stage {
+            "full" => build_first_native_graphs_with_runtime(
+                &manager,
+                &graph,
+                &config,
+                definition,
+                &architecture,
+                weight_shapes_for_architecture_config(&architecture),
+                &fixture.identity,
+                2,
+            )
+            .is_err(),
+            "prefill-segment" => build_first_native_prefill_graph_segment_with_runtime(
+                &manager,
+                &graph,
+                &config,
+                definition,
+                &fixture.config,
+                &fixture.identity,
+                2,
+                0,
+                architecture.num_hidden_layers,
+            )
+            .is_err(),
+            _ => build_first_native_decode_graph_segment_with_runtime(
+                &manager,
+                &graph,
+                &config,
+                definition,
+                &fixture.config,
+                &fixture.identity,
+                2,
+                0,
+                architecture.num_hidden_layers,
+            )
+            .is_err(),
+        };
+        assert!(failed, "{stage} must fail on the missing weight");
+        let recorded = keys.lock().unwrap().clone();
+        let key = recorded
+            .first()
+            .expect("the Component invoked a capability");
+        assert!(recorded.iter().all(|recorded| recorded == key));
+        assert!(
+            graph
+                .call(
+                    key,
+                    "kv-resource",
+                    &[ComponentValue::S64(0), ComponentValue::Enum("k".into())],
+                )
+                .is_err(),
+            "{stage} left a graph-builder session"
+        );
+        assert!(
+            config.call(key, "model-config", &[]).is_err(),
+            "{stage} left a model configuration"
+        );
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn encoder_graph_boundary_rejects_missing_or_incompatible_inputs_and_outputs() {
     let fixture = e2e_fixture().unwrap();
     let request = FirstNativeEncoderGraphRequest {

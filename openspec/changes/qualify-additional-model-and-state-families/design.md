@@ -194,6 +194,9 @@ alias or be KV/prefix edges. Fingerprints include state metadata and fusion
 cannot remove a state edge. A real Wasmtime Component tests both graph phases;
 older Components continue linking through their original versions. Planning and
 execution explicitly reject these graphs while lifecycle support is absent.
+Before a decoder graph pair is returned, the Runtime also checks that prefill
+and decode declare the same state identities, layers, slots, compatibility
+keys and tensor descriptors; mismatched phases or schemas are rejected.
 
 For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and
