@@ -482,6 +482,8 @@ fn kv_update_transaction_falls_back_to_reference_cpu_when_unbound() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
+        session: None,
+        tokenizer: generation_tokenizer_reference(&e2e_fixture().unwrap()),
         layer_kv: LayerKvMap::new(),
         provider: None,
     };

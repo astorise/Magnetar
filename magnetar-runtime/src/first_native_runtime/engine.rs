@@ -892,6 +892,10 @@ impl ComponentGraphCache {
 pub(super) struct FirstNativeExecutionKvState {
     pub(super) cache: KvCacheId,
     pub(super) compatibility: KvCacheCompatibility,
+    /// The owner is retained even if an abandoned cache has already been
+    /// forgotten, so cleanup cannot cross a session or tokenizer boundary.
+    pub(super) session: Option<InferenceSessionId>,
+    pub(super) tokenizer: GenerationTokenizerReference,
     pub(super) layer_kv: LayerKvMap,
     /// The Provider `execute_first_native_graph` actually resolved and wrote this
     /// step's pending K/V resources under. `None` before the first graph
@@ -958,6 +962,8 @@ impl E2eRuntimeModelExecutionEngine {
         Ok(FirstNativeExecutionKvState {
             cache: cache_id,
             compatibility,
+            session: request.session.clone(),
+            tokenizer: request.tokenizer.clone(),
             layer_kv: LayerKvMap::new(),
             provider: None,
         })
@@ -967,17 +973,64 @@ impl E2eRuntimeModelExecutionEngine {
         request.request_id.as_str().to_string()
     }
 
+    /// Request IDs alone are not an authority to read or destroy state. A
+    /// caller reusing an ID must also match the original owner and prompt.
+    fn validate_kv_state_owner(
+        &self,
+        state: &FirstNativeExecutionKvState,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        let requested = self.kv_compatibility(request);
+        if state.session != request.session
+            || state.tokenizer != request.tokenizer
+            || state.compatibility.model != requested.model
+            || state.compatibility.tokenizer != requested.tokenizer
+            || state.compatibility.prefix_fingerprint != requested.prefix_fingerprint
+        {
+            return Err(InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state belongs to a different request owner or prompt"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Check ownership before touching replay, pools or pending writes.
+    fn validate_kv_request_owner(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        let key = Self::kv_state_key(request);
+        for states in [&self.kv_states, &self.pending_kv_states] {
+            let states = states
+                .lock()
+                .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                    reason: "first-native KV state lock poisoned".into(),
+                })?;
+            if let Some(state) = states.get(&key) {
+                self.validate_kv_state_owner(state, request)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn store_kv_state(
         &self,
         request: &GenerationRequest,
         state: FirstNativeExecutionKvState,
     ) -> Result<(), InferenceApiError> {
-        self.kv_states
-            .lock()
-            .map_err(|_| InferenceApiError::KvCacheUnavailable {
-                reason: "first-native KV state lock poisoned".into(),
-            })?
-            .insert(Self::kv_state_key(request), state);
+        self.validate_kv_state_owner(&state, request)?;
+        let key = Self::kv_state_key(request);
+        let mut states =
+            self.kv_states
+                .lock()
+                .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                    reason: "first-native KV state lock poisoned".into(),
+                })?;
+        if let Some(existing) = states.get(&key) {
+            self.validate_kv_state_owner(existing, request)?;
+        }
+        states.insert(key, state);
         Ok(())
     }
 
@@ -986,12 +1039,18 @@ impl E2eRuntimeModelExecutionEngine {
         request: &GenerationRequest,
         state: FirstNativeExecutionKvState,
     ) -> Result<(), InferenceApiError> {
-        self.pending_kv_states
-            .lock()
-            .map_err(|_| InferenceApiError::KvCacheUnavailable {
-                reason: "first-native pending KV state lock poisoned".into(),
-            })?
-            .insert(Self::kv_state_key(request), state);
+        self.validate_kv_state_owner(&state, request)?;
+        let key = Self::kv_state_key(request);
+        let mut states =
+            self.pending_kv_states
+                .lock()
+                .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                    reason: "first-native pending KV state lock poisoned".into(),
+                })?;
+        if let Some(existing) = states.get(&key) {
+            self.validate_kv_state_owner(existing, request)?;
+        }
+        states.insert(key, state);
         Ok(())
     }
 
@@ -999,12 +1058,18 @@ impl E2eRuntimeModelExecutionEngine {
         &self,
         request: &GenerationRequest,
     ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
-        self.pending_kv_states
-            .lock()
-            .map_err(|_| InferenceApiError::KvCacheUnavailable {
-                reason: "first-native pending KV state lock poisoned".into(),
-            })?
-            .remove(&Self::kv_state_key(request))
+        let key = Self::kv_state_key(request);
+        let mut states =
+            self.pending_kv_states
+                .lock()
+                .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                    reason: "first-native pending KV state lock poisoned".into(),
+                })?;
+        if let Some(state) = states.get(&key) {
+            self.validate_kv_state_owner(state, request)?;
+        }
+        states
+            .remove(&key)
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: "generation step has no pending first-native KV state to commit".into(),
             })
@@ -1022,13 +1087,18 @@ impl E2eRuntimeModelExecutionEngine {
         runtime: &mut Runtime,
         request: &GenerationRequest,
     ) -> Result<(), InferenceApiError> {
-        let discarded = self
-            .pending_kv_states
-            .lock()
-            .map_err(|_| InferenceApiError::KvCacheUnavailable {
-                reason: "first-native pending KV state lock poisoned".into(),
-            })?
-            .remove(&Self::kv_state_key(request));
+        let key = Self::kv_state_key(request);
+        let mut pending =
+            self.pending_kv_states
+                .lock()
+                .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                    reason: "first-native pending KV state lock poisoned".into(),
+                })?;
+        if let Some(state) = pending.get(&key) {
+            self.validate_kv_state_owner(state, request)?;
+        }
+        let discarded = pending.remove(&key);
+        drop(pending);
         let Some(discarded) = discarded else {
             return Ok(());
         };
@@ -1095,6 +1165,12 @@ impl E2eRuntimeModelExecutionEngine {
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: "decode requires existing first-native KV state".into(),
             })?;
+        self.validate_kv_state_owner(&state, request)?;
+        if runtime.kv_cache(&state.cache)?.session != state.session {
+            return Err(InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV cache session does not match its owner".into(),
+            });
+        }
         runtime.validate_kv_cache_reuse(&state.cache, &state.compatibility, None)?;
         Ok(state)
     }
@@ -1626,6 +1702,7 @@ impl E2eRuntimeModelExecutionEngine {
         greedy: Option<&crate::SamplingRequest>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         let kv_clock = runtime.phase_ledger().clock();
+        self.validate_kv_request_owner(request)?;
         self.discard_pending_kv_state(runtime, request)?;
         let prefill = generated_tokens.is_empty();
         let mut kv_state = if prefill {
@@ -2152,6 +2229,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         _accepted_token: TokenId,
         _step: &RuntimeModelExecutionStep,
     ) -> Result<(), InferenceApiError> {
+        self.validate_kv_request_owner(request)?;
         let mut state = self.take_pending_kv_state(request)?;
         // Validate the cache transition before promoting resources. A sealed
         // or full cache must not replace the preceding committed generation.
@@ -2198,6 +2276,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         runtime: &mut Runtime,
         request: &GenerationRequest,
     ) -> Result<(), InferenceApiError> {
+        self.validate_kv_request_owner(request)?;
         self.step_replay.release(&Self::kv_state_key(request));
         self.discard_pending_kv_state(runtime, request)?;
         // A pooled store set outlives its request (`replay-bucketed-prefill`).

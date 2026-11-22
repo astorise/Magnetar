@@ -220,6 +220,11 @@ layout in deterministic resource-id order. Cross-phase comparisons use the
 layout, since edge names are local to each graph. Extraction checks the
 recurrent boundary only and never replaces whole-graph validation; its logical
 identity is not a session, model instance, Provider or allocation identity.
+The existing first-native KV path retains the request's session, model,
+tokenizer metadata and prompt fingerprint with both pending and committed
+state. It checks them before decode, retry, commit or release, including when
+an abandoned cache has already been forgotten. A colliding request id alone
+does not authorize access to or cleanup of another request's state.
 
 For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and

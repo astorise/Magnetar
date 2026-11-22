@@ -4839,6 +4839,8 @@ pub(super) fn check_incremental_decode_matches_full_sequence_oracle(
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
+        session: None,
+        tokenizer: generation_tokenizer_reference(fixture),
         // The hand-rolled decode oracle's own return is a plain, densely
         // 0-indexed `Vec` (it processes every layer unconditionally, never
         // a segment), so its Vec index already equals the real layer
@@ -5684,6 +5686,8 @@ pub(super) fn check_incremental_decode_rejects_missing_layer_kv(
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
+        session: None,
+        tokenizer: generation_tokenizer_reference(fixture),
         layer_kv: LayerKvMap::new(),
         provider: None,
     };
