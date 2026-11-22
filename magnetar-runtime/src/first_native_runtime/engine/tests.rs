@@ -557,6 +557,25 @@ fn same_request_id_cannot_reuse_or_discard_another_sessions_kv() {
         .unwrap();
     let cache = prefill_cache_id_from_step(&prefill).unwrap();
     let committed = runtime.kv_cache(&cache).unwrap().clone();
+    assert_eq!(
+        committed.compatibility.tokenizer_vocabulary_size,
+        request.tokenizer.metadata.vocabulary_size
+    );
+    assert!(committed.compatibility.model_architecture.is_some());
+
+    let mut other_component = engine.clone();
+    other_component.component_digest = Some(ComponentDigest::sha256(b"different component"));
+    assert!(
+        other_component
+            .decode_kv_state(&mut runtime, &request)
+            .is_err()
+    );
+    assert!(
+        other_component
+            .release_request_state(&mut runtime, &request)
+            .is_err()
+    );
+    assert_eq!(runtime.kv_cache(&cache).unwrap(), &committed);
 
     let mut no_session = request.clone();
     no_session.session = None;

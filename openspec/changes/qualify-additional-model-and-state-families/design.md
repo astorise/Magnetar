@@ -228,6 +228,10 @@ does not authorize access to or cleanup of another request's state.
 KV compatibility validation also compares declared component architecture,
 model revision, tokenizer vocabulary size and attention implementation;
 an absent declaration does not match a present one.
+First-native generation records its Component identity and version together
+with the supplied artifact digest (or its built-in default marker), and the
+tokenizer vocabulary size. A changed Component cannot read or release an
+existing request's state solely by reusing the same request id.
 
 For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and

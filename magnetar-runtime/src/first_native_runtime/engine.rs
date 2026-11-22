@@ -984,7 +984,9 @@ impl E2eRuntimeModelExecutionEngine {
         if state.session != request.session
             || state.tokenizer != request.tokenizer
             || state.compatibility.model != requested.model
+            || state.compatibility.model_architecture != requested.model_architecture
             || state.compatibility.tokenizer != requested.tokenizer
+            || state.compatibility.tokenizer_vocabulary_size != requested.tokenizer_vocabulary_size
             || state.compatibility.prefix_fingerprint != requested.prefix_fingerprint
         {
             return Err(InferenceApiError::KvCacheUnavailable {
@@ -1176,7 +1178,7 @@ impl E2eRuntimeModelExecutionEngine {
     }
 
     pub(super) fn kv_compatibility(&self, request: &GenerationRequest) -> KvCacheCompatibility {
-        KvCacheCompatibility::new(
+        let mut compatibility = KvCacheCompatibility::new(
             request.model.clone(),
             request.tokenizer.tokenizer_id.clone(),
         )
@@ -1184,7 +1186,18 @@ impl E2eRuntimeModelExecutionEngine {
             &request.input_token_ids,
             request.request_id.as_str(),
             &request.tokenizer.tokenizer_id,
-        ))
+        ));
+        let digest = self
+            .component_digest
+            .as_ref()
+            .map(|digest| digest.value.as_str())
+            .unwrap_or("runtime-default");
+        compatibility.model_architecture = Some(format!(
+            "{}@{}|{}",
+            self.fixture.identity.id, self.fixture.identity.version.0, digest
+        ));
+        compatibility.tokenizer_vocabulary_size = request.tokenizer.metadata.vocabulary_size;
+        compatibility
     }
 }
 
