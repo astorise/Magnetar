@@ -956,13 +956,13 @@ impl Runtime {
     fn release_kv_cache_memory(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
         if let Some(allocation) = self.kv_cache(cache)?.residency.memory_allocation {
             // Already released (possibly so long ago that it has left the
-            // MemoryManager's bounded retired history): nothing to do.
-            if !self.memory.is_live_allocation(allocation) {
-                return Ok(());
+            // MemoryManager's bounded retired history): skip this allocation,
+            // but still release any live per-layer allocations below.
+            if self.memory.is_live_allocation(allocation) {
+                self.memory
+                    .release(allocation)
+                    .map_err(|_| KvCacheError::CacheReleased)?;
             }
-            self.memory
-                .release(allocation)
-                .map_err(|_| KvCacheError::CacheReleased)?;
         }
         // Release every layer's committed K/V tensor resource allocation
         // (task 7.1/7.4 cleanup) -- these are separate, per-layer

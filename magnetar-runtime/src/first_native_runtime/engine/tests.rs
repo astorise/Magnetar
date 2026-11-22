@@ -727,6 +727,42 @@ fn kv_steps_require_the_committed_generated_token_history() {
         .unwrap();
 }
 
+#[test]
+fn released_coarse_kv_allocation_does_not_skip_layer_cleanup() {
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let engine = new_copy_based_kv_lifecycle_engine(&fixture);
+    let request = kv_lifecycle_test_request(
+        &fixture,
+        &runtime,
+        &instance,
+        "kv-coarse-already-released",
+        None,
+        &[1, 2],
+    )
+    .unwrap();
+    let mut plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2).unwrap();
+    let prefill = engine
+        .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+        .unwrap();
+    engine
+        .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+        .unwrap();
+    let cache = prefill_cache_id_from_step(&prefill).unwrap();
+    let binding = runtime.kv_cache(&cache).unwrap().layer_resources[&0].clone();
+    let coarse = runtime.allocate_kv_cache_memory(&cache).unwrap();
+    runtime.memory_mut().release(coarse).unwrap();
+    assert!(runtime.memory().is_live_allocation(binding.k_allocation));
+    assert!(runtime.memory().is_live_allocation(binding.v_allocation));
+    runtime.release_kv_cache(&cache).unwrap();
+    assert!(!runtime.memory().is_live_allocation(binding.k_allocation));
+    assert!(!runtime.memory().is_live_allocation(binding.v_allocation));
+    engine
+        .release_request_state(&mut runtime, &request)
+        .unwrap();
+}
+
 /// `turboquant-kv-history`: a prefill records its stores' precisions in
 /// the history's compatibility and KV layout metadata (none for f32, as
 /// before), and a history is not continued once this model's stores
