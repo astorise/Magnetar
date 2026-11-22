@@ -1358,6 +1358,10 @@ fn kv_cache_compatibility_embeds_component_version() {
         compatibility_v1.model_architecture,
         compatibility_v2.model_architecture
     );
+    assert!(matches!(
+        compatibility_v1.validate_reuse(&compatibility_v2),
+        Err(crate::KvCacheError::CacheModelMismatch)
+    ));
 }
 
 #[test]

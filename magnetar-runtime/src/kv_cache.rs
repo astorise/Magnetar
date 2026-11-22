@@ -346,10 +346,15 @@ impl KvCacheCompatibility {
     }
 
     pub fn validate_reuse(&self, requested: &Self) -> Result<(), KvCacheError> {
-        if self.model != requested.model {
+        if self.model != requested.model
+            || self.model_architecture != requested.model_architecture
+            || self.model_revision != requested.model_revision
+        {
             return Err(KvCacheError::CacheModelMismatch);
         }
-        if self.tokenizer != requested.tokenizer {
+        if self.tokenizer != requested.tokenizer
+            || self.tokenizer_vocabulary_size != requested.tokenizer_vocabulary_size
+        {
             return Err(KvCacheError::CacheTokenizerMismatch);
         }
         if self.prefix_fingerprint != requested.prefix_fingerprint {
@@ -357,6 +362,9 @@ impl KvCacheCompatibility {
         }
         if self.position_encoding != requested.position_encoding {
             return Err(KvCacheError::CachePositionMismatch);
+        }
+        if self.attention_implementation != requested.attention_implementation {
+            return Err(KvCacheError::CacheLayoutMismatch);
         }
         if self.quantization_mode != requested.quantization_mode {
             return Err(KvCacheError::CacheDTypeMismatch);

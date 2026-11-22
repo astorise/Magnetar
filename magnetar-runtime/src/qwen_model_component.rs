@@ -1471,9 +1471,8 @@ pub fn qwen_config_fingerprint(config: &FirstNativeModelConfig) -> String {
 
 /// Build [`crate::KvCacheCompatibility`] carrying Qwen Component identity and
 /// version metadata (via [`qwen_component_compatibility_key`]) in its
-/// `model_architecture` field, so that Qwen Component changes are visible in
-/// KV Cache compatibility metadata even though the base contract does not yet
-/// enforce it in `validate_reuse`.
+/// `model_architecture` field, so `validate_reuse` rejects a different
+/// Component identity or version.
 pub fn qwen_kv_cache_compatibility(
     identity: &ModelComponentIdentity,
     model: crate::GenerationModelReference,

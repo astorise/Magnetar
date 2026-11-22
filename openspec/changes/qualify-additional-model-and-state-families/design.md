@@ -225,6 +225,9 @@ tokenizer metadata and prompt fingerprint with both pending and committed
 state. It checks them before decode, retry, commit or release, including when
 an abandoned cache has already been forgotten. A colliding request id alone
 does not authorize access to or cleanup of another request's state.
+KV compatibility validation also compares declared component architecture,
+model revision, tokenizer vocabulary size and attention implementation;
+an absent declaration does not match a present one.
 
 For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and
