@@ -407,7 +407,7 @@ impl E2eRuntimeModelExecutionEngine {
                 }
             }
         }
-        execute_first_native_graph_materializing(
+        execute_first_native_graph_namespaced(
             runtime,
             &self.fixture,
             model_instance,
@@ -421,6 +421,8 @@ impl E2eRuntimeModelExecutionEngine {
             MaterializedEdges::Only(&["logits"]),
             Some(&graphs.decode_memo),
             kv_stores,
+            None,
+            true,
         )
         .map(|output| (output, None))
     }
@@ -551,6 +553,7 @@ impl E2eRuntimeModelExecutionEngine {
             Some(step.memo),
             kv_stores,
             step.resource_namespace,
+            false,
         );
         let end_clock = runtime.phase_ledger().clock();
         let captured = match executed {

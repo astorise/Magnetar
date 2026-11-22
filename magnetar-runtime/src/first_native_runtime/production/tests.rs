@@ -945,18 +945,7 @@ fn failed_generation_releases_session_before_a_first_commit() {
     )
     .unwrap();
     model.set_prefill_buckets(Vec::new());
-    let weight = model
-        .runtime
-        .model_instances()
-        .instance(&model.instance)
-        .unwrap()
-        .definition()
-        .resource_bindings
-        .weights["layers.0.self_attn.q_proj"]
-        .clone();
     let executor = provider.executor();
-    let saved = executor.read_tensor(&weight).unwrap();
-    assert!(executor.release_tensor(&weight));
     let sessions_before = model.runtime.sessions().count();
     let caches_before = model.runtime.kv_caches().caches().count();
     let request = || ProductionGenerationRequest {
@@ -966,10 +955,36 @@ fn failed_generation_releases_session_before_a_first_commit() {
         max_new_tokens: Some(2),
         max_generation_millis: None,
     };
-    assert!(model.generate(request(), None).is_err());
-    assert_eq!(model.runtime.sessions().count(), sessions_before);
-    assert_eq!(model.runtime.kv_caches().caches().count(), caches_before);
-    executor.write_tensor(weight, saved);
+    for name in [
+        "layers.0.self_attn.q_proj",
+        "layers.0.self_attn.v_proj",
+        "layers.0.mlp.down_proj",
+    ] {
+        let weight = model
+            .runtime
+            .model_instances()
+            .instance(&model.instance)
+            .unwrap()
+            .definition()
+            .resource_bindings
+            .weights[name]
+            .clone();
+        let saved = executor.read_tensor(&weight).unwrap();
+        assert!(executor.release_tensor(&weight));
+        let observation_start = model.runtime.kv_caches().observations().len();
+        assert!(model.generate(request(), None).is_err());
+        assert_eq!(model.runtime.sessions().count(), sessions_before);
+        assert_eq!(model.runtime.kv_caches().caches().count(), caches_before);
+        let cache = model.runtime.kv_caches().observations()[observation_start..]
+            .iter()
+            .find_map(|observation| observation.cache.clone())
+            .unwrap();
+        assert!(!model.runtime.memory().allocations().any(|allocation| {
+            allocation.state == MemoryAllocationState::Active
+                && allocation.request.owner == MemoryAllocationOwner::Session(cache.to_string())
+        }));
+        executor.write_tensor(weight, saved);
+    }
     model
         .generate(request(), None)
         .expect("a later request can succeed");

@@ -6349,6 +6349,12 @@ pub(super) fn check_kv_stale_pending_state_does_not_survive_a_failed_retry(
         });
     }
 
+    if runtime.kv_caches().caches().next().is_some() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "failed prefill retry left an abandoned KV cache".into(),
+        });
+    }
+
     match engine.commit_generation_step(&mut runtime, &request, &[], 1, &first_step) {
         Err(InferenceApiError::KvCacheUnavailable { reason }) if reason.contains("pending") => {
             Ok(())

@@ -1032,6 +1032,14 @@ impl E2eRuntimeModelExecutionEngine {
         let Some(discarded) = discarded else {
             return Ok(());
         };
+        let committed = self
+            .kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state lock poisoned".into(),
+            })?
+            .get(&Self::kv_state_key(request))
+            .is_some_and(|state| state.cache == discarded.cache);
         // `generalize-first-native-provider-dispatch`: resolve the Provider
         // this step's graph execution actually wrote the pending resources
         // under, not Reference CPU unconditionally -- discarding a non-CPU
@@ -1050,15 +1058,10 @@ impl E2eRuntimeModelExecutionEngine {
             // In-place KV stores (`append-kv-history-in-place`) also hold
             // the committed history: they are released with it, unless no
             // step of this request ever committed (a failed prefill).
-            let has_committed_state = self
-                .kv_states
-                .lock()
-                .map(|states| states.contains_key(&Self::kv_state_key(request)))
-                .unwrap_or(true);
             // A pooled store set's stores stay with the pool.
             let pooled = self.kv_pool.current(&Self::kv_state_key(request)).is_some();
             for layer in discarded.layer_kv.values() {
-                if layer.rows.is_some() && (has_committed_state || pooled) {
+                if layer.rows.is_some() && (committed || pooled) {
                     continue;
                 }
                 // Best-effort: this pending state is being discarded
@@ -1066,6 +1069,12 @@ impl E2eRuntimeModelExecutionEngine {
                 release_pending_kv_resource(runtime, &provider, &layer.k);
                 release_pending_kv_resource(runtime, &provider, &layer.v);
             }
+        }
+        // A discarded prefill never made its cache visible as committed
+        // state. Retire that empty cache too; a decode must keep its cache.
+        if !committed && runtime.kv_cache(&discarded.cache).is_ok() {
+            runtime.release_kv_cache(&discarded.cache)?;
+            runtime.kv_caches_mut().forget_released(&discarded.cache)?;
         }
         Ok(())
     }
@@ -1243,6 +1252,7 @@ impl E2eRuntimeModelExecutionEngine {
             Some(&graphs.prefill_memo),
             kv_stores,
             keeps_intermediates.then_some(namespace.as_str()),
+            true,
         )?;
         if let Some(key) = recording.filter(|_| keeps_intermediates) {
             self.step_replay.prefill_warmed(key);
@@ -1615,6 +1625,81 @@ impl E2eRuntimeModelExecutionEngine {
         execution_plan: Option<&mut PreparedExecutionPlan>,
         greedy: Option<&crate::SamplingRequest>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
+        let kv_clock = runtime.phase_ledger().clock();
+        self.discard_pending_kv_state(runtime, request)?;
+        let prefill = generated_tokens.is_empty();
+        let mut kv_state = if prefill {
+            self.create_prefill_kv_state(runtime, request)?
+        } else {
+            self.decode_kv_state(runtime, request)?
+        };
+        // Graph execution uses the first binding's Provider for the whole
+        // graph. Keep it even if execution fails before returning its output.
+        if let Some(binding) = execution_plan
+            .as_ref()
+            .and_then(|plan| plan.node_bindings.first())
+        {
+            kv_state.provider = Some(binding.provider.clone());
+        }
+        let failure_state = kv_state.clone();
+        runtime
+            .phase_ledger_mut()
+            .record(kv_clock, StepPhase::KvStatePrepare);
+        let result = self.execute_step_with_kv_state(
+            runtime,
+            request,
+            generated_tokens,
+            execution_plan,
+            greedy,
+            kv_state,
+        );
+        if result.is_err() {
+            // The graph can fail after writing one or more K/V tensors but
+            // before returning its layer map. Their names are cache-scoped;
+            // committed histories and pooled stores have different names.
+            let binding = failure_state
+                .provider
+                .unwrap_or_else(|| ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+            if let Ok(provider) = resolve_kernel_execution_provider(runtime, &binding) {
+                for layer in 0..self.fixture.config.architecture.layer_count {
+                    for role in ["k", "v"] {
+                        for suffix in if prefill {
+                            &["pending", "store"][..]
+                        } else {
+                            &["pending"][..]
+                        } {
+                            let id = TensorResourceId::new(format!(
+                                "kv.{}.layer{layer}.{role}.{suffix}",
+                                failure_state.cache
+                            ));
+                            release_pending_kv_resource(runtime, &provider, &id);
+                        }
+                    }
+                }
+            }
+            if prefill {
+                // This fresh cache never reached a commit and cannot be
+                // reused. Pooled stores remain owned by their pool.
+                if runtime.release_kv_cache(&failure_state.cache).is_ok() {
+                    let _ = runtime
+                        .kv_caches_mut()
+                        .forget_released(&failure_state.cache);
+                }
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_step_with_kv_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        execution_plan: Option<&mut PreparedExecutionPlan>,
+        greedy: Option<&crate::SamplingRequest>,
+        mut kv_state: FirstNativeExecutionKvState,
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         let forced_token = self.forced_token;
 
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
@@ -1622,12 +1707,6 @@ impl E2eRuntimeModelExecutionEngine {
             .filter(|_| forced_token.is_none())
             .and_then(|greedy| crate::sampling::device_greedy_plan(greedy, vocab));
         let mut device_greedy_column = None;
-        let kv_clock = runtime.phase_ledger().clock();
-        let mut kv_state = if generated_tokens.is_empty() {
-            self.create_prefill_kv_state(runtime, request)?
-        } else {
-            self.decode_kv_state(runtime, request)?
-        };
         let model_input_token_count = if generated_tokens.is_empty() {
             request.input_token_ids.len()
         } else {
@@ -1644,10 +1723,6 @@ impl E2eRuntimeModelExecutionEngine {
                 reason: "decode requires a newly admitted token position".into(),
             })?
         };
-        self.discard_pending_kv_state(runtime, request)?;
-        runtime
-            .phase_ledger_mut()
-            .record(kv_clock, StepPhase::KvStatePrepare);
         // Both flags below (task 8.1) are only ever assigned immediately
         // after the check they attest to actually ran and passed for *this*
         // step -- never assumed from an earlier, one-time check (Model

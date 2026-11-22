@@ -1448,6 +1448,7 @@ pub(super) fn execute_first_native_graph_materializing(
         memo,
         kv_stores,
         None,
+        false,
     )
 }
 
@@ -1470,6 +1471,7 @@ pub(super) fn execute_first_native_graph_namespaced(
     memo: Option<&GraphExecutionMemo>,
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
+    cleanup_on_failure: bool,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
@@ -1487,6 +1489,7 @@ pub(super) fn execute_first_native_graph_namespaced(
         memo,
         kv_stores,
         resource_namespace,
+        cleanup_on_failure,
     )
 }
 
@@ -1550,6 +1553,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     memo: Option<&GraphExecutionMemo>,
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
+    cleanup_on_failure: bool,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
@@ -1607,7 +1611,10 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     // concurrent execution. Walking the graph is delegated to a helper
     // (rather than continuing inline) purely for readability now, not to
     // manage a restore point.
-    let (dispatch, bindings, layer_kv) = execute_first_native_graph_nodes(
+    let event_start = node_events.len();
+    let cleanup_failed_resources = cleanup_on_failure && resource_namespace.is_none();
+    let mut written_resources = Vec::new();
+    let result = execute_first_native_graph_nodes(
         order,
         runtime,
         fixture,
@@ -1624,7 +1631,23 @@ pub(super) fn execute_first_native_graph_with_resident_input(
         materialized,
         kv_stores,
         resource_namespace,
-    )?;
+        cleanup_failed_resources.then_some(&mut written_resources),
+    );
+    if result.is_err() && cleanup_failed_resources {
+        // Only resources actually uploaded or produced by this invocation
+        // are eligible: resident inputs and weights belong to the caller.
+        // Namespaced replay buffers have a separate lifecycle and may be
+        // shared with a recording, so they stay with that namespace.
+        let produced = node_events[event_start..]
+            .iter()
+            .filter(|event| event.kind == InferenceApiObservationKind::TensorResourceProduced)
+            .filter_map(|event| event.resource.clone());
+        let resources: BTreeSet<_> = written_resources.into_iter().chain(produced).collect();
+        for resource in resources {
+            release_pending_kv_resource(runtime, &executor, &resource);
+        }
+    }
+    let (dispatch, bindings, layer_kv) = result?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
 
@@ -1646,6 +1669,7 @@ pub(super) fn execute_first_native_graph_nodes(
     materialized: MaterializedEdges<'_>,
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
+    mut written_resources: Option<&mut Vec<TensorResourceId>>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
     // Recurrent edges are validated by the graph contract, but this executor
@@ -1733,6 +1757,9 @@ pub(super) fn execute_first_native_graph_nodes(
                     }
                 }
             })?;
+        if let Some(written) = written_resources.as_mut() {
+            written.push(resource_id.clone());
+        }
         bindings.insert(edge_id, (resource_id, shape));
     }
     dispatch_ctx
@@ -2428,6 +2455,9 @@ pub(super) fn execute_first_native_graph_nodes(
                         }
                     }
                 })?;
+                if let Some(written) = written_resources.as_mut() {
+                    written.push(output_resource_id.clone());
+                }
                 dispatch_ctx.runtime.phase_ledger_mut().record_operator(
                     edge_clock,
                     StepPhase::EdgeWrite,

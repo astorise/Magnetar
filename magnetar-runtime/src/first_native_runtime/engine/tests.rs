@@ -107,6 +107,212 @@ fn failed_prefill_commit_releases_pending_kv_on_request_cleanup() {
 }
 
 #[test]
+fn failed_prefill_graph_releases_partially_written_kv_on_request_cleanup() {
+    let fixture = e2e_fixture().unwrap();
+    for (copy_based, failed_weight) in [
+        (true, "layers.0.self_attn.v_proj"),
+        (true, "layers.0.mlp.down_proj"),
+        (false, "layers.0.self_attn.v_proj"),
+        (false, "layers.0.mlp.down_proj"),
+    ] {
+        let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+        let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let engine = if copy_based {
+            new_copy_based_kv_lifecycle_engine(&fixture)
+        } else {
+            new_kv_lifecycle_engine(&fixture)
+        };
+        let request = kv_lifecycle_test_request(
+            &fixture,
+            &runtime,
+            &instance,
+            "partial-prefill-failure",
+            None,
+            &[1, 2],
+        )
+        .unwrap();
+        let mut plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2).unwrap();
+        let weight = runtime
+            .model_instances()
+            .instance(&instance)
+            .unwrap()
+            .definition()
+            .resource_bindings
+            .weights[failed_weight]
+            .clone();
+        let provider = resolve_kernel_execution_provider(
+            &runtime,
+            &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        )
+        .unwrap();
+        assert!(provider.release_tensor(&weight).unwrap());
+        let error = engine
+            .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+            .unwrap_err();
+        assert!(error.to_string().contains(failed_weight), "{error}");
+        let cache = runtime
+            .kv_caches()
+            .observations()
+            .iter()
+            .find_map(|observation| observation.cache.clone())
+            .unwrap();
+        let suffix = if copy_based { "pending" } else { "store" };
+        let key = TensorResourceId::new(format!("kv.{cache}.layer0.k.{suffix}"));
+        let value = TensorResourceId::new(format!("kv.{cache}.layer0.v.{suffix}"));
+        engine
+            .release_request_state(&mut runtime, &request)
+            .unwrap();
+        for id in [key, value] {
+            assert!(provider.read_tensor(&id).is_none(), "leaked {id}");
+            assert!(
+                runtime.memory().tensor_residency(&id).is_none(),
+                "leaked {id}"
+            );
+        }
+        assert!(
+            runtime.kv_cache(&cache).is_err(),
+            "failed prefill left its cache"
+        );
+        let owned = runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| {
+                allocation.state == MemoryAllocationState::Active
+                    && allocation.request.owner == MemoryAllocationOwner::Session(cache.to_string())
+            })
+            .count();
+        assert_eq!(owned, 0, "failed prefill left cache-owned allocations");
+    }
+}
+
+#[test]
+fn abandoned_prefill_cleanup_accepts_an_already_forgotten_cache() {
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let engine = new_copy_based_kv_lifecycle_engine(&fixture);
+    let request = kv_lifecycle_test_request(
+        &fixture,
+        &runtime,
+        &instance,
+        "forgotten-prefill",
+        None,
+        &[1, 2],
+    )
+    .unwrap();
+    let mut plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2).unwrap();
+    let step = engine
+        .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+        .unwrap();
+    let cache = prefill_cache_id_from_step(&step).unwrap();
+    let key = TensorResourceId::new(format!("kv.{cache}.layer0.k.pending"));
+    let provider = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    assert!(provider.read_tensor(&key).is_some());
+    runtime.release_kv_cache(&cache).unwrap();
+    runtime.kv_caches_mut().forget_released(&cache).unwrap();
+    engine
+        .release_request_state(&mut runtime, &request)
+        .unwrap();
+    engine
+        .release_request_state(&mut runtime, &request)
+        .unwrap();
+    assert!(provider.read_tensor(&key).is_none());
+}
+
+#[test]
+fn failed_decode_graph_preserves_committed_kv_and_can_retry() {
+    let fixture = e2e_fixture().unwrap();
+    for copy_based in [true, false] {
+        let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+        let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let engine = if copy_based {
+            new_copy_based_kv_lifecycle_engine(&fixture)
+        } else {
+            new_kv_lifecycle_engine(&fixture)
+        };
+        let request = kv_lifecycle_test_request(
+            &fixture,
+            &runtime,
+            &instance,
+            "partial-decode-failure",
+            None,
+            &[1, 2],
+        )
+        .unwrap();
+        let mut plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2).unwrap();
+        let prefill = engine
+            .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+            .unwrap();
+        engine
+            .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+            .unwrap();
+        let cache = prefill_cache_id_from_step(&prefill).unwrap();
+        let before = runtime.kv_cache(&cache).unwrap().clone();
+        let provider = resolve_kernel_execution_provider(
+            &runtime,
+            &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        )
+        .unwrap();
+        let binding = &before.layer_resources[&0];
+        let committed_k = provider.read_tensor_rows(&binding.k, 0, 2).unwrap();
+        let committed_v = provider.read_tensor_rows(&binding.v, 0, 2).unwrap();
+        let expected = engine
+            .execute_generation_step(&mut runtime, &request, &[1], Some(&mut plans.decode))
+            .unwrap()
+            .logits;
+        engine
+            .discard_pending_kv_state(&mut runtime, &request)
+            .unwrap();
+        let weight = runtime
+            .model_instances()
+            .instance(&instance)
+            .unwrap()
+            .definition()
+            .resource_bindings
+            .weights["layers.0.mlp.down_proj"]
+            .clone();
+        let saved = provider.read_tensor(&weight).unwrap();
+        assert!(provider.release_tensor(&weight).unwrap());
+        let error = engine
+            .execute_generation_step(&mut runtime, &request, &[1], Some(&mut plans.decode))
+            .unwrap_err();
+        assert!(error.to_string().contains("down_proj"), "{error}");
+        assert_eq!(runtime.kv_cache(&cache).unwrap(), &before);
+        assert_eq!(
+            provider.read_tensor_rows(&binding.k, 0, 2).unwrap(),
+            committed_k
+        );
+        assert_eq!(
+            provider.read_tensor_rows(&binding.v, 0, 2).unwrap(),
+            committed_v
+        );
+        for role in ["k", "v"] {
+            let id = TensorResourceId::new(format!("kv.{cache}.layer0.{role}.pending"));
+            assert!(provider.read_tensor(&id).is_none(), "leaked {id}");
+            assert!(
+                runtime.memory().tensor_residency(&id).is_none(),
+                "leaked {id}"
+            );
+        }
+        provider.write_tensor(weight, saved).unwrap();
+        let retried = engine
+            .execute_generation_step(&mut runtime, &request, &[1], Some(&mut plans.decode))
+            .unwrap();
+        assert_eq!(retried.logits, expected);
+        engine
+            .commit_generation_step(&mut runtime, &request, &[1], 2, &retried)
+            .unwrap();
+        engine
+            .release_request_state(&mut runtime, &request)
+            .unwrap();
+    }
+}
+
+#[test]
 fn failed_prefill_commit_can_retry_the_same_pending_state() {
     let fixture = e2e_fixture().unwrap();
     let mut runtime = build_runtime_with_model_execution_engine(&fixture);
