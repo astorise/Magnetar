@@ -201,6 +201,11 @@ and decode declare the same state identities, layers, slots, compatibility
 keys and tensor descriptors; mismatched phases, schemas or out-of-range layers
 are rejected. Segment graphs may only read or produce recurrent states in
 their own declared layer interval.
+The graph contract extracts each validated input/output binding and its logical
+layout in deterministic resource-id order. Cross-phase comparisons use the
+layout, since edge names are local to each graph. Extraction checks the
+recurrent boundary only and never replaces whole-graph validation; its logical
+identity is not a session, model instance, Provider or allocation identity.
 
 For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and

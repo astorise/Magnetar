@@ -283,6 +283,25 @@ pub struct GraphRecurrentStateMetadata {
     pub compatibility_key: String,
 }
 
+/// The logical layout shared by both sides of a recurrent state slot.
+/// This does not identify a session, model instance, Provider, or allocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphRecurrentStateLayout {
+    pub resource_id: String,
+    pub layer: u32,
+    pub slot: String,
+    pub compatibility_key: String,
+    pub descriptor: TensorDescriptor,
+}
+
+/// Graph-local edges for one validated recurrent state layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphRecurrentStateBinding {
+    pub layout: GraphRecurrentStateLayout,
+    pub input_edge: TensorEdgeId,
+    pub output_edge: TensorEdgeId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphPrefixCacheMetadata {
     pub reused_prefix_length: u64,
@@ -346,6 +365,16 @@ impl ExecutionGraph {
 
     pub fn validate(&self, catalog: &OperatorCatalog) -> Result<GraphValidationReport, GraphError> {
         validate_execution_graph(self, catalog)
+    }
+
+    /// Extract validated recurrent input/output pairs, ordered by resource id.
+    ///
+    /// This validates recurrent boundaries and their topology only. Call
+    /// `validate` as well before planning or dispatching the graph.
+    pub fn recurrent_state_bindings(&self) -> Result<Vec<GraphRecurrentStateBinding>, GraphError> {
+        let producers = derive_edge_producers(self)?;
+        let consumers = derive_edge_consumers(self);
+        validate_recurrent_edges(self, &producers, &consumers)
     }
 }
 
@@ -628,7 +657,7 @@ fn validate_recurrent_edges<'a>(
     graph: &'a ExecutionGraph,
     producers: &BTreeMap<&TensorEdgeId, &ExecutionNodeId>,
     consumers: &BTreeMap<&TensorEdgeId, BTreeSet<&ExecutionNodeId>>,
-) -> Result<(), GraphError> {
+) -> Result<Vec<GraphRecurrentStateBinding>, GraphError> {
     type Pair<'a> = (Option<&'a TensorEdge>, Option<&'a TensorEdge>);
     let mut states: BTreeMap<&str, Pair<'a>> = BTreeMap::new();
     let mut slots: BTreeMap<(u32, &str), &str> = BTreeMap::new();
@@ -721,6 +750,7 @@ fn validate_recurrent_edges<'a>(
             }
         }
     }
+    let mut bindings = Vec::with_capacity(states.len());
     for (identity, (input, output)) in states {
         let (Some(input), Some(output)) = (input, output) else {
             return Err(GraphError::LifecycleInvalid(format!(
@@ -738,8 +768,19 @@ fn validate_recurrent_edges<'a>(
                 "recurrent state '{identity}' input/output mismatch"
             )));
         }
+        bindings.push(GraphRecurrentStateBinding {
+            layout: GraphRecurrentStateLayout {
+                resource_id: identity.into(),
+                layer: in_meta.layer,
+                slot: in_meta.slot.clone(),
+                compatibility_key: in_meta.compatibility_key.clone(),
+                descriptor: input.descriptor.clone(),
+            },
+            input_edge: input.id.clone(),
+            output_edge: output.id.clone(),
+        });
     }
-    Ok(())
+    Ok(bindings)
 }
 
 pub fn plan_execution_graph(

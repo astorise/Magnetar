@@ -96,6 +96,14 @@ fn recurrent_edges_require_matched_fixed_state_and_fail_closed_in_planning() {
     graph.fingerprint = Some("model-v1".into());
     let catalog = default_graph_catalog();
     graph.validate(&catalog).unwrap();
+    let bindings = graph.recurrent_state_bindings().unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].layout.resource_id, "model.state.layer3.conv");
+    assert_eq!(bindings[0].layout.layer, 3);
+    assert_eq!(bindings[0].layout.slot, "conv");
+    assert_eq!(bindings[0].layout.descriptor, tensor([2, 3]));
+    assert_eq!(bindings[0].input_edge, input_id);
+    assert_eq!(bindings[0].output_edge, output_id);
     assert!(matches!(
         plan_execution_graph(&graph, &catalog, &GraphPlanningPolicy::default(), None),
         Err(GraphError::ProviderCapabilityUnavailable(_))
@@ -122,6 +130,7 @@ fn recurrent_edges_require_matched_fixed_state_and_fail_closed_in_planning() {
     ));
     let mut invalid = graph.clone();
     invalid.edges.get_mut(&output_id).unwrap().recurrent_state = None;
+    assert!(invalid.recurrent_state_bindings().is_err());
     assert!(matches!(
         invalid.validate(&catalog),
         Err(GraphError::LifecycleInvalid(_))

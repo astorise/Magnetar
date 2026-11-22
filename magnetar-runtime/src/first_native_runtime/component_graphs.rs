@@ -872,41 +872,34 @@ pub(super) fn build_first_native_graphs_with_runtime(
 }
 
 /// Both phases must describe the same fixed-size slots before they can ever
-/// share a session. Each individual graph has already been validated by the
-/// graph-builder, including its input/output pair for every slot.
+/// share a session. Graph-local edge names need not match between phases.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn validate_recurrent_graph_pair(
     prefill: &ExecutionGraph,
     decode: &ExecutionGraph,
     layer_count: u32,
 ) -> Result<(), E2eConformanceError> {
-    fn inputs(
-        graph: &ExecutionGraph,
-    ) -> BTreeMap<&str, (&GraphRecurrentStateMetadata, &TensorDescriptor)> {
-        graph
-            .edges
-            .values()
-            .filter_map(|edge| {
-                let state = edge.recurrent_state.as_ref()?;
-                (state.behavior == GraphRecurrentStateBehavior::Input)
-                    .then_some((state.resource_id.as_str(), (state, &edge.descriptor)))
-            })
-            .collect()
-    }
-
+    let incompatible = || E2eConformanceError::ModelComponentFailed {
+        reason: "prefill and decode graphs have incompatible recurrent state schemas or phases"
+            .into(),
+    };
+    let prefill_states = prefill
+        .recurrent_state_bindings()
+        .map_err(|_| incompatible())?;
+    let decode_states = decode
+        .recurrent_state_bindings()
+        .map_err(|_| incompatible())?;
     if prefill.phase != ExecutionGraphPhase::Prefill
         || decode.phase != ExecutionGraphPhase::Decode
-        || inputs(prefill) != inputs(decode)
-        || prefill.edges.values().any(|edge| {
-            edge.recurrent_state
-                .as_ref()
-                .is_some_and(|state| state.layer >= layer_count)
-        })
+        || !prefill_states
+            .iter()
+            .map(|binding| &binding.layout)
+            .eq(decode_states.iter().map(|binding| &binding.layout))
+        || prefill_states
+            .iter()
+            .any(|binding| binding.layout.layer >= layer_count)
     {
-        return Err(E2eConformanceError::ModelComponentFailed {
-            reason: "prefill and decode graphs have incompatible recurrent state schemas or phases"
-                .into(),
-        });
+        return Err(incompatible());
     }
     Ok(())
 }

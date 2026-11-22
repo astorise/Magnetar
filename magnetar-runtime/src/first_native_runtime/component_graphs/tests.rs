@@ -114,6 +114,36 @@ fn decoder_graph_pair_requires_matching_recurrent_schemas() {
     }
     assert!(validate_recurrent_graph_pair(&decode, &prefill, 1).is_err());
     assert!(validate_recurrent_graph_pair(&prefill, &decode, 0).is_err());
+
+    // Do not accept an input-only slot even if its input matches prefill.
+    // Both edges must be checked before a state can cross a graph boundary.
+    let mut missing_output = decode.clone();
+    missing_output
+        .edges
+        .get_mut(&TensorEdgeId::new("state.out"))
+        .unwrap()
+        .recurrent_state = None;
+    assert!(validate_recurrent_graph_pair(&prefill, &missing_output, 1).is_err());
+
+    // Edge names are graph-local and may differ between prefill and decode.
+    let mut renamed = decode.clone();
+    for (old, new) in [("state.in", "decode.in"), ("state.out", "decode.out")] {
+        let old_id = TensorEdgeId::new(old);
+        let new_id = TensorEdgeId::new(new);
+        let mut edge = renamed.edges.remove(&old_id).unwrap();
+        edge.id = new_id.clone();
+        renamed.edges.insert(new_id.clone(), edge);
+        for node in renamed.nodes.values_mut() {
+            for id in node.inputs.iter_mut().chain(&mut node.outputs) {
+                if *id == old_id {
+                    *id = new_id.clone();
+                }
+            }
+        }
+    }
+    renamed.validate(&initial_operator_catalog()).unwrap();
+    validate_recurrent_graph_pair(&prefill, &renamed, 1).unwrap();
+
     assert!(validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Prefill, 0, 1).is_ok());
     assert!(
         validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Prefill, 1, 2).is_err()
