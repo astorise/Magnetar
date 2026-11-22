@@ -334,6 +334,14 @@ prediction must be in range. Multiple questions can carry separate results
 with different option counts. This is a result contract, not a claim that
 the inference API can already load or execute a decision checkpoint.
 
+The standalone Laya f32 head can construct its parameters from decoded,
+named tensors after validating geometry, shapes and finite values. Its 35
+expected head tensors match the pinned checkpoint's F16 header. A separate
+opt-in test compares the real head weights, converted to f32, with the pinned
+PyTorch head using synthetic padded and variable-option encoder outputs. This
+does not decode the checkpoint in Runtime or qualify the real encoder, a BF16
+execution path, calibration, or an end-to-end decision request.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
