@@ -484,6 +484,7 @@ fn kv_update_transaction_falls_back_to_reference_cpu_when_unbound() {
         ),
         session: None,
         tokenizer: generation_tokenizer_reference(&e2e_fixture().unwrap()),
+        generated: FirstNativeCommittedTokens::default(),
         layer_kv: LayerKvMap::new(),
         provider: None,
     };

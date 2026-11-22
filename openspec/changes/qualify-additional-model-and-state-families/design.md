@@ -232,6 +232,11 @@ First-native generation records its Component identity and version together
 with the supplied artifact digest (or its built-in default marker), and the
 tokenizer vocabulary size. A changed Component cannot read or release an
 existing request's state solely by reusing the same request id.
+Each first-native KV generation also records its accepted token sequence.
+Decode and commit require the exact previously accepted sequence, while a
+second prefill cannot overwrite an existing committed generation. A rejected
+history leaves both the prior cache and any pending step intact. Token IDs are
+not printed by the state diagnostic representation.
 
 For the future execution path, initial state is zero; continuing calls read
 the last committed generation. State slots are keyed by session, model and

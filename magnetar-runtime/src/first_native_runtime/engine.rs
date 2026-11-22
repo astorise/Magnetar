@@ -896,6 +896,8 @@ pub(super) struct FirstNativeExecutionKvState {
     /// forgotten, so cleanup cannot cross a session or tokenizer boundary.
     pub(super) session: Option<InferenceSessionId>,
     pub(super) tokenizer: GenerationTokenizerReference,
+    /// Tokens accepted with the committed state, never raw text.
+    pub(super) generated: FirstNativeCommittedTokens,
     pub(super) layer_kv: LayerKvMap,
     /// The Provider `execute_first_native_graph` actually resolved and wrote this
     /// step's pending K/V resources under. `None` before the first graph
@@ -904,6 +906,20 @@ pub(super) struct FirstNativeExecutionKvState {
     /// `discard_pending_kv_state` fall back to Reference CPU only in that
     /// case (`generalize-first-native-provider-dispatch`).
     pub(super) provider: Option<ProviderBinding>,
+}
+
+/// Persistent token history; clones share it until the next successful step.
+/// Debug output deliberately contains no generated token IDs.
+#[derive(Clone, Default)]
+pub(super) struct FirstNativeCommittedTokens(Arc<Vec<TokenId>>);
+
+impl fmt::Debug for FirstNativeCommittedTokens {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstNativeCommittedTokens")
+            .field("len", &self.0.len())
+            .finish()
+    }
 }
 
 /// One layer's K/V tensor resource identities. Before commit, these name
@@ -964,6 +980,7 @@ impl E2eRuntimeModelExecutionEngine {
             compatibility,
             session: request.session.clone(),
             tokenizer: request.tokenizer.clone(),
+            generated: FirstNativeCommittedTokens::default(),
             layer_kv: LayerKvMap::new(),
             provider: None,
         })
@@ -1716,12 +1733,35 @@ impl E2eRuntimeModelExecutionEngine {
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         let kv_clock = runtime.phase_ledger().clock();
         self.validate_kv_request_owner(request)?;
-        self.discard_pending_kv_state(runtime, request)?;
         let prefill = generated_tokens.is_empty();
-        let mut kv_state = if prefill {
-            self.create_prefill_kv_state(runtime, request)?
+        let existing = if prefill {
+            if self
+                .kv_states
+                .lock()
+                .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                    reason: "first-native KV state lock poisoned".into(),
+                })?
+                .contains_key(&Self::kv_state_key(request))
+            {
+                return Err(InferenceApiError::KvCacheUnavailable {
+                    reason: "prefill cannot replace a committed generation".into(),
+                });
+            }
+            None
         } else {
-            self.decode_kv_state(runtime, request)?
+            let state = self.decode_kv_state(runtime, request)?;
+            if state.generated.0.as_slice() != generated_tokens {
+                return Err(InferenceApiError::KvCacheUnavailable {
+                    reason: "decode token history does not match the committed generation".into(),
+                });
+            }
+            Some(state)
+        };
+        // A bad or stale history must not discard a valid pending step.
+        self.discard_pending_kv_state(runtime, request)?;
+        let mut kv_state = match existing {
+            Some(state) => state,
+            None => self.create_prefill_kv_state(runtime, request)?,
         };
         // Graph execution uses the first binding's Provider for the whole
         // graph. Keep it even if execution fails before returning its output.
@@ -2239,11 +2279,20 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens_before_step: &[TokenId],
-        _accepted_token: TokenId,
+        accepted_token: TokenId,
         _step: &RuntimeModelExecutionStep,
     ) -> Result<(), InferenceApiError> {
         self.validate_kv_request_owner(request)?;
         let mut state = self.take_pending_kv_state(request)?;
+        if state.generated.0.as_slice() != generated_tokens_before_step {
+            self.store_pending_kv_state(request, state)?;
+            return Err(InferenceApiError::KvCacheUnavailable {
+                reason: "commit token history does not match the pending generation".into(),
+            });
+        }
+        // Prepare this allocation before publishing any KV resources.
+        let mut next_generated = state.generated.clone();
+        Arc::make_mut(&mut next_generated.0).push(accepted_token);
         // Validate the cache transition before promoting resources. A sealed
         // or full cache must not replace the preceding committed generation.
         // The same cache methods are used here and by the actual commit.
@@ -2281,6 +2330,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         } else {
             runtime.append_decode_kv_cache(&state.cache, 1)?;
         }
+        state.generated = next_generated;
         self.store_kv_state(request, state)
     }
 

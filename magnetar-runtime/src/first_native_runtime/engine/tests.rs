@@ -650,6 +650,83 @@ fn same_request_id_cannot_reuse_or_discard_another_sessions_kv() {
         .unwrap();
 }
 
+#[test]
+fn kv_steps_require_the_committed_generated_token_history() {
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let engine = new_copy_based_kv_lifecycle_engine(&fixture);
+    let request = kv_lifecycle_test_request(
+        &fixture,
+        &runtime,
+        &instance,
+        "kv-token-history",
+        None,
+        &[1, 2],
+    )
+    .unwrap();
+    let mut plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2).unwrap();
+    let prefill = engine
+        .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+        .unwrap();
+    engine
+        .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+        .unwrap();
+    let cache = prefill_cache_id_from_step(&prefill).unwrap();
+    let committed = runtime.kv_cache(&cache).unwrap().clone();
+    assert!(
+        engine
+            .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+            .is_err()
+    );
+    assert!(
+        engine
+            .execute_generation_step(&mut runtime, &request, &[2], Some(&mut plans.decode))
+            .is_err()
+    );
+    assert_eq!(runtime.kv_cache(&cache).unwrap(), &committed);
+
+    let decode = engine
+        .execute_generation_step(&mut runtime, &request, &[1], Some(&mut plans.decode))
+        .unwrap();
+    let key = E2eRuntimeModelExecutionEngine::kv_state_key(&request);
+    assert!(
+        engine
+            .commit_generation_step(&mut runtime, &request, &[2], 2, &decode)
+            .is_err()
+    );
+    assert!(
+        engine
+            .execute_generation_step(&mut runtime, &request, &[2], Some(&mut plans.decode))
+            .is_err()
+    );
+    assert!(engine.pending_kv_states.lock().unwrap().contains_key(&key));
+    assert_eq!(runtime.kv_cache(&cache).unwrap(), &committed);
+    engine
+        .commit_generation_step(&mut runtime, &request, &[1], 2, &decode)
+        .unwrap();
+
+    assert!(
+        engine
+            .execute_generation_step(&mut runtime, &request, &[1], Some(&mut plans.decode))
+            .is_err()
+    );
+    assert!(
+        engine
+            .execute_generation_step(&mut runtime, &request, &[3, 2], Some(&mut plans.decode))
+            .is_err()
+    );
+    let next = engine
+        .execute_generation_step(&mut runtime, &request, &[1, 2], Some(&mut plans.decode))
+        .unwrap();
+    engine
+        .commit_generation_step(&mut runtime, &request, &[1, 2], 3, &next)
+        .unwrap();
+    engine
+        .release_request_state(&mut runtime, &request)
+        .unwrap();
+}
+
 /// `turboquant-kv-history`: a prefill records its stores' precisions in
 /// the history's compatibility and KV layout metadata (none for f32, as
 /// before), and a history is not continued once this model's stores

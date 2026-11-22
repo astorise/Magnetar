@@ -4841,6 +4841,7 @@ pub(super) fn check_incremental_decode_matches_full_sequence_oracle(
         ),
         session: None,
         tokenizer: generation_tokenizer_reference(fixture),
+        generated: FirstNativeCommittedTokens::default(),
         // The hand-rolled decode oracle's own return is a plain, densely
         // 0-indexed `Vec` (it processes every layer unconditionally, never
         // a segment), so its Vec index already equals the real layer
@@ -5688,6 +5689,7 @@ pub(super) fn check_incremental_decode_rejects_missing_layer_kv(
         ),
         session: None,
         tokenizer: generation_tokenizer_reference(fixture),
+        generated: FirstNativeCommittedTokens::default(),
         layer_kv: LayerKvMap::new(),
         provider: None,
     };
