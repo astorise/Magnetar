@@ -207,6 +207,8 @@ pub enum ShapeRule {
     GeodesicResidual,
     /// One Mamba-2 mixer and its fixed-size convolution and SSM states.
     Mamba2Mixer,
+    /// Gated-delta mixer with explicit convolution and recurrent states.
+    GatedDeltaMixer,
     /// Mamba-3 recurrence or projected mixer with four explicit states.
     Mamba3Mimo,
     Mamba3Mixer,
@@ -1366,6 +1368,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             3,
             ShapeRule::Mamba2Mixer,
         ),
+        // Qwen3.5-style mixer and two explicit, fixed-size next states.
+        (
+            "gated-delta-mixer",
+            OperatorFamily::LinearAlgebra,
+            13,
+            3,
+            ShapeRule::GatedDeltaMixer,
+        ),
         // Preprocessed Mamba-3 sequence and four independent next states.
         (
             "mamba3-mimo",
@@ -1607,10 +1617,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         if name == "encoder-attention" {
             spec.memory = OperatorMemoryBehavior::pure().with_workspace();
         }
+        if name == "gated-delta-mixer" {
+            spec.layout_contract = OperatorLayoutContract::new([TensorLayoutKind::Contiguous]);
+        }
         if matches!(
             name,
             "encoder-attention"
                 | "mamba2-mixer"
+                | "gated-delta-mixer"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -1752,6 +1766,31 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "zero_centered_norm",
                 OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "gated-delta-mixer" => OperatorAttributeSchema::default()
+            .with_rule(
+                "key_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "value_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "key_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "value_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_kernel",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
             ),
         "mamba2-mixer" => OperatorAttributeSchema::default()
             .with_rule(
@@ -2179,6 +2218,96 @@ fn validate_concat_heads(
     Ok(())
 }
 
+/// Validate gated-delta geometry and all input/output shapes before planning.
+fn validate_gated_delta_mixer_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(), OperatorError> {
+    let invalid = || OperatorError::ShapeMismatch {
+        reason: "invalid gated-delta mixer geometry, attributes or tensor shapes".into(),
+    };
+    if inputs.len() != 13 || outputs.len() != 3 {
+        return Err(invalid());
+    }
+    let positive = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => Ok(*value as u64),
+        _ => Err(invalid()),
+    };
+    let key_heads = positive("key_heads")?;
+    let value_heads = positive("value_heads")?;
+    let key_dim = positive("key_dim")?;
+    let value_dim = positive("value_dim")?;
+    let kernel = positive("conv_kernel")?;
+    let epsilon_valid = matches!(
+        attributes.get("epsilon"),
+        Some(OperatorAttributeValue::Float(value))
+            if value.is_finite() && (*value as f32).is_finite() && *value as f32 > 0.0
+    );
+    if !value_heads.is_multiple_of(key_heads) || !epsilon_valid {
+        return Err(invalid());
+    }
+    let [tokens, hidden] = inputs[0].shape.dimensions.as_slice() else {
+        return Err(invalid());
+    };
+    let keys = key_heads.checked_mul(key_dim).ok_or_else(invalid)?;
+    let values = value_heads.checked_mul(value_dim).ok_or_else(invalid)?;
+    let channels = keys
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(values))
+        .ok_or_else(invalid)?;
+    let shapes = [
+        vec![*tokens, *hidden],
+        vec![channels, kernel],
+        vec![value_heads, key_dim, value_dim],
+        vec![channels, *hidden],
+        vec![values, *hidden],
+        vec![value_heads, *hidden],
+        vec![value_heads, *hidden],
+        vec![channels, kernel],
+        vec![value_heads],
+        vec![value_heads],
+        vec![value_dim],
+        vec![*hidden, values],
+        vec![*tokens],
+    ];
+    let valid = |tensor: &TensorDescriptor, shape: &[u64]| {
+        let f32_dtype = DTypeDescriptor::portable(ComputeDType::Float32);
+        tensor.shape.symbolic.is_none()
+            && tensor.view.is_none()
+            && tensor.dtype == f32_dtype
+            && tensor
+                .storage_dtype
+                .as_ref()
+                .is_none_or(|dtype| dtype == &f32_dtype)
+            && tensor
+                .compute_dtype
+                .as_ref()
+                .is_none_or(|dtype| dtype == &f32_dtype)
+            && tensor.shape.dimensions == shape
+            && shape
+                .iter()
+                .try_fold(1u64, |count, &dim| {
+                    count
+                        .checked_mul(dim)
+                        .filter(|&size| dim > 0 && size <= 67_108_864)
+                })
+                .is_some()
+    };
+    if !inputs
+        .iter()
+        .zip(&shapes)
+        .all(|(tensor, shape)| valid(tensor, shape))
+        || !outputs
+            .iter()
+            .zip(&shapes[..3])
+            .all(|(tensor, shape)| valid(tensor, shape))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// Validate fixed Mamba-2 geometry before dispatch or allocating state. The
 /// numerical provider applies the same equations to actual tensor values.
 fn validate_mamba2_mixer_shape(
@@ -2439,6 +2568,7 @@ fn validate_shape_rule(
     match rule {
         ShapeRule::Any => Ok(()),
         ShapeRule::Mamba2Mixer => validate_mamba2_mixer_shape(inputs, outputs, attributes),
+        ShapeRule::GatedDeltaMixer => validate_gated_delta_mixer_shape(inputs, outputs, attributes),
         ShapeRule::Mamba3Mimo => validate_mamba3_shape(inputs, outputs, attributes, false),
         ShapeRule::Mamba3Mixer => validate_mamba3_shape(inputs, outputs, attributes, true),
         ShapeRule::Rank(rank) => inputs

@@ -385,6 +385,29 @@ execution path, calibration, or an end-to-end decision request.
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
 
+### Gated-delta mixer profile
+
+The experimental `gated-delta-mixer@1` is an additive, single-sequence f32
+operator. It takes hidden states [T,H], convolution history [C,K], recurrence
+[Vh,Kd,Vd], QKV/Z/A/B matrices, depthwise convolution weights, A_log, dt_bias,
+normalization weights, the output projection, and a 0/1 mask. Matrices use
+checkpoint order [output,input]; C is 2*Kh*Kd + Vh*Vd. It returns [T,H] and
+the two next states, without mutating its inputs. Required attributes declare
+Kh, Vh, Kd, Vd, K and epsilon; Vh must be a multiple of Kh. Only contiguous f32
+tensors and finite values are supported. Invalid geometry, masks, aliases and
+unsupported layouts fail before a result is published. Both CPU Providers
+advertise this optional operator; an unqualified Provider must decline it.
+The WIT graph-builder already transports operator identifiers and typed
+attributes, so no WIT version is changed by this addition.
+
+Synthetic fixtures compare the real CPU graph's prefill, chunked continuation,
+single-token steps, grouped heads, mask handling, output and both explicit
+states with independently executed pinned Transformers functions. The
+component's opt-in real-weight f32 test covers one verified base-checkpoint
+mixer separately. Neither test enables model graphs or Runtime-managed
+recurrent sessions; those remain explicitly rejected until lifecycle and
+atomic commit requirements are implemented.
+
 ### Compatibility and WIT evolution
 
 Preserve existing F32 and single-Device baseline fixtures and public request semantics. Reuse current WIT and Rust contracts first. Before implementation requires new graph operators, state envelopes or result types, record their exact versioned portable schema, negotiation, unsupported behavior and migration tests; native API types are prohibited. A new precision or model profile is opt-in until its validation evidence supports promotion. Vendor implementations stay in their repositories, followed by an explicit parent submodule pin update.

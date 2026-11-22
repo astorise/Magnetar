@@ -12,6 +12,9 @@ use crate::tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
 mod differential_attention;
 mod encoder_attention;
 mod encoder_ops;
+mod gated_delta_core;
+mod gated_delta_mixer;
+mod gated_delta_mixer_core;
 mod mamba2_mixer;
 mod mamba3_core;
 mod mamba3_mimo;
@@ -27,6 +30,9 @@ pub use encoder_attention::{
 };
 pub use encoder_ops::{
     affine_layernorm, affine_layernorm_epsilon, gelu_exact, slice_last, slice_last_attributes,
+};
+pub use gated_delta_mixer::{
+    GatedDeltaMixer, gated_delta_mixer, gated_delta_mixer_from_attributes,
 };
 pub use mamba2_mixer::{Mamba2Mixer, mamba2_mixer, mamba2_mixer_from_attributes};
 pub use mamba3_core::Geometry as Mamba3Mimo;

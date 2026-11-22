@@ -1520,11 +1520,12 @@ pub(super) fn dispatch_qwen_split(
     result
 }
 
-/// Admit all three pure Mamba-2 outputs before submission and release every
+/// Admit all three pure mixer outputs before submission and release every
 /// admitted resource if admission or execution fails.
-pub(super) fn dispatch_mamba2_mixer(
+pub(super) fn dispatch_three_output_mixer(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
+    operator: OperatorId,
     inputs: Vec<NodeValue>,
     targets: [OutputTarget; 3],
     attributes: BTreeMap<String, OperatorAttributeValue>,
@@ -1545,7 +1546,7 @@ pub(super) fn dispatch_mamba2_mixer(
         if aliases_input || targets[..index].iter().any(|other| other.0 == target.0) {
             return Err(InferenceApiError::GraphPlanningFailed {
                 reason: format!(
-                    "graph node '{operation_id}' aliases a Mamba-2 output with an input or another output"
+                    "graph node '{operation_id}' aliases a mixer output with an input or another output"
                 ),
             });
         }
@@ -1571,7 +1572,7 @@ pub(super) fn dispatch_mamba2_mixer(
     let result = dispatch_reference_cpu_operator_multi(
         ctx,
         operation_id,
-        dispatch_operator_id("mamba2-mixer", OperatorFamily::LinearAlgebra),
+        operator,
         resources,
         outputs,
         attributes,

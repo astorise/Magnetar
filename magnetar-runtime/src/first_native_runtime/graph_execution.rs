@@ -580,10 +580,15 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
-        "mamba2-mixer" => {
-            if !(10..=13).contains(&inputs.len()) || node.outputs.len() != 3 {
+        name @ ("mamba2-mixer" | "gated-delta-mixer") => {
+            let valid_inputs = if name == "mamba2-mixer" {
+                (10..=13).contains(&inputs.len())
+            } else {
+                inputs.len() == 13
+            };
+            if !valid_inputs || node.outputs.len() != 3 {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 10 to 13 inputs and 3 outputs"),
+                    reason: format!("graph node '{node_id}' has invalid {name} arity"),
                 });
             }
             if let Some(graph) = ctx.graph.as_ref() {
@@ -612,9 +617,10 @@ pub(super) fn dispatch_first_native_graph_node(
                 resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
                 ctx.output_owner(kv_cache_id),
             );
-            dispatch_mamba2_mixer(
+            dispatch_three_output_mixer(
                 ctx,
                 node_id,
+                dispatch_operator_id(name, OperatorFamily::LinearAlgebra),
                 inputs,
                 [output_target, second, third],
                 node.attributes.clone(),
@@ -1843,6 +1849,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "silu-mul"
                 | "moe-experts"
                 | "mamba2-mixer"
+                | "gated-delta-mixer"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -1927,6 +1934,7 @@ pub(super) fn execute_first_native_graph_nodes(
         if matches!(
             node.operator.name(),
             "mamba2-mixer"
+                | "gated-delta-mixer"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -2711,6 +2719,8 @@ pub(super) fn materialize_first_native_graph_bindings(
 mod differential_attention_tests;
 #[cfg(test)]
 mod encoder_ops_tests;
+#[cfg(test)]
+mod gated_delta_mixer_tests;
 #[cfg(test)]
 mod mamba2_tests;
 #[cfg(test)]

@@ -464,7 +464,7 @@ fn validate_first_scope_attributes(
     }
 }
 
-const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 47] = [
+const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 48] = [
     required_now("embedding", OperatorFamily::Tensor, true),
     required_now("matmul", OperatorFamily::LinearAlgebra, true),
     required_now("rmsnorm", OperatorFamily::Normalization, true),
@@ -482,6 +482,7 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 47] = [
     // and its shared expert's sigmoid-scaled output.
     first_decoder_optional("moe-experts", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba2-mixer", OperatorFamily::LinearAlgebra),
+    first_decoder_optional("gated-delta-mixer", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba3-mimo", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba3-mixer", OperatorFamily::LinearAlgebra),
     first_decoder_optional("token-shift", OperatorFamily::Tensor),
