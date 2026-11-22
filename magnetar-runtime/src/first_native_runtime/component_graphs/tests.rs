@@ -315,6 +315,76 @@ fn encoder_graph_boundary_rejects_missing_or_incompatible_inputs_and_outputs() {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn encoder_graph_boundary_rejects_inputs_used_only_by_disconnected_nodes() {
+    let fixture = e2e_fixture().unwrap();
+    let request = FirstNativeEncoderGraphRequest {
+        architecture: architecture_config_from_first_native_model_config(&fixture.config),
+        encoder: EncoderGraphConfig {
+            norm_epsilon: 1e-5,
+            max_positions: 16,
+            norm_bias: false,
+            attention_bias: false,
+            mlp_bias: false,
+            layers: vec![],
+        },
+        weight_shapes: BTreeMap::new(),
+        identity: fixture.identity,
+        sequence_length: 3,
+    };
+    for disconnected in ["input.token_ids", "input.attention_mask"] {
+        let live = if disconnected == "input.token_ids" {
+            "input.attention_mask"
+        } else {
+            "input.token_ids"
+        };
+        let mut graph = ExecutionGraph::new(
+            ExecutionGraphId::new("disconnected-encoder-input"),
+            ExecutionGraphPhase::Encode,
+        );
+        for (name, shape) in [
+            ("input.token_ids", vec![3]),
+            ("input.attention_mask", vec![3]),
+            (
+                "weight.embedding",
+                vec![8, request.architecture.hidden_size],
+            ),
+            ("hidden_states", vec![3, request.architecture.hidden_size]),
+            ("unused", vec![3]),
+        ] {
+            graph = graph.with_edge(TensorEdge::new(
+                TensorEdgeId::new(name),
+                f32_tensor_descriptor_from_shape(&shape),
+            ));
+        }
+        graph = graph.with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("encode"),
+                OperatorId::magnetar("embedding", 1, OperatorFamily::Tensor),
+            )
+            .with_input(TensorEdgeId::new(live))
+            .with_input(TensorEdgeId::new("weight.embedding"))
+            .with_output(TensorEdgeId::new("hidden_states")),
+        );
+        graph = graph.with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("irrelevant"),
+                OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+            )
+            .with_input(TensorEdgeId::new(disconnected))
+            .with_input(TensorEdgeId::new(disconnected))
+            .with_output(TensorEdgeId::new("unused")),
+        );
+        graph.validate(&initial_operator_catalog()).unwrap();
+        validate_first_scope_graph(&graph).unwrap();
+        assert!(
+            validate_encoder_graph_boundary(&graph, &request).is_err(),
+            "the {disconnected} input must contribute to hidden_states"
+        );
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn fixed_silu_components_reject_unknown_and_incompatible_activations() {
     let fixtures: &[(&[u8], &[u8])] = &[
         (

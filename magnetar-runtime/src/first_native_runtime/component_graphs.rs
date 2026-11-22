@@ -585,6 +585,32 @@ fn validate_encoder_graph_boundary(
     }) {
         return Err(invalid());
     }
+    // Merely consuming an input in some node is insufficient: a Component
+    // could use token IDs or the mask only in a disconnected branch while
+    // producing hidden states independently. Walk backwards from the
+    // declared output through authoritative node inputs and outputs.
+    let producers: BTreeMap<_, _> = graph
+        .nodes
+        .values()
+        .flat_map(|node| node.outputs.iter().map(move |edge| (edge, node)))
+        .collect();
+    let output = TensorEdgeId::new("hidden_states");
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![&output];
+    while let Some(edge) = pending.pop() {
+        if !reachable.insert(edge) {
+            continue;
+        }
+        if let Some(node) = producers.get(edge) {
+            pending.extend(node.inputs.iter());
+        }
+    }
+    if ["input.token_ids", "input.attention_mask"]
+        .iter()
+        .any(|required| !reachable.iter().any(|edge| edge.as_str() == *required))
+    {
+        return Err(invalid());
+    }
     Ok(())
 }
 
