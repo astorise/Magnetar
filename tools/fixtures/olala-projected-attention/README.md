@@ -20,3 +20,26 @@ python tools/fixtures/olala-projected-attention/reference.py /path/to/modeling_o
 
 The explicit histories exercised here do not implement Runtime session state,
 Component construction or end-to-end checkpoint loading.
+
+`real_checkpoint_reference.py` runs the first checkpoint attention layer
+(layer 4) with actual weights converted to f32 and synthetic hidden states.
+It checks the source, header and two byte-range hashes before writing binary
+reference outputs. Ranges relative to the Safetensors data section are:
+
+- `[55829544, 55829736)` as `olala-attention-layer4-f32.bin`.
+- `[11481542688, 11503968800)` as `olala-attention-layer4-bf16.bin`.
+
+With the full header as `olala-header.bin` and the source as
+`modeling-olala.py`, run from the repository root:
+
+```text
+python tools/fixtures/olala-projected-attention/real_checkpoint_reference.py target/modeling-olala.py target/olala-header.bin target/olala-attention-layer4-f32.bin target/olala-attention-layer4-bf16.bin target/olala-attention-reference
+```
+
+Set `MAGNETAR_OLALA_ATTENTION_DIR` to the absolute path of `target`, then run
+`cargo test --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading --lib real_olala_attention_weights_match_pytorch_in_f32 -- --ignored --nocapture`.
+The test compares the output, both raw token-shift states and both attention
+histories for full prefill, a prefix and two cached steps. The upstream eager
+attention casts Q/K/V and its result to bfloat16 at the attention boundary;
+the surrounding projections here run in f32. This is not full-model or native
+BF16 inference.

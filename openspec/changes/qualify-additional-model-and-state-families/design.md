@@ -192,6 +192,12 @@ past and position zero, which suppresses any supplied prior raw state. Packed
 multi-document attention, RoPE, value embeddings, XSA and biased/CosNet
 projections are outside this profile and must not silently use it. These
 explicit tensors do not implement Runtime-managed recurrent or KV lifecycle.
+The Olala profile can reorder decoded f32 weights into this operator's
+layout. An opt-in integration test decodes the pinned checkpoint's first
+differential-attention layer and compares its f32 projections and explicit
+states with the upstream PyTorch class on synthetic hidden states, retaining
+the class's bfloat16 attention-boundary rounding. This is not a qualification
+of native BF16 projections or end-to-end hybrid inference.
 
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,

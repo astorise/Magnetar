@@ -47,6 +47,8 @@ mod tests_mistral_logits;
 #[cfg(test)]
 mod tests_nemotron_profile;
 #[cfg(test)]
+mod tests_olala_attention_checkpoint;
+#[cfg(test)]
 mod tests_olala_mamba3_profile;
 #[cfg(test)]
 mod tests_olmo3_logits;
