@@ -247,6 +247,17 @@ disabled until the transactional lifecycle is implemented and tested.
 The Operator catalog validates state, weight and output shapes, bias-dependent
 arity and numerical attributes before a graph can be accepted for planning.
 
+The pinned Nano remote model source has a separate whole-model qualification
+ambiguity: `NemotronHBlock.forward` forwards `cache_position` to attention but
+does not pass its `cache_params` as `past_key_value` or forward the attention
+mask. Its Mamba call forwards `cache_params`, but not the Mamba mask. The
+attention implementation updates its cache only when `past_key_value` is
+supplied. `components/nemotron/tests/fixtures/check_nano_block_forwarding.py`
+executes the SHA-256-verified upstream block with spies to reproduce this
+wiring without weights or CUDA. The standalone Mamba-2 numerical fixtures do
+not settle whether a complete cached hybrid graph should match this source or
+the intended attention-history contract; neither is qualified by them.
+
 The Nemotron component also derives an invocation plan for the pinned Nano
 mixer geometry. Checkpoint tensor names, shapes and dtypes for all 23 Mamba
 layers were checked against 12 real Safetensors shard headers, including BF16 matrices and
