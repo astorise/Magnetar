@@ -149,6 +149,14 @@ not assumed. As with `mamba3-mimo`, explicit state tensors do not establish
 Runtime-managed session state. The Operator catalog validates both forms'
 geometry, all input and output state shapes, bounded intermediate sizes and
 the projected mixer's numerical attributes before a graph is planned.
+The Olala library now plans this f32 invocation for all 29 Mamba-3 layers
+of the pinned mini configuration. Its eleven checkpoint names, shapes and
+storage dtypes match the verified Safetensors header; matrix transposition and
+the head/rank permutation are explicit after storage decoding. An opt-in test
+decodes the first layer's real BF16/F32 weights through Runtime's loader and
+compares the f32 mixer output and all four states with the pinned PyTorch
+class, using synthetic hidden states. This does not qualify BF16 arithmetic,
+full-model inference or state ownership in Runtime.
 
 The portable `token-shift@1` operator expresses the previous-token mixing
 used by the pinned Olala attention profile without equating it to KV history.

@@ -952,6 +952,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-component-olala"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "magnetar-core"
 version = "1.0.0"
 dependencies = [
@@ -1044,6 +1052,7 @@ dependencies = [
  "magnetar-component-laya",
  "magnetar-component-modernbert",
  "magnetar-component-nemotron",
+ "magnetar-component-olala",
  "magnetar-format-gguf",
  "magnetar-inference-qualification",
  "magnetar-integration-resident-provider",
