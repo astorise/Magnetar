@@ -154,6 +154,7 @@ pub enum PreparedExecutionPhase {
     Warmup,
     Prefill,
     Decode,
+    Encode,
     AdapterActivation,
     AdapterMerge,
     SamplingHelper,
@@ -167,6 +168,7 @@ impl From<ExecutionGraphPhase> for PreparedExecutionPhase {
             ExecutionGraphPhase::Warmup => Self::Warmup,
             ExecutionGraphPhase::Prefill => Self::Prefill,
             ExecutionGraphPhase::Decode => Self::Decode,
+            ExecutionGraphPhase::Encode => Self::Encode,
             ExecutionGraphPhase::AdapterActivation => Self::AdapterActivation,
             ExecutionGraphPhase::AdapterMerge => Self::AdapterMerge,
             ExecutionGraphPhase::SamplingHelper => Self::SamplingHelper,
@@ -2424,6 +2426,9 @@ pub fn semantic_graph_fingerprint(graph: &ExecutionGraph) -> ExecutionGraphSeman
         canonical.push_str(&format!("consumers={:?}\n", edge.consumers));
         canonical.push_str(&format!("kv={:?}\n", edge.kv_cache));
         canonical.push_str(&format!("prefix={:?}\n", edge.prefix_cache));
+        if let Some(state) = &edge.recurrent_state {
+            canonical.push_str(&format!("recurrent={state:?}\n"));
+        }
     }
 
     ExecutionGraphSemanticFingerprint(format!("sha256:{}", sha256_hex(canonical.as_bytes())))

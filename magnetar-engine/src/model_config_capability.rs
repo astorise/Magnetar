@@ -18,11 +18,37 @@ use std::sync::Mutex;
 
 use crate::component::{ComponentError, ComponentValue, HostCapability};
 use crate::{
-    ExpertGroupScore, ExpertRoutingConfig, ExpertScoring, LatentAttentionConfig, LayerSpec,
-    MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling,
+    ExpertGroupScore, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
+    LatentAttentionConfig, LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig,
+    RopeFrequencyScaling,
 };
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
+
+/// Ordered bidirectional encoder layer configuration supplied by ingestion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncoderLayerConfig {
+    /// Inclusive symmetric local radius; `None` selects global attention.
+    pub local_radius: Option<u32>,
+    pub rope_theta: f64,
+    pub attention_normalization: bool,
+}
+
+/// Encoder-specific configuration for a graph-building session.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncoderGraphConfig {
+    pub norm_epsilon: f64,
+    pub max_positions: u64,
+    pub norm_bias: bool,
+    pub attention_bias: bool,
+    pub mlp_bias: bool,
+    pub layers: Vec<EncoderLayerConfig>,
+}
+
+struct BoundConfig {
+    architecture: ModelArchitectureConfig,
+    encoder: Option<EncoderGraphConfig>,
+}
 
 /// Runtime-side [`HostCapability`] backing `model-config`. One instance is
 /// registered once on a `ComponentManager`/engine and shared across every
@@ -31,19 +57,27 @@ const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
 /// `GraphBuilderCapability`.
 #[derive(Default)]
 pub struct ModelConfigCapability {
-    bound: Mutex<BTreeMap<String, ModelArchitectureConfig>>,
+    bound: Mutex<BTreeMap<String, BoundConfig>>,
     /// The operations each bound instance has called since its binding
     /// ([`Self::unread_declared_features`]).
     called: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
-/// The `1.7.0` functions whose feature a graph does not otherwise show:
+/// The functions whose feature a graph does not otherwise show:
 /// when the bound configuration declares one, a Component must have read
-/// it before its graph is accepted.
-const FEATURE_FUNCTIONS: [&str; 3] = [
+/// it before its graph is accepted. Activation must always be read, so a
+/// Component can distinguish an unknown activation from a supported one.
+const FEATURE_FUNCTIONS: [&str; 10] = [
+    "layer-layout",
+    "options",
     "multi-head-latent-attention",
     "mixture-of-experts-layers",
     "expert-routing",
+    "hidden-activation",
+    "rope-layers",
+    "expert-normalization",
+    "latent-norm-epsilon",
+    "encoder-config",
 ];
 
 impl ModelConfigCapability {
@@ -55,11 +89,72 @@ impl ModelConfigCapability {
     /// Component's `build-prefill-graph`/`build-decode-graph` export.
     /// Replaces any prior binding for this key.
     pub fn bind_config(&self, instance_key: &str, config: ModelArchitectureConfig) {
-        self.bound
-            .lock()
-            .unwrap()
-            .insert(instance_key.to_string(), config);
+        self.bound.lock().unwrap().insert(
+            instance_key.to_string(),
+            BoundConfig {
+                architecture: config,
+                encoder: None,
+            },
+        );
         self.called.lock().unwrap().remove(instance_key);
+    }
+
+    /// Binds an encoder profile to an already-bound architecture. Rebinding
+    /// the architecture drops this profile and all feature-read evidence.
+    pub fn bind_encoder_config(
+        &self,
+        instance_key: &str,
+        encoder: EncoderGraphConfig,
+    ) -> Result<(), ComponentError> {
+        let mut bound = self.bound.lock().unwrap();
+        let entry = bound.get_mut(instance_key).ok_or_else(|| {
+            rejected(
+                instance_key,
+                "no model architecture configuration bound for this instance",
+            )
+        })?;
+        let architecture = &entry.architecture;
+        if let Err(error) = architecture.validate() {
+            let message = error.to_string();
+            bound.remove(instance_key);
+            self.called.lock().unwrap().remove(instance_key);
+            return Err(rejected(instance_key, message));
+        }
+        let epsilon = encoder.norm_epsilon as f32;
+        if encoder.layers.len() != architecture.num_hidden_layers as usize
+            || encoder.max_positions == 0
+            || encoder.max_positions > (1 << 24)
+            || architecture.vocab_size > (1 << 24)
+            || architecture.num_key_value_heads != architecture.num_attention_heads
+            || architecture
+                .head_dim
+                .checked_mul(architecture.num_attention_heads as u64)
+                != Some(architecture.hidden_size)
+            || !architecture.head_dim.is_multiple_of(2)
+            || !encoder.norm_epsilon.is_finite()
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+            || encoder.attention_bias != architecture.attention_bias
+            || encoder.layers.iter().any(|layer| {
+                layer.local_radius == Some(0)
+                    || !layer.rope_theta.is_finite()
+                    || layer.rope_theta <= 0.0
+                    || !(layer.rope_theta as f32).is_finite()
+                    || (layer.rope_theta as f32) <= 0.0
+            })
+        {
+            bound.remove(instance_key);
+            self.called.lock().unwrap().remove(instance_key);
+            return Err(rejected(
+                instance_key,
+                "invalid or incompatible encoder configuration",
+            ));
+        }
+        entry.encoder = Some(encoder);
+        if let Some(called) = self.called.lock().unwrap().get_mut(instance_key) {
+            called.remove("encoder-config");
+        }
+        Ok(())
     }
 
     /// Drops the bound configuration for `instance_key`, mirroring
@@ -69,27 +164,45 @@ impl ModelConfigCapability {
         self.called.lock().unwrap().remove(instance_key);
     }
 
-    /// The `1.7.0` functions carrying a feature the configuration bound to
-    /// `instance_key` declares (latent attention, mixed expert layers,
-    /// expert routing) that the Component has not called since the binding.
+    /// The functions carrying features the configuration bound to
+    /// `instance_key` declares that the Component has not called since the
+    /// binding, plus `hidden-activation` even when its value is unknown.
     /// A Component compiled against an earlier version cannot read them, so
     /// a graph it built for such a checkpoint would silently leave the
     /// feature out; the Runtime refuses that graph instead
     /// (`express-latent-attention-forms`).
     pub fn unread_declared_features(&self, instance_key: &str) -> Vec<&'static str> {
         let bound = self.bound.lock().unwrap();
-        let Some(config) = bound.get(instance_key) else {
+        let Some(entry) = bound.get(instance_key) else {
             return Vec::new();
         };
+        let config = &entry.architecture;
         let called = self.called.lock().unwrap();
         let called = called.get(instance_key);
         FEATURE_FUNCTIONS
             .into_iter()
             .filter(|function| {
                 let declared = match *function {
+                    "layer-layout" => config.layer_layout.is_some(),
+                    "options" => {
+                        config.final_logit_softcapping.is_some()
+                            || config.per_layer_input_size.is_some()
+                    }
                     "multi-head-latent-attention" => config.latent_attention.is_some(),
                     "mixture-of-experts-layers" => config.moe_layers.is_some(),
-                    _ => config.expert_routing.is_some(),
+                    "expert-routing" => config.expert_routing.is_some(),
+                    "expert-normalization" => config
+                        .expert_routing
+                        .is_some_and(|routing| routing.normalization.is_some()),
+                    "latent-norm-epsilon" => config
+                        .latent_attention
+                        .is_some_and(|mla| mla.norm_eps.is_some()),
+                    "rope-layers" => config.rope_layers.is_some(),
+                    "encoder-config" => entry.encoder.is_some(),
+                    // Even an absent activation is meaningful: a fixed-activation
+                    // decoder must see and reject it instead of guessing.
+                    "hidden-activation" => true,
+                    _ => unreachable!("every tracked model-config function is handled"),
                 };
                 declared && !called.is_some_and(|called| called.contains(*function))
             })
@@ -370,6 +483,51 @@ fn encode_layer_layout(layout: Option<&[LayerSpec]>) -> ComponentValue {
     }))
 }
 
+fn encode_encoder_config(config: Option<&EncoderGraphConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(config.map(|config| {
+        Box::new(ComponentValue::Record(vec![
+            field("norm-epsilon", ComponentValue::F64(config.norm_epsilon)),
+            field(
+                "max-positions",
+                ComponentValue::S64(config.max_positions as i64),
+            ),
+            field("norm-bias", ComponentValue::Bool(config.norm_bias)),
+            field(
+                "attention-bias",
+                ComponentValue::Bool(config.attention_bias),
+            ),
+            field("mlp-bias", ComponentValue::Bool(config.mlp_bias)),
+            field(
+                "layers",
+                ComponentValue::List(
+                    config
+                        .layers
+                        .iter()
+                        .map(|layer| {
+                            ComponentValue::Record(vec![
+                                field(
+                                    "local-radius",
+                                    ComponentValue::Option(
+                                        layer
+                                            .local_radius
+                                            .map(|radius| Box::new(ComponentValue::U32(radius))),
+                                    ),
+                                ),
+                                field("rope-theta", ComponentValue::F64(layer.rope_theta)),
+                                field(
+                                    "attention-normalization",
+                                    ComponentValue::Bool(layer.attention_normalization),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]))
+    }))
+}
+
 /// `architecture-options` (`1.6.0`).
 fn encode_options(config: &ModelArchitectureConfig) -> ComponentValue {
     let field = |name: &str, value: ComponentValue| (name.to_string(), value);
@@ -416,7 +574,12 @@ impl HostCapability for ModelConfigCapability {
             | "options"
             | "multi-head-latent-attention"
             | "mixture-of-experts-layers"
-            | "expert-routing" => {
+            | "expert-routing"
+            | "expert-normalization"
+            | "latent-norm-epsilon"
+            | "encoder-config"
+            | "rope-layers"
+            | "hidden-activation" => {
                 if !arguments.is_empty() {
                     return Err(rejected(
                         instance_key,
@@ -427,12 +590,13 @@ impl HostCapability for ModelConfigCapability {
                     ));
                 }
                 let bound = self.bound.lock().unwrap();
-                let config = bound.get(instance_key).ok_or_else(|| {
+                let entry = bound.get(instance_key).ok_or_else(|| {
                     rejected(
                         instance_key,
                         "no model architecture configuration bound for this instance",
                     )
                 })?;
+                let config = &entry.architecture;
                 let encoded = match operation {
                     "model-config" => encode_architecture_config(config),
                     "rope-scaling" => encode_rope_scaling(config.rope_frequency_scaling.as_ref()),
@@ -440,11 +604,40 @@ impl HostCapability for ModelConfigCapability {
                         encode_mixture_of_experts(config.mixture_of_experts.as_ref())
                     }
                     "layer-layout" => encode_layer_layout(config.layer_layout.as_deref()),
+                    "encoder-config" => encode_encoder_config(entry.encoder.as_ref()),
                     "multi-head-latent-attention" => {
                         encode_latent_attention(config.latent_attention.as_ref())
                     }
                     "mixture-of-experts-layers" => encode_moe_layers(config.moe_layers.as_deref()),
+                    "rope-layers" => encode_moe_layers(config.rope_layers.as_deref()),
                     "expert-routing" => encode_expert_routing(config.expert_routing.as_ref()),
+                    "expert-normalization" => ComponentValue::Option(
+                        config
+                            .expert_routing
+                            .and_then(|routing| routing.normalization)
+                            .map(|value| {
+                                Box::new(ComponentValue::Enum(
+                                    match value {
+                                        ExpertNormalization::Never => "never",
+                                        ExpertNormalization::MultipleExperts => "multiple-experts",
+                                        ExpertNormalization::Always => "always",
+                                    }
+                                    .into(),
+                                ))
+                            }),
+                    ),
+                    "latent-norm-epsilon" => ComponentValue::Option(
+                        config
+                            .latent_attention
+                            .and_then(|mla| mla.norm_eps)
+                            .map(|value| Box::new(ComponentValue::F64(value))),
+                    ),
+                    "hidden-activation" => ComponentValue::Option(
+                        config
+                            .hidden_activation
+                            .as_ref()
+                            .map(|value| Box::new(ComponentValue::String(value.clone()))),
+                    ),
                     _ => encode_options(config),
                 };
                 drop(bound);

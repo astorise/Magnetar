@@ -346,10 +346,15 @@ impl KvCacheCompatibility {
     }
 
     pub fn validate_reuse(&self, requested: &Self) -> Result<(), KvCacheError> {
-        if self.model != requested.model {
+        if self.model != requested.model
+            || self.model_architecture != requested.model_architecture
+            || self.model_revision != requested.model_revision
+        {
             return Err(KvCacheError::CacheModelMismatch);
         }
-        if self.tokenizer != requested.tokenizer {
+        if self.tokenizer != requested.tokenizer
+            || self.tokenizer_vocabulary_size != requested.tokenizer_vocabulary_size
+        {
             return Err(KvCacheError::CacheTokenizerMismatch);
         }
         if self.prefix_fingerprint != requested.prefix_fingerprint {
@@ -357,6 +362,9 @@ impl KvCacheCompatibility {
         }
         if self.position_encoding != requested.position_encoding {
             return Err(KvCacheError::CachePositionMismatch);
+        }
+        if self.attention_implementation != requested.attention_implementation {
+            return Err(KvCacheError::CacheLayoutMismatch);
         }
         if self.quantization_mode != requested.quantization_mode {
             return Err(KvCacheError::CacheDTypeMismatch);
@@ -591,6 +599,19 @@ impl KvCache {
         self.layout.append_tokens(count)
     }
 
+    /// Complete prefill atomically: a capacity or lifecycle failure must not
+    /// leave an empty cache stuck in the intermediate Prefilling state.
+    pub(crate) fn complete_prefill(&mut self, tokens: u32) -> Result<(), KvCacheError> {
+        let mut next = self.clone();
+        if next.lifecycle == KvCacheLifecycleState::Empty {
+            next.transition_to(KvCacheLifecycleState::Prefilling)?;
+        }
+        next.append_tokens(tokens)?;
+        next.transition_to(KvCacheLifecycleState::Ready)?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn seal(&mut self) -> Result<(), KvCacheError> {
         self.transition_to(KvCacheLifecycleState::Sealed)
     }
@@ -782,14 +803,7 @@ impl KvCacheManager {
     }
 
     pub fn prefill_completed(&mut self, id: &KvCacheId, tokens: u32) -> Result<(), KvCacheError> {
-        {
-            let cache = self.cache_mut(id)?;
-            if cache.lifecycle == KvCacheLifecycleState::Empty {
-                cache.transition_to(KvCacheLifecycleState::Prefilling)?;
-            }
-            cache.append_tokens(tokens)?;
-            cache.transition_to(KvCacheLifecycleState::Ready)?;
-        }
+        self.cache_mut(id)?.complete_prefill(tokens)?;
         self.observe(
             KvCacheObservationKind::PrefillCompleted,
             Some(id.clone()),

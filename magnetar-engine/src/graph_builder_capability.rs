@@ -23,7 +23,8 @@ use crate::compute_types::{
 use crate::execution_graph::{
     ExecutionGraph, ExecutionGraphId, ExecutionGraphPhase, ExecutionGraphProducer, ExecutionNode,
     ExecutionNodeId, GraphKvCacheBehavior, GraphKvCacheMetadata, GraphModelCompatibility,
-    TensorAliasing, TensorEdge, TensorEdgeId,
+    GraphRecurrentStateBehavior, GraphRecurrentStateMetadata, TensorAliasing, TensorEdge,
+    TensorEdgeId,
 };
 use crate::operator::{
     OperatorAttributeValue, OperatorFamily, OperatorId, initial_operator_catalog,
@@ -68,6 +69,22 @@ struct Session {
     graph: Option<ExecutionGraph>,
     finished: BTreeMap<String, ExecutionGraph>,
     next_handle: u64,
+    recurrent_resources: BTreeMap<String, RecurrentResource>,
+}
+
+#[derive(Clone)]
+struct RecurrentResource {
+    layer: u32,
+    slot: String,
+    shape: ShapeDescriptor,
+}
+
+struct NodeDescription {
+    id: String,
+    operator: String,
+    family: OperatorFamily,
+    attributes: Vec<(String, OperatorAttributeValue)>,
+    inputs: Vec<String>,
 }
 
 /// Runtime-side [`HostCapability`] backing `graph-builder`. One instance is
@@ -102,6 +119,7 @@ impl GraphBuilderCapability {
                 graph: None,
                 finished: BTreeMap::new(),
                 next_handle: 0,
+                recurrent_resources: BTreeMap::new(),
             },
         );
     }
@@ -205,6 +223,27 @@ fn decode_tensor_shape(value: &ComponentValue) -> Result<ShapeDescriptor, String
         decoded.push(expect_u64(dimension)?);
     }
     Ok(ShapeDescriptor::new(decoded))
+}
+
+fn decode_node_description(arguments: &[ComponentValue]) -> Result<NodeDescription, String> {
+    let id = expect_string(&arguments[0])?.to_string();
+    let operator = expect_string(&arguments[1])?.to_string();
+    let family = parse_operator_family(expect_string(&arguments[2])?)?;
+    let attributes = expect_list(&arguments[3])?
+        .iter()
+        .map(decode_attribute)
+        .collect::<Result<Vec<_>, _>>()?;
+    let inputs = expect_list(&arguments[4])?
+        .iter()
+        .map(|value| expect_string(value).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NodeDescription {
+        id,
+        operator,
+        family,
+        attributes,
+        inputs,
+    })
 }
 
 /// Every tensor this Capability's graphs carry is contiguous `float32` --
@@ -316,6 +355,7 @@ impl GraphBuilderCapability {
         let phase = match phase {
             "prefill" => ExecutionGraphPhase::Prefill,
             "decode" => ExecutionGraphPhase::Decode,
+            "encode" => ExecutionGraphPhase::Encode,
             other => {
                 return Err(rejected(
                     CAPABILITY_NAME,
@@ -328,6 +368,13 @@ impl GraphBuilderCapability {
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
         let position_offset = expect_u64(&arguments[2])
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        if phase == ExecutionGraphPhase::Encode && (sequence_length == 0 || position_offset != 0) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "encode graphs require positive length and zero position offset",
+            ));
+        }
 
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(instance_key).ok_or_else(|| {
@@ -356,6 +403,7 @@ impl GraphBuilderCapability {
         graph.model = GraphModelCompatibility::default();
         graph.fingerprint = Some(session.context.compatibility_key.clone());
         session.graph = Some(graph);
+        session.recurrent_resources.clear();
         Ok(Vec::new())
     }
 
@@ -501,6 +549,208 @@ impl GraphBuilderCapability {
         Ok(vec![ComponentValue::String(resource_id)])
     }
 
+    fn recurrent_resource(
+        &self,
+        instance_key: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        expect_arity("recurrent-resource", 3, arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let layer = expect_u64(&arguments[0])
+            .ok()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                rejected(
+                    CAPABILITY_NAME,
+                    instance_key,
+                    "recurrent-resource: invalid layer",
+                )
+            })?;
+        let slot = expect_string(&arguments[1])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        if slot.is_empty()
+            || slot.len() > 64
+            || !slot
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "recurrent-resource: invalid slot",
+            ));
+        }
+        let shape = decode_tensor_shape(&arguments[2])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        if shape.dimensions.is_empty()
+            || shape.dimensions.contains(&0)
+            || !shape
+                .element_count()
+                .is_ok_and(|elements| elements <= 67_108_864)
+        {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "recurrent-resource: invalid fixed shape",
+            ));
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(instance_key).ok_or_else(|| {
+            rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "no prepared session for this instance",
+            )
+        })?;
+        if session.graph.is_none() {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "recurrent-resource called before begin-graph",
+            ));
+        }
+        let id = format!("{}.state.layer{layer}.{slot}", session.context.kv_namespace);
+        if let Some(existing) = session.recurrent_resources.get(&id) {
+            if existing.layer != layer || existing.slot != slot || existing.shape != shape {
+                return Err(rejected(
+                    CAPABILITY_NAME,
+                    instance_key,
+                    "recurrent-resource: incompatible repeated declaration",
+                ));
+            }
+        } else {
+            session.recurrent_resources.insert(
+                id.clone(),
+                RecurrentResource {
+                    layer,
+                    slot: slot.to_string(),
+                    shape,
+                },
+            );
+        }
+        Ok(vec![ComponentValue::String(id)])
+    }
+
+    fn recurrent_input(
+        &self,
+        instance_key: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        expect_arity("recurrent-input", 1, arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let id = expect_string(&arguments[0])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(instance_key).ok_or_else(|| {
+            rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "no prepared session for this instance",
+            )
+        })?;
+        let resource = session
+            .recurrent_resources
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                rejected(
+                    CAPABILITY_NAME,
+                    instance_key,
+                    "recurrent-input: unknown resource",
+                )
+            })?;
+        let graph = session.graph.as_mut().ok_or_else(|| {
+            rejected(CAPABILITY_NAME, instance_key, "no graph under construction")
+        })?;
+        let edge_id = TensorEdgeId::new(format!("recurrent.{id}.input"));
+        if graph.edges.contains_key(&edge_id) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "recurrent-input: resource already has an input",
+            ));
+        }
+        let mut edge = TensorEdge::new(edge_id.clone(), descriptor_from_shape(resource.shape));
+        edge.recurrent_state = Some(GraphRecurrentStateMetadata {
+            resource_id: id.to_string(),
+            layer: resource.layer,
+            slot: resource.slot,
+            behavior: GraphRecurrentStateBehavior::Input,
+            compatibility_key: session.context.compatibility_key.clone(),
+        });
+        graph.edges.insert(edge_id.clone(), edge);
+        Ok(vec![ComponentValue::String(edge_id.as_str().to_string())])
+    }
+
+    fn recurrent_output(
+        &self,
+        instance_key: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        expect_arity("recurrent-output", 2, arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let id = expect_string(&arguments[0])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let edge_id = expect_string(&arguments[1])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(instance_key).ok_or_else(|| {
+            rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "no prepared session for this instance",
+            )
+        })?;
+        let resource = session
+            .recurrent_resources
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                rejected(
+                    CAPABILITY_NAME,
+                    instance_key,
+                    "recurrent-output: unknown resource",
+                )
+            })?;
+        let graph = session.graph.as_mut().ok_or_else(|| {
+            rejected(CAPABILITY_NAME, instance_key, "no graph under construction")
+        })?;
+        if graph.edges.values().any(|edge| matches!(&edge.recurrent_state, Some(metadata) if metadata.resource_id == id && metadata.behavior == GraphRecurrentStateBehavior::Output)) {
+            return Err(rejected(CAPABILITY_NAME, instance_key, "recurrent-output: resource already has an output"));
+        }
+        let edge = graph
+            .edges
+            .get_mut(&TensorEdgeId::new(edge_id))
+            .ok_or_else(|| {
+                rejected(
+                    CAPABILITY_NAME,
+                    instance_key,
+                    "recurrent-output: unknown edge",
+                )
+            })?;
+        if edge.producer.is_none()
+            || edge.kv_cache.is_some()
+            || edge.prefix_cache.is_some()
+            || edge.recurrent_state.is_some()
+            || edge.aliasing != TensorAliasing::None
+            || edge.descriptor != descriptor_from_shape(resource.shape)
+        {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "recurrent-output: edge must be a same-shaped, unaliased node output",
+            ));
+        }
+        edge.recurrent_state = Some(GraphRecurrentStateMetadata {
+            resource_id: id.to_string(),
+            layer: resource.layer,
+            slot: resource.slot,
+            behavior: GraphRecurrentStateBehavior::Output,
+            compatibility_key: session.context.compatibility_key.clone(),
+        });
+        Ok(Vec::new())
+    }
+
     fn add_node(
         &self,
         instance_key: &str,
@@ -508,33 +758,8 @@ impl GraphBuilderCapability {
     ) -> Result<Vec<ComponentValue>, ComponentError> {
         expect_arity("add-node", 7, arguments)
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let node_id = expect_string(&arguments[0])
+        let description = decode_node_description(arguments)
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let operator = expect_string(&arguments[1])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let family = expect_string(&arguments[2])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let family = parse_operator_family(family)
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let attribute_values = expect_list(&arguments[3])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let mut attributes = Vec::with_capacity(attribute_values.len());
-        for value in attribute_values {
-            attributes.push(
-                decode_attribute(value)
-                    .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?,
-            );
-        }
-        let input_values = expect_list(&arguments[4])
-            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
-        let mut inputs = Vec::with_capacity(input_values.len());
-        for value in input_values {
-            inputs.push(
-                expect_string(value)
-                    .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?
-                    .to_string(),
-            );
-        }
         let output_shape = decode_tensor_shape(&arguments[5])
             .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
         let kv = match &arguments[6] {
@@ -552,6 +777,56 @@ impl GraphBuilderCapability {
             }
         };
 
+        let ids = self.insert_node(instance_key, description, vec![output_shape], kv, false)?;
+        Ok(vec![ComponentValue::String(
+            ids.into_iter().next().expect("one output"),
+        )])
+    }
+
+    fn add_node_outputs(
+        &self,
+        instance_key: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        expect_arity("add-node-outputs", 6, arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let description = decode_node_description(arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let values = expect_list(&arguments[5])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        if !(1..=16).contains(&values.len()) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "add-node-outputs requires 1-16 outputs",
+            ));
+        }
+        let shapes = values
+            .iter()
+            .map(decode_tensor_shape)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let ids = self.insert_node(instance_key, description, shapes, None, true)?;
+        Ok(vec![ComponentValue::List(
+            ids.into_iter().map(ComponentValue::String).collect(),
+        )])
+    }
+
+    fn insert_node(
+        &self,
+        instance_key: &str,
+        description: NodeDescription,
+        output_shapes: Vec<ShapeDescriptor>,
+        kv: Option<(String, GraphKvCacheBehavior)>,
+        multiple_outputs: bool,
+    ) -> Result<Vec<String>, ComponentError> {
+        let NodeDescription {
+            id: node_id,
+            operator,
+            family,
+            attributes,
+            inputs,
+        } = description;
         let mut sessions = self.sessions.lock().unwrap();
         // Read before `active_graph` takes a mutable borrow of `sessions`.
         let compatibility_key = sessions
@@ -568,7 +843,7 @@ impl GraphBuilderCapability {
                 ));
             }
         }
-        let node_node_id = ExecutionNodeId::new(node_id);
+        let node_node_id = ExecutionNodeId::new(&node_id);
         if graph.nodes.contains_key(&node_node_id) {
             return Err(rejected(
                 CAPABILITY_NAME,
@@ -576,39 +851,69 @@ impl GraphBuilderCapability {
                 format!("add-node: node '{node_id}' already exists"),
             ));
         }
-        let output_edge_id = TensorEdgeId::new(format!("edge.{node_id}"));
+        let output_edge_ids: Vec<_> = (0..output_shapes.len())
+            .map(|index| {
+                TensorEdgeId::new(if multiple_outputs {
+                    format!("edge.{node_id}.{index}")
+                } else {
+                    format!("edge.{node_id}")
+                })
+            })
+            .collect();
+        if output_edge_ids
+            .iter()
+            .any(|id| graph.edges.contains_key(id))
+        {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "add-node: output edge identity already exists",
+            ));
+        }
         let mut node = ExecutionNode::new(
             node_node_id.clone(),
-            OperatorId::magnetar(operator, 1, family),
+            OperatorId::magnetar(&operator, 1, family),
         );
         for input in &inputs {
             node = node.with_input(TensorEdgeId::new(input.as_str()));
         }
-        node = node.with_output(output_edge_id.clone());
+        for output in &output_edge_ids {
+            node = node.with_output(output.clone());
+        }
         for (name, value) in attributes {
             node = node.with_attribute(name, value);
         }
-        let mut output_edge =
-            TensorEdge::new(output_edge_id.clone(), descriptor_from_shape(output_shape))
-                .with_producer(node_node_id.clone());
-        if let Some((resource_id, behavior)) = kv {
-            output_edge.kv_cache = Some(GraphKvCacheMetadata {
-                cache_id: resource_id,
-                behavior,
-                paged: false,
-                compatibility_key,
-            });
-        }
+        let output_edges: Vec<_> = output_edge_ids
+            .iter()
+            .cloned()
+            .zip(output_shapes)
+            .map(|(id, shape)| {
+                let mut edge = TensorEdge::new(id, descriptor_from_shape(shape))
+                    .with_producer(node_node_id.clone());
+                if let Some((resource_id, behavior)) = &kv {
+                    edge.kv_cache = Some(GraphKvCacheMetadata {
+                        cache_id: resource_id.clone(),
+                        behavior: behavior.clone(),
+                        paged: false,
+                        compatibility_key: compatibility_key.clone(),
+                    });
+                }
+                edge
+            })
+            .collect();
         for input in &inputs {
             if let Some(edge) = graph.edges.get_mut(&TensorEdgeId::new(input.as_str())) {
                 edge.consumers.insert(node_node_id.clone());
             }
         }
         graph.nodes.insert(node_node_id, node);
-        graph.edges.insert(output_edge_id.clone(), output_edge);
-        Ok(vec![ComponentValue::String(
-            output_edge_id.as_str().to_string(),
-        )])
+        for edge in output_edges {
+            graph.edges.insert(edge.id.clone(), edge);
+        }
+        Ok(output_edge_ids
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect())
     }
 
     fn finish_graph(
@@ -651,6 +956,13 @@ impl GraphBuilderCapability {
                 format!("finish-graph: output edge '{output_edge_id}' does not exist"),
             )
         })?;
+        if edge.recurrent_state.is_some() {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "finish-graph: output cannot also be a recurrent state edge",
+            ));
+        }
         if output_edge_id != output_name {
             if let Some(producer) = &edge.producer
                 && let Some(node) = graph.nodes.get_mut(producer)
@@ -725,7 +1037,11 @@ impl HostCapability for GraphBuilderCapability {
             "weight-edge" => self.weight_edge(instance_key, arguments),
             "alias-weight-edge" => self.alias_weight_edge(instance_key, arguments),
             "kv-resource" => self.kv_resource(instance_key, arguments),
+            "recurrent-resource" => self.recurrent_resource(instance_key, arguments),
+            "recurrent-input" => self.recurrent_input(instance_key, arguments),
+            "recurrent-output" => self.recurrent_output(instance_key, arguments),
             "add-node" => self.add_node(instance_key, arguments),
+            "add-node-outputs" => self.add_node_outputs(instance_key, arguments),
             "finish-graph" => self.finish_graph(instance_key, arguments),
             other => Err(rejected(
                 CAPABILITY_NAME,

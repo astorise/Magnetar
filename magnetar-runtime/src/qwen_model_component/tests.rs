@@ -1358,6 +1358,10 @@ fn kv_cache_compatibility_embeds_component_version() {
         compatibility_v1.model_architecture,
         compatibility_v2.model_architecture
     );
+    assert!(matches!(
+        compatibility_v1.validate_reuse(&compatibility_v2),
+        Err(crate::KvCacheError::CacheModelMismatch)
+    ));
 }
 
 #[test]
@@ -1721,6 +1725,7 @@ fn a_latent_attention_inventory_needs_the_split_projections() {
         qk_nope_head_dim: 2,
         qk_rope_head_dim: 2,
         v_head_dim: 3,
+        norm_eps: None,
     };
     config.latent_attention = Some(mla);
     let metadata = |name: String, shape: Vec<u64>| ModelTensorMetadata {

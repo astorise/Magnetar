@@ -379,10 +379,16 @@ mod tests {
         let unreachable_addr = dead_listener.local_addr().unwrap();
         drop(dead_listener);
 
+        // An unused loopback port may be refused or time out depending on
+        // the OS and firewall. Compare with the last address's direct error
+        // rather than assuming a particular network policy.
+        let last_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+        let timeout = std::time::Duration::from_secs(2);
+        let expected = TcpStream::connect_timeout(&last_addr, timeout).unwrap_err();
         let error =
-            connect_to_first_reachable(&[unreachable_addr], std::time::Duration::from_secs(2))
-                .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+            connect_to_first_reachable(&[unreachable_addr, last_addr], timeout).unwrap_err();
+        assert_eq!(error.kind(), expected.kind());
+        assert_eq!(error.raw_os_error(), expected.raw_os_error());
     }
 
     /// §10/§29 "Test network stays in CLI": with explicit policy, a real

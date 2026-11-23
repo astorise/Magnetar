@@ -317,3 +317,69 @@ A Model Component implementing `model-component-graph-producer` SHALL be able to
 - **WHEN** its declared output edge is inspected
 - **THEN** it carries a raw post-layer hidden state of shape `[sequence_length, hidden_size]`, not a vocabulary-sized logits tensor
 
+### Requirement: Model Components Can Validate Declared Activation
+
+`model-component-graph` version `1.8.0` SHALL provide an optional
+`hidden-activation` through `model-config`. The value SHALL preserve the
+normalized checkpoint activation when it is known. Components that support
+only a fixed activation SHALL check the value and refuse missing or different
+values instead of silently producing an incompatible graph. Every Component
+SHALL read this capability, including when the value is unknown; a Component
+with no configurable activation may explicitly ignore the result. The Runtime
+SHALL reject a graph from an older Component that cannot read this capability.
+
+#### Scenario: A fixed-SiLU Component receives an incompatible activation
+
+- **GIVEN** a Component that implements only SiLU feed-forward activation
+- **WHEN** `hidden-activation` is absent or names a different activation
+- **THEN** graph production fails before inference
+
+### Requirement: Components Receive Per-Layer Rotary Selection
+
+`model-component-graph` version `1.9.0` SHALL expose an optional per-layer
+RoPE selection through `model-config`. A present list SHALL contain one value
+per decoder layer: true rotates Q/K and false keeps them position-independent.
+An older Component that does not read a declared list SHALL be refused.
+Segments SHALL use the original layer indices, and a NoPE layer SHALL cache
+the unrotated key for both prefill and cached decode.
+
+#### Scenario: A declared NoPE layer reaches an older Component
+
+- **GIVEN** a model configuration with a per-layer RoPE selection
+- **WHEN** graph production uses a Component that never reads that selection
+- **THEN** the Runtime refuses the graph rather than assuming all layers rotate
+
+### Requirement: Components Receive Expert Normalization Semantics
+
+`model-component-graph` version `1.10.0` SHALL expose an optional expert
+normalization mode through `model-config`. The modes distinguish no
+normalization, normalization only when multiple experts are selected, and
+normalization even for top-1. The Runtime SHALL refuse a graph built without
+reading a declared mode. The mode SHALL agree with the checkpoint's declared
+top-k normalization setting.
+
+#### Scenario: A declared top-1 mode reaches an older Component
+
+- **GIVEN** a checkpoint whose expert normalization mode is explicit
+- **WHEN** a Component builds a graph without reading that mode
+- **THEN** the Runtime refuses the graph rather than guessing its top-1 behavior
+
+The same version SHALL expose a separately declared latent bottleneck
+normalization epsilon. When present, Components SHALL read and apply it for
+query and key/value latent norms instead of assuming the decoder-wide epsilon.
+
+### Requirement: Production Graph Weights Come From The Artifact Inventory
+
+The Runtime SHALL validate a production Component's requested weight edges
+against the loaded artifact's tensor names and declared shapes, without
+inventing decoder-specific tensor names or substituting inferred shapes.
+A tied output projection MAY be represented as an alias of the artifact's
+declared token embedding. The completed graph SHALL pass portable Operator
+shape validation before execution.
+
+#### Scenario: A Component asks for an absent or incompatible weight
+
+- **GIVEN** a loaded artifact whose inventory is missing a requested weight or declares an incompatible shape
+- **WHEN** its Component builds a production graph
+- **THEN** graph construction or validation fails before the graph executes
+

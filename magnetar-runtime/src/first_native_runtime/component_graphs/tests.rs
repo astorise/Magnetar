@@ -7,6 +7,565 @@ use super::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn decoder_segments_reject_inverted_or_out_of_range_layers() {
+    let fixture = e2e_fixture().unwrap();
+    let count = fixture.config.architecture.layer_count as u32;
+    for (start, end) in [(0, 0), (0, count), (count, count)] {
+        validate_segment_bounds(&fixture.config, start, end).unwrap();
+    }
+    for (start, end) in [(1, 0), (0, count + 1), (count + 1, count + 1)] {
+        assert!(
+            build_first_native_prefill_graph_segment_for_config(
+                &fixture.config,
+                &fixture.identity,
+                2,
+                start,
+                end
+            )
+            .is_err(),
+            "accepted invalid prefill segment {start}..{end}"
+        );
+        assert!(
+            build_first_native_decode_graph_segment_for_config(
+                &fixture.config,
+                &fixture.identity,
+                2,
+                start,
+                end
+            )
+            .is_err(),
+            "accepted invalid decode segment {start}..{end}"
+        );
+        let loading = load_first_native_segment_with_provider_and_weights(
+            Arc::new(ReferenceCpuProvider::new()),
+            &fixture,
+            &fixture.weights,
+            start,
+            end,
+        );
+        assert!(matches!(
+            loading,
+            Err(E2eConformanceError::ModelComponentFailed { reason })
+                if reason.contains("invalid decoder segment")
+        ));
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn decoder_graph_pair_requires_matching_recurrent_schemas() {
+    let make_graph = |phase| {
+        let input_id = TensorEdgeId::new("state.in");
+        let output_id = TensorEdgeId::new("state.out");
+        let state = |behavior| GraphRecurrentStateMetadata {
+            resource_id: "model.state.layer0.conv".into(),
+            layer: 0,
+            slot: "conv".into(),
+            behavior,
+            compatibility_key: "component-v1".into(),
+        };
+        let mut input =
+            TensorEdge::new(input_id.clone(), f32_tensor_descriptor_from_shape(&[2, 3]));
+        input.recurrent_state = Some(state(GraphRecurrentStateBehavior::Input));
+        let mut output =
+            TensorEdge::new(output_id.clone(), f32_tensor_descriptor_from_shape(&[2, 3]));
+        output.recurrent_state = Some(state(GraphRecurrentStateBehavior::Output));
+        ExecutionGraph::new(ExecutionGraphId::new("pair-test"), phase)
+            .with_edge(input)
+            .with_edge(output)
+            .with_node(
+                ExecutionNode::new(
+                    ExecutionNodeId::new("update"),
+                    OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+                )
+                .with_input(input_id)
+                .with_output(output_id),
+            )
+    };
+    let prefill = make_graph(ExecutionGraphPhase::Prefill);
+    let decode = make_graph(ExecutionGraphPhase::Decode);
+    for graph in [&prefill, &decode] {
+        graph.validate(&initial_operator_catalog()).unwrap();
+    }
+    validate_recurrent_graph_pair(&prefill, &decode, 1).unwrap();
+    for difference in ["shape", "slot", "compatibility", "missing"] {
+        let mut incompatible = decode.clone();
+        for edge in incompatible.edges.values_mut() {
+            match difference {
+                "shape" => edge.descriptor = f32_tensor_descriptor_from_shape(&[2, 4]),
+                "slot" => {
+                    let state = edge.recurrent_state.as_mut().unwrap();
+                    state.slot = "ssm".into();
+                    state.resource_id = "model.state.layer0.ssm".into();
+                }
+                "compatibility" => {
+                    edge.recurrent_state.as_mut().unwrap().compatibility_key =
+                        "another-component".into();
+                }
+                "missing" => edge.recurrent_state = None,
+                _ => unreachable!(),
+            }
+        }
+        incompatible.validate(&initial_operator_catalog()).unwrap();
+        assert!(
+            validate_recurrent_graph_pair(&prefill, &incompatible, 1).is_err(),
+            "accepted incompatible {difference}"
+        );
+    }
+    assert!(validate_recurrent_graph_pair(&decode, &prefill, 1).is_err());
+    assert!(validate_recurrent_graph_pair(&prefill, &decode, 0).is_err());
+
+    // Do not accept an input-only slot even if its input matches prefill.
+    // Both edges must be checked before a state can cross a graph boundary.
+    let mut missing_output = decode.clone();
+    missing_output
+        .edges
+        .get_mut(&TensorEdgeId::new("state.out"))
+        .unwrap()
+        .recurrent_state = None;
+    assert!(validate_recurrent_graph_pair(&prefill, &missing_output, 1).is_err());
+
+    // Edge names are graph-local and may differ between prefill and decode.
+    let mut renamed = decode.clone();
+    for (old, new) in [("state.in", "decode.in"), ("state.out", "decode.out")] {
+        let old_id = TensorEdgeId::new(old);
+        let new_id = TensorEdgeId::new(new);
+        let mut edge = renamed.edges.remove(&old_id).unwrap();
+        edge.id = new_id.clone();
+        renamed.edges.insert(new_id.clone(), edge);
+        for node in renamed.nodes.values_mut() {
+            for id in node.inputs.iter_mut().chain(&mut node.outputs) {
+                if *id == old_id {
+                    *id = new_id.clone();
+                }
+            }
+        }
+    }
+    renamed.validate(&initial_operator_catalog()).unwrap();
+    validate_recurrent_graph_pair(&prefill, &renamed, 1).unwrap();
+
+    assert!(validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Prefill, 0, 1).is_ok());
+    assert!(
+        validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Prefill, 1, 2).is_err()
+    );
+    assert!(validate_segment_recurrent_scope(&prefill, ExecutionGraphPhase::Decode, 0, 1).is_err());
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn failed_decoder_graph_builds_release_host_capability_state() {
+    struct RecordingCapability {
+        inner: Arc<dyn HostCapability>,
+        keys: Arc<Mutex<Vec<String>>>,
+        reject_weights: bool,
+    }
+    impl HostCapability for RecordingCapability {
+        fn call(
+            &self,
+            key: &str,
+            operation: &str,
+            arguments: &[ComponentValue],
+        ) -> Result<Vec<ComponentValue>, ComponentError> {
+            self.keys.lock().unwrap().push(key.to_string());
+            if self.reject_weights && operation == "weight-edge" {
+                return Err(ComponentError::CapabilityCallRejected {
+                    capability: "graph-builder".into(),
+                    instance_key: key.into(),
+                    message: "injected missing weight".into(),
+                });
+            }
+            self.inner.call(key, operation, arguments)
+        }
+    }
+
+    let graph = Arc::new(GraphBuilderCapability::new());
+    let config = Arc::new(ModelConfigCapability::new());
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().unwrap(),
+    ));
+    manager.set_resource_limits(inference_component_runtime_limits());
+    manager
+        .set_trust_store(ComponentTrustStore::default().trust_digest(QWEN_REAL_COMPONENT_DIGEST));
+    for (name, inner) in [
+        (
+            "magnetar:model-component-graph/graph-builder",
+            graph.clone() as Arc<dyn HostCapability>,
+        ),
+        (
+            "magnetar:model-component-graph/model-config",
+            config.clone() as Arc<dyn HostCapability>,
+        ),
+    ] {
+        manager.provide_capability(
+            WitInterface::new(name, "1.8.0"),
+            Arc::new(RecordingCapability {
+                inner,
+                keys: keys.clone(),
+                reject_weights: name.ends_with("graph-builder"),
+            }),
+        );
+    }
+    let definition = manager
+        .prepare_pushed_package(qwen_real_component_package().unwrap())
+        .unwrap();
+    let manager = Mutex::new(manager);
+    let fixture = e2e_fixture().unwrap();
+    let architecture = architecture_config_from_first_native_model_config(&fixture.config);
+    for stage in ["full", "prefill-segment", "decode-segment"] {
+        keys.lock().unwrap().clear();
+        let failed = match stage {
+            "full" => build_first_native_graphs_with_runtime(
+                &manager,
+                &graph,
+                &config,
+                definition,
+                &architecture,
+                weight_shapes_for_architecture_config(&architecture),
+                &fixture.identity,
+                2,
+            )
+            .is_err(),
+            "prefill-segment" => build_first_native_prefill_graph_segment_with_runtime(
+                &manager,
+                &graph,
+                &config,
+                definition,
+                &fixture.config,
+                &fixture.identity,
+                2,
+                0,
+                architecture.num_hidden_layers,
+            )
+            .is_err(),
+            _ => build_first_native_decode_graph_segment_with_runtime(
+                &manager,
+                &graph,
+                &config,
+                definition,
+                &fixture.config,
+                &fixture.identity,
+                2,
+                0,
+                architecture.num_hidden_layers,
+            )
+            .is_err(),
+        };
+        assert!(failed, "{stage} must fail on the missing weight");
+        let recorded = keys.lock().unwrap().clone();
+        let key = recorded
+            .first()
+            .expect("the Component invoked a capability");
+        assert!(recorded.iter().all(|recorded| recorded == key));
+        assert!(
+            graph
+                .call(
+                    key,
+                    "kv-resource",
+                    &[ComponentValue::S64(0), ComponentValue::Enum("k".into())],
+                )
+                .is_err(),
+            "{stage} left a graph-builder session"
+        );
+        assert!(
+            config.call(key, "model-config", &[]).is_err(),
+            "{stage} left a model configuration"
+        );
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn encoder_graph_boundary_rejects_missing_or_incompatible_inputs_and_outputs() {
+    let fixture = e2e_fixture().unwrap();
+    let request = FirstNativeEncoderGraphRequest {
+        architecture: architecture_config_from_first_native_model_config(&fixture.config),
+        encoder: EncoderGraphConfig {
+            norm_epsilon: 1e-5,
+            max_positions: 16,
+            norm_bias: false,
+            attention_bias: false,
+            mlp_bias: false,
+            layers: vec![],
+        },
+        weight_shapes: BTreeMap::new(),
+        identity: fixture.identity,
+        sequence_length: 3,
+    };
+    let token_ids = TensorEdgeId::new("input.token_ids");
+    let mask = TensorEdgeId::new("input.attention_mask");
+    let output = TensorEdgeId::new("hidden_states");
+    let mut graph = ExecutionGraph::new(
+        ExecutionGraphId::new("boundary-test"),
+        ExecutionGraphPhase::Encode,
+    );
+    for (id, shape) in [
+        (token_ids.clone(), vec![3]),
+        (mask.clone(), vec![3]),
+        (output.clone(), vec![3, request.architecture.hidden_size]),
+    ] {
+        graph = graph.with_edge(TensorEdge::new(
+            id,
+            f32_tensor_descriptor_from_shape(&shape),
+        ));
+    }
+    graph = graph.with_node(
+        ExecutionNode::new(
+            ExecutionNodeId::new("test"),
+            OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+        )
+        .with_input(token_ids)
+        .with_input(mask.clone())
+        .with_output(output.clone()),
+    );
+    assert!(validate_encoder_graph_boundary(&graph, &request).is_ok());
+    let mut wrong = graph.clone();
+    wrong.phase = ExecutionGraphPhase::Prefill;
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+    wrong = graph.clone();
+    wrong.edges.get_mut(&output).unwrap().descriptor = f32_tensor_descriptor_from_shape(&[3, 1]);
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+    wrong = graph.clone();
+    wrong
+        .nodes
+        .values_mut()
+        .next()
+        .unwrap()
+        .inputs
+        .retain(|id| id != &mask);
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+    wrong = graph.clone();
+    let unexpected = TensorEdgeId::new("input.extra");
+    wrong = wrong.with_edge(TensorEdge::new(
+        unexpected,
+        f32_tensor_descriptor_from_shape(&[3]),
+    ));
+    assert!(validate_encoder_graph_boundary(&wrong, &request).is_err());
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn encoder_graph_boundary_rejects_inputs_used_only_by_disconnected_nodes() {
+    let fixture = e2e_fixture().unwrap();
+    let request = FirstNativeEncoderGraphRequest {
+        architecture: architecture_config_from_first_native_model_config(&fixture.config),
+        encoder: EncoderGraphConfig {
+            norm_epsilon: 1e-5,
+            max_positions: 16,
+            norm_bias: false,
+            attention_bias: false,
+            mlp_bias: false,
+            layers: vec![],
+        },
+        weight_shapes: BTreeMap::new(),
+        identity: fixture.identity,
+        sequence_length: 3,
+    };
+    for disconnected in ["input.token_ids", "input.attention_mask"] {
+        let live = if disconnected == "input.token_ids" {
+            "input.attention_mask"
+        } else {
+            "input.token_ids"
+        };
+        let mut graph = ExecutionGraph::new(
+            ExecutionGraphId::new("disconnected-encoder-input"),
+            ExecutionGraphPhase::Encode,
+        );
+        for (name, shape) in [
+            ("input.token_ids", vec![3]),
+            ("input.attention_mask", vec![3]),
+            (
+                "weight.embedding",
+                vec![8, request.architecture.hidden_size],
+            ),
+            ("hidden_states", vec![3, request.architecture.hidden_size]),
+            ("unused", vec![3]),
+        ] {
+            graph = graph.with_edge(TensorEdge::new(
+                TensorEdgeId::new(name),
+                f32_tensor_descriptor_from_shape(&shape),
+            ));
+        }
+        graph = graph.with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("encode"),
+                OperatorId::magnetar("embedding", 1, OperatorFamily::Tensor),
+            )
+            .with_input(TensorEdgeId::new(live))
+            .with_input(TensorEdgeId::new("weight.embedding"))
+            .with_output(TensorEdgeId::new("hidden_states")),
+        );
+        graph = graph.with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("irrelevant"),
+                OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+            )
+            .with_input(TensorEdgeId::new(disconnected))
+            .with_input(TensorEdgeId::new(disconnected))
+            .with_output(TensorEdgeId::new("unused")),
+        );
+        graph.validate(&initial_operator_catalog()).unwrap();
+        validate_first_scope_graph(&graph).unwrap();
+        assert!(
+            validate_encoder_graph_boundary(&graph, &request).is_err(),
+            "the {disconnected} input must contribute to hidden_states"
+        );
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn fixed_silu_components_reject_unknown_and_incompatible_activations() {
+    let fixtures: &[(&[u8], &[u8])] = &[
+        (
+            QWEN_REAL_COMPONENT_BYTES,
+            QWEN_REAL_COMPONENT_MANIFEST_BYTES,
+        ),
+        (
+            LLAMA_REAL_COMPONENT_BYTES,
+            LLAMA_REAL_COMPONENT_MANIFEST_BYTES,
+        ),
+        (
+            include_bytes!("../../../fixtures/components/deepseek-real.component.wasm"),
+            include_bytes!(
+                "../../../fixtures/components/deepseek-real.component.wasm.magnetar-component.yaml"
+            ),
+        ),
+    ];
+    let fixture = e2e_fixture().unwrap();
+    for (bytes, manifest) in fixtures {
+        let digest = ComponentDigest::sha256(bytes);
+        let trust = ComponentTrustStore::default().trust_digest(&digest.value);
+        register_inference_component_artifact(bytes.to_vec(), manifest.to_vec(), &trust).unwrap();
+        for activation in [None, Some("gelu"), Some("unknown")] {
+            let mut config = architecture_config_from_first_native_model_config(&fixture.config);
+            config.hidden_activation = activation.map(str::to_string);
+            assert!(
+                build_first_native_graphs_from_named_component(
+                    &digest,
+                    &config,
+                    &fixture.identity,
+                    2
+                )
+                .is_err(),
+                "component {digest:?} accepted activation {activation:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn mistral_component_reads_activation_and_per_layer_windows() {
+    let bytes = include_bytes!("../../../fixtures/components/mistral-real.component.wasm");
+    let manifest = include_bytes!(
+        "../../../fixtures/components/mistral-real.component.wasm.magnetar-component.yaml"
+    );
+    let digest = ComponentDigest::sha256(bytes);
+    let trust = ComponentTrustStore::default().trust_digest(&digest.value);
+    register_inference_component_artifact(bytes.to_vec(), manifest.to_vec(), &trust).unwrap();
+    let fixture = e2e_fixture().unwrap();
+    let mut config = architecture_config_from_first_native_model_config(&fixture.config);
+    config.hidden_activation = Some("silu".into());
+    config.layer_layout = Some(vec![
+        crate::LayerSpec {
+            sliding_window: Some(2),
+            head_dim: config.head_dim,
+            num_key_value_heads: config.num_key_value_heads,
+            rope_theta: config.rope_theta,
+            partial_rotary_factor: None,
+            value_from_key: false,
+            kv_source_layer: None,
+            intermediate_size: config.intermediate_size,
+        };
+        config.num_hidden_layers as usize
+    ]);
+    let (graphs, _, _) =
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .expect("the new component reads its required configuration");
+    for graph in [&graphs.prefill, &graphs.decode] {
+        let attention = graph
+            .nodes
+            .values()
+            .find(|node| node.operator.name() == "attention")
+            .unwrap();
+        assert_eq!(
+            attention.attributes.get("window_size"),
+            Some(&OperatorAttributeValue::Integer(2))
+        );
+    }
+    config.hidden_activation = None;
+    assert!(
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .is_err()
+    );
+    config.hidden_activation = Some("gelu".into());
+    assert!(
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .is_err()
+    );
+    config.hidden_activation = Some("silu".into());
+    config.layer_layout = None;
+    let (graphs, _, _) =
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .unwrap();
+    assert!(
+        graphs
+            .prefill
+            .nodes
+            .values()
+            .filter(|node| node.operator.name() == "attention")
+            .all(|node| !node.attributes.contains_key("window_size"))
+    );
+    config.rope_layers = Some(vec![false; config.num_hidden_layers as usize]);
+    assert!(
+        build_first_native_graphs_from_named_component(&digest, &config, &fixture.identity, 4)
+            .is_err(),
+        "a pre-1.9 component must not ignore the declared per-layer positional encoding"
+    );
+    config.rope_layers = None;
+    let mut tensors = fixture.manifest.tensors.clone();
+    build_first_native_graphs_from_named_component_for_artifact(
+        &digest,
+        &config,
+        &tensors,
+        &fixture.identity,
+        4,
+    )
+    .expect("the Component can build from the real inventory");
+    tensors.retain(|tensor| tensor.name != "layers.0.input_norm");
+    assert!(
+        build_first_native_graphs_from_named_component_for_artifact(
+            &digest,
+            &config,
+            &tensors,
+            &fixture.identity,
+            4,
+        )
+        .is_err(),
+        "a missing weight cannot be fabricated from architecture defaults"
+    );
+    let mut tensors = fixture.manifest.tensors.clone();
+    tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == "layers.0.self_attn.q_proj")
+        .unwrap()
+        .shape = vec![1, 1];
+    assert!(
+        build_first_native_graphs_from_named_component_for_artifact(
+            &digest,
+            &config,
+            &tensors,
+            &fixture.identity,
+            4,
+        )
+        .is_err(),
+        "a declared weight with the wrong shape must fail graph validation"
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn e2e_two_segment_split_produces_identical_output_to_full_graph() {
     check_two_segment_split_produces_identical_output_to_full_graph().expect(
         "splitting a real forward pass into two segment Model Instances, bridged \
@@ -204,6 +763,46 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     let synthetic_prefill_hash =
         qwen_operator_sequence_hash(&qwen_graph_operator_codes(&synthetic_graphs.prefill).unwrap());
     assert_ne!(named_prefill_hash, synthetic_prefill_hash);
+    let mut no_activation = architecture_config_from_first_native_model_config(&fixture.config);
+    no_activation.hidden_activation = None;
+    build_first_native_graphs_from_named_component(
+        &synthetic_digest,
+        &no_activation,
+        &fixture.identity,
+        prompt_token_count,
+    )
+    .expect("a Component with no MLP may explicitly accept an unknown activation");
+
+    // The pre-1.8 version of this same fixture cannot distinguish known and
+    // unknown activation values. It must be rejected for both, even though
+    // it could otherwise construct a graph successfully.
+    let legacy_bytes =
+        include_bytes!("../../../fixtures/components/synthetic-legacy.component.wasm");
+    let legacy_manifest = include_bytes!(
+        "../../../fixtures/components/synthetic-legacy.component.wasm.magnetar-component.yaml"
+    );
+    let legacy_digest = ComponentDigest::sha256(legacy_bytes);
+    let legacy_trust = ComponentTrustStore::default().trust_digest(&legacy_digest.value);
+    register_inference_component_artifact(
+        legacy_bytes.to_vec(),
+        legacy_manifest.to_vec(),
+        &legacy_trust,
+    )
+    .expect("the legacy fixture registers before graph validation");
+    for activation in [None, Some("silu")] {
+        let mut config = architecture_config_from_first_native_model_config(&fixture.config);
+        config.hidden_activation = activation.map(str::to_string);
+        let error = build_first_native_graphs_from_named_component(
+            &legacy_digest,
+            &config,
+            &fixture.identity,
+            prompt_token_count,
+        )
+        .map(|_| ())
+        .expect_err("an older Component must not ignore activation")
+        .to_string();
+        assert!(error.contains("hidden-activation"), "{error}");
+    }
 
     // Building the synthetic Component's graphs must not disturb the real
     // Qwen Component's own registered runtime: building from the Qwen
@@ -635,12 +1234,34 @@ fn a_component_that_never_reads_a_declared_1_7_0_feature_is_refused() {
             groups: None,
             routed_scaling_factor: 2.0,
             selection_bias: false,
+            normalization: None,
             shared_expert_gated: true,
         }),
         ..routed
     };
     let error = build(&custom_routing).expect_err("unread expert routing is refused");
     assert!(error.contains("expert-routing"), "{error}");
+
+    // An old component can otherwise construct a full-attention graph with
+    // exactly the same weights as a checkpoint requiring a sliding window.
+    let windowed = ModelArchitectureConfig {
+        layer_layout: Some(vec![
+            crate::LayerSpec {
+                sliding_window: Some(2),
+                head_dim: dense.head_dim,
+                num_key_value_heads: dense.num_key_value_heads,
+                rope_theta: dense.rope_theta,
+                partial_rotary_factor: None,
+                value_from_key: false,
+                kv_source_layer: None,
+                intermediate_size: dense.intermediate_size,
+            };
+            dense.num_hidden_layers as usize
+        ]),
+        ..dense.clone()
+    };
+    let error = build(&windowed).expect_err("unread sliding window is refused");
+    assert!(error.contains("layer-layout"), "{error}");
 
     // A YaRN checkpoint: the Component's `1.5.0` view of `rope-scaling` has no
     // `yarn` case, so it cannot build an unscaled graph for it.

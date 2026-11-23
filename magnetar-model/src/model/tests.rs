@@ -6,6 +6,18 @@
 use super::*;
 use ed25519_dalek::Signer;
 
+#[test]
+fn e4m3fn_storage_is_distinct_from_other_one_byte_formats() {
+    let fp8 = ModelDType::parse("F8_E4M3").unwrap();
+    assert_eq!(fp8, ModelDType::F8E4M3Fn);
+    assert_eq!(fp8.descriptor().size_bytes(), 1);
+    assert_ne!(fp8.descriptor(), ModelDType::U8.descriptor());
+    assert_ne!(fp8.descriptor(), ModelDType::I8.descriptor());
+    assert_ne!(fp8.descriptor(), ModelDType::Q8.descriptor());
+    assert_eq!(ModelDType::parse("F8_E5M2"), None);
+    assert_eq!(ModelDType::parse("F8_E4M3FNUZ"), None);
+}
+
 fn model_manifest_yaml(digest: &str, signatures_block: &str) -> String {
     format!(
         r#"
@@ -218,6 +230,7 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
             qk_nope_head_dim: 128,
             qk_rope_head_dim: 64,
             v_head_dim: 128,
+            norm_eps: None,
         }),
         moe_layers: Some((0..27).map(|layer| layer >= 1).collect()),
         expert_routing: Some(ExpertRoutingConfig {
@@ -229,6 +242,7 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
             }),
             routed_scaling_factor: 1.0,
             selection_bias: false,
+            normalization: None,
             shared_expert_gated: false,
         }),
         ..Default::default()
@@ -239,6 +253,8 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
         change(&mut config);
         assert!(config.validate().is_err(), "{config:?}");
     };
+    refused(|config| config.hidden_activation = Some("unknown-activation".into()));
+    refused(|config| config.rope_layers = Some(vec![true]));
     // A query/key head that is not nope + rope wide.
     refused(|config| config.head_dim = 128);
     // Fewer K/V heads than attention heads.
@@ -246,6 +262,9 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
     // A zero latent width.
     refused(|config| {
         config.latent_attention.as_mut().unwrap().kv_lora_rank = 0;
+    });
+    refused(|config| {
+        config.latent_attention.as_mut().unwrap().norm_eps = Some(f64::NAN);
     });
     // Expert layers for another layer count, or without experts.
     refused(|config| config.moe_layers = Some(vec![true; 26]));
@@ -291,5 +310,20 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
             .as_mut()
             .unwrap()
             .routed_scaling_factor = 0.0
+    });
+    refused(|config| {
+        config.expert_routing.as_mut().unwrap().normalization = Some(ExpertNormalization::Always);
+    });
+    refused(|config| {
+        let groups = config
+            .expert_routing
+            .as_mut()
+            .unwrap()
+            .groups
+            .as_mut()
+            .unwrap();
+        groups.count = 64;
+        groups.per_token = 6;
+        groups.score = ExpertGroupScore::TopTwoSum;
     });
 }

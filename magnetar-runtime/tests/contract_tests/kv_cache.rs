@@ -223,6 +223,86 @@ fn kv_cache_reuse_validates_model_tokenizer_prompt_and_affinity() {
 }
 
 #[test]
+fn kv_cache_reuse_rejects_incompatible_declared_model_and_attention_metadata() {
+    let mut declared = compatibility();
+    declared.model_architecture = Some("component-v1".into());
+    declared.model_revision = Some("revision-1".into());
+    declared.tokenizer_vocabulary_size = 512;
+    declared.attention_implementation = Some("attention-a".into());
+    let mut created = cache(KvCacheScope::RuntimeCache);
+    created.compatibility = declared.clone();
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.create_kv_cache(created).unwrap();
+    runtime.prefill_kv_cache_completed(&id, 1).unwrap();
+    runtime
+        .validate_kv_cache_reuse(&id, &declared, None)
+        .unwrap();
+
+    for (name, requested, expected) in [
+        (
+            "architecture",
+            {
+                let mut value = declared.clone();
+                value.model_architecture = Some("component-v2".into());
+                value
+            },
+            KvCacheError::CacheModelMismatch,
+        ),
+        (
+            "missing architecture",
+            {
+                let mut value = declared.clone();
+                value.model_architecture = None;
+                value
+            },
+            KvCacheError::CacheModelMismatch,
+        ),
+        (
+            "revision",
+            {
+                let mut value = declared.clone();
+                value.model_revision = Some("revision-2".into());
+                value
+            },
+            KvCacheError::CacheModelMismatch,
+        ),
+        (
+            "vocabulary",
+            {
+                let mut value = declared.clone();
+                value.tokenizer_vocabulary_size = 513;
+                value
+            },
+            KvCacheError::CacheTokenizerMismatch,
+        ),
+        (
+            "unknown vocabulary",
+            {
+                let mut value = declared.clone();
+                value.tokenizer_vocabulary_size = 0;
+                value
+            },
+            KvCacheError::CacheTokenizerMismatch,
+        ),
+        (
+            "attention",
+            {
+                let mut value = declared.clone();
+                value.attention_implementation = Some("attention-b".into());
+                value
+            },
+            KvCacheError::CacheLayoutMismatch,
+        ),
+    ] {
+        assert_eq!(
+            runtime.validate_kv_cache_reuse(&id, &requested, None),
+            Err(expected),
+            "accepted {name}"
+        );
+    }
+}
+
+#[test]
 fn kv_cache_memory_uses_memory_manager_kv_class_and_tracks_allocation() {
     let mut runtime = Runtime::initialize(RuntimeConfig {
         memory: MemoryManagerConfig {

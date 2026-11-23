@@ -128,6 +128,7 @@ impl E2eRuntimeModelExecutionEngine {
                 Some(&graphs.prefill_memo),
                 Some(kv_stores),
                 None,
+                true,
             )?;
             // The history ends at this pass's last real row.
             for layer in pass.2.values_mut() {

@@ -418,6 +418,7 @@ pub fn run_first_native_graph_segment_dispatch(
             None,
             None,
             None,
+            false,
         )
         .map_err(E2eConformanceError::from)?;
     Ok(FirstNativeProviderRunOutcome {
@@ -521,6 +522,7 @@ pub fn load_first_native_segment_with_provider_and_weights(
     start_layer: u32,
     end_layer: u32,
 ) -> Result<(Runtime, ModelInstanceId, ProviderBinding), E2eConformanceError> {
+    super::component_graphs::validate_segment_bounds(&fixture.config, start_layer, end_layer)?;
     let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
     let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
     let instance = load_fixture_instance_segment_with_weights_for_provider(

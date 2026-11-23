@@ -114,7 +114,8 @@ impl<'g> EdgeIndex<'g> {
             && producer.outputs.len() == 1
             && self.consumers.get(intermediate) == Some(&1)
             && edge.kv_cache.is_none()
-            && edge.prefix_cache.is_none())
+            && edge.prefix_cache.is_none()
+            && edge.recurrent_state.is_none())
         .then_some(producer_id)
     }
 }

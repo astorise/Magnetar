@@ -4,11 +4,11 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:7e549701a6815e5770a083951eb984c5af7d8f140bbc366e36d9530247f4621f"
+    value: "sha256:db0b04b195ba767c83a7efa3213afd0e0fae4863baac34936724b264a37d1be3"
 component:
   name: "magnetar.smollm2.graph"
   version: "0.1.0"
-  description: "SmolLM2 Llama-compatible graph test component"
+  description: "SmolLM2 and SmolLM3 graph test component"
   role: "llama-model-component"
 runtime:
   magnetar:
@@ -16,16 +16,18 @@ runtime:
 compatibility:
   architecture_families:
     - llama
+    - smollm3
   artifact_formats:
     - huggingface
+    - gguf
 wit:
   imports:
     - package: "magnetar:model-component-graph"
       interface: "graph-builder"
-      version: "1.4.0"
+      version: "1.9.0"
     - package: "magnetar:model-component-graph"
       interface: "model-config"
-      version: "1.4.0"
+      version: "1.9.0"
   exports: []
 capabilities:
   requires: []

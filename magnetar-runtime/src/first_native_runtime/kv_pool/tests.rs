@@ -317,6 +317,62 @@ fn a_reused_store_set_keeps_its_allocation_and_holds_no_earlier_rows() {
     assert_eq!(harness.store_allocation(1), Some(allocation));
 }
 
+#[test]
+fn failed_pooled_prefill_can_release_and_reuse_its_store_set() {
+    let mut harness = Harness::new(None).unwrap();
+    let prompt = [5, 2];
+    let request = harness.request("failed-pooled", &prompt, 3);
+    let mut plans = harness.plans(&request);
+    let weight = harness
+        .runtime
+        .model_instances()
+        .instance(&harness.instance)
+        .unwrap()
+        .definition()
+        .resource_bindings
+        .weights["layers.0.mlp.down_proj"]
+        .clone();
+    let executor = resolve_kernel_execution_provider(&harness.runtime, &provider()).unwrap();
+    let saved = executor.read_tensor(&weight).unwrap();
+    assert!(executor.release_tensor(&weight).unwrap());
+    let error = harness
+        .engine
+        .execute_generation_step(
+            &mut harness.runtime,
+            &request,
+            &[],
+            Some(&mut plans.prefill),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("down_proj"), "{error}");
+    let set = harness
+        .engine
+        .kv_pool
+        .current("failed-pooled")
+        .unwrap()
+        .pool_set
+        .unwrap();
+    let allocation = harness.store_allocation(set).unwrap();
+    harness.release(&request);
+    assert_eq!(harness.store_allocation(set), Some(allocation));
+    executor.write_tensor(weight, saved).unwrap();
+
+    let next = harness.request("after-failure", &prompt, 3);
+    let actual = harness.generate(&next, 1, false);
+    assert_eq!(
+        harness
+            .engine
+            .kv_pool
+            .current("after-failure")
+            .unwrap()
+            .pool_set,
+        Some(set)
+    );
+    assert_eq!(harness.store_allocation(set), Some(allocation));
+    assert_eq!(actual, fresh(&prompt, 1));
+    harness.release(&next);
+}
+
 /// Two live requests never share a set, and each gets its own results.
 #[test]
 fn live_requests_use_different_store_sets() {

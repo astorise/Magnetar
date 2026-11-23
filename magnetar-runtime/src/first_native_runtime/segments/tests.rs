@@ -98,7 +98,8 @@ fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shap
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    let mut config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    config.hidden_activation = Some("silu".into());
     config.validate(&identity).expect("GQA config validates");
     let architecture_implementation = qwen_architecture_implementation(
         &identity,
@@ -189,7 +190,8 @@ fn real_qwen_component_produces_a_config_correct_graph_for_a_genuinely_gqa_shape
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    let mut config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    config.hidden_activation = Some("silu".into());
     config.validate(&identity).expect("GQA config validates");
     let architecture_implementation = qwen_architecture_implementation(
         &identity,

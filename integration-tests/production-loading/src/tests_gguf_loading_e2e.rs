@@ -509,6 +509,14 @@ fn reference_cpu_tokens(
     let component = crate::test_support::real_component_for_architecture_family(
         &ingested.manifest.architecture.family,
     );
+    reference_cpu_tokens_with_component(ingested, tokenizer, component)
+}
+
+fn reference_cpu_tokens_with_component(
+    ingested: &magnetar_runtime::production_model_ingestion::ProductionIngestionResult,
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    component: magnetar_runtime::ComponentDigest,
+) -> Vec<u32> {
     let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer.metadata().clone(),
@@ -580,10 +588,54 @@ fn llama_gguf_and_huggingface_ingestion_of_identical_weights_produce_identical_g
         .ingest(&gguf_source)
         .expect("real llama GGUF ingestion succeeds");
     assert_eq!(gguf_ingested.manifest.architecture.family, "llama");
-    let gguf_tokenizer =
+    let gguf_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(
         magnetar_loader_gguf::load_gguf_tokenizer(&gguf_source, "gguf-llama-cross-check", None)
-            .expect("real tokenizer builds from embedded vocabulary");
-    let gguf_tokens = reference_cpu_tokens(&gguf_ingested, Arc::new(gguf_tokenizer));
+            .expect("real tokenizer builds from embedded vocabulary"),
+    );
+    assert_eq!(
+        gguf_ingested
+            .manifest
+            .architecture_config
+            .as_ref()
+            .unwrap()
+            .hidden_activation
+            .as_deref(),
+        Some("silu")
+    );
+    let gguf_tokens = reference_cpu_tokens(&gguf_ingested, gguf_tokenizer.clone());
+    let smollm = crate::test_support::smollm2_component();
+    assert_eq!(
+        gguf_tokens,
+        reference_cpu_tokens_with_component(&gguf_ingested, gguf_tokenizer.clone(), smollm.clone())
+    );
+
+    // The same GGUF artifact must fail before inference when its normalized
+    // activation is missing or unsupported by the fixed-SiLU Component.
+    for activation in [None, Some("gelu")] {
+        let mut manifest = gguf_ingested.manifest.clone();
+        manifest
+            .architecture_config
+            .as_mut()
+            .unwrap()
+            .hidden_activation = activation.map(str::to_string);
+        let fixture = production_model_fixture(
+            manifest.clone(),
+            gguf_tokenizer.metadata().clone(),
+            gguf_tokenizer.clone(),
+        )
+        .unwrap();
+        assert!(
+            magnetar_runtime::build_first_native_graphs_from_named_component_for_artifact(
+                &smollm,
+                manifest.architecture_config.as_ref().unwrap(),
+                &manifest.tensors,
+                &fixture.identity,
+                2,
+            )
+            .is_err(),
+            "GGUF activation {activation:?} must be rejected before inference"
+        );
+    }
 
     // Every tensor reaches Model Loading with the same bytes from both
     // ingestors: the restored query/key rows above all.

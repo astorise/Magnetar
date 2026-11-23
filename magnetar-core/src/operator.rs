@@ -202,6 +202,16 @@ pub enum ShapeRule {
     /// input may instead have shape `[1]`: one value broadcast to every
     /// element (`extend-portable-operator-attributes`).
     SameShapeOrScalar,
+    /// Two equally shaped nonempty vectors/row batches, followed by two
+    /// scalar parameters; the output has the first input's shape.
+    GeodesicResidual,
+    /// One Mamba-2 mixer and its fixed-size convolution and SSM states.
+    Mamba2Mixer,
+    /// Gated-delta mixer with explicit convolution and recurrent states.
+    GatedDeltaMixer,
+    /// Mamba-3 recurrence or projected mixer with four explicit states.
+    Mamba3Mimo,
+    Mamba3Mixer,
     Matmul,
     RmsNorm,
     RowBroadcastAdd,
@@ -315,6 +325,16 @@ pub const MOE_EXPERTS_ACTIVATION_FEATURE: &str = "moe-experts-activation";
 /// sixth input, `per_expert_scale`.
 pub const MOE_PER_EXPERT_SCALE_FEATURE: &str = "per-expert-scale";
 
+/// Kernel support for selection-biased sigmoid routing, optional grouping,
+/// selected-score normalization and routed scaling.
+pub const MOE_SIGMOID_ROUTING_FEATURE: &str = "sigmoid-expert-routing";
+
+/// Ungated `relu(x)²` expert networks with compact two-weight operands.
+pub const MOE_RELU_SQUARED_FEATURE: &str = "moe-relu-squared";
+
+/// Elementwise `activation(kind = "relu_squared")`.
+pub const ACTIVATION_RELU_SQUARED_FEATURE: &str = "activation-relu-squared";
+
 /// Kernel feature an `attention` Kernel advertises when it honours
 /// `value_head_dimension`: V rows and the output are that wide per head
 /// while Q and K rows stay `head_dimension` wide (multi-head latent
@@ -390,6 +410,12 @@ pub fn required_kernel_features(
             }
         }
         "embedding" if present("scale") => features.push(EMBEDDING_SCALE_FEATURE),
+        "activation" => {
+            if matches!(attributes.get("kind"), Some(OperatorAttributeValue::String(kind)) if kind == "relu_squared")
+            {
+                features.push(ACTIVATION_RELU_SQUARED_FEATURE);
+            }
+        }
         "rmsnorm" => {
             if present("head_count") || present("head_dimension") {
                 features.push(RMSNORM_PER_HEAD_FEATURE);
@@ -429,7 +455,36 @@ pub fn required_kernel_features(
             if !silu {
                 features.push(MOE_EXPERTS_ACTIVATION_FEATURE);
             }
-            if input_count > 5 {
+            let relu_squared = matches!(
+                attributes.get("activation"),
+                Some(OperatorAttributeValue::String(name)) if name == "relu_squared"
+            );
+            if relu_squared {
+                features.push(MOE_RELU_SQUARED_FEATURE);
+            }
+            // Any routing attribute requires the feature, even malformed or
+            // partial declarations: an older Kernel must never silently
+            // execute such a node with its baseline softmax routing.
+            let sigmoid_form = [
+                "routing_scoring",
+                "routing_normalization",
+                "routing_scale",
+                "routing_group_count",
+                "routing_group_selected",
+            ]
+            .iter()
+            .any(|name| present(name));
+            if sigmoid_form {
+                features.push(MOE_SIGMOID_ROUTING_FEATURE);
+            }
+            let base_inputs = if sigmoid_form && relu_squared {
+                5
+            } else if sigmoid_form {
+                6
+            } else {
+                5
+            };
+            if input_count > base_inputs {
                 features.push(MOE_PER_EXPERT_SCALE_FEATURE);
             }
         }
@@ -1290,12 +1345,68 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // `execute-and-cache-moe-experts` F02: routed mixture of experts.
         // Inputs `h [T, H]`, router logits `[T, E]`, stacked expert
         // weights `gate [H, E*I]`, `up [H, E*I]`, `down [I, E*H]`; output
-        // `[T, H]`. See [`moe_experts_reference`].
+        // `[T, H]`. The sigmoid form adds a `[E]` selection-only bias, then
+        // an optional `[E]` output scale. Its `routing_scoring` is
+        // `sigmoid`, `routing_normalization` is `never`, `multiple`, or
+        // `always`, and `routing_scale` is positive. Optional paired group
+        // attributes rank groups by the sum of the top two biased scores.
+        // A tie across a group or expert selection boundary is refused.
+        // `activation = "relu_squared"` selects an ungated sigmoid form:
+        // `h, logits, in, down, bias`, optionally followed by expert scale.
         (
             "moe-experts",
             OperatorFamily::LinearAlgebra,
-            6,
+            7,
             1,
+            ShapeRule::Any,
+        ),
+        // One sequence's Mamba-2 activation and explicit next conv/SSM states.
+        (
+            "mamba2-mixer",
+            OperatorFamily::LinearAlgebra,
+            13,
+            3,
+            ShapeRule::Mamba2Mixer,
+        ),
+        // Qwen3.5-style mixer and two explicit, fixed-size next states.
+        (
+            "gated-delta-mixer",
+            OperatorFamily::LinearAlgebra,
+            13,
+            3,
+            ShapeRule::GatedDeltaMixer,
+        ),
+        // Preprocessed Mamba-3 sequence and four independent next states.
+        (
+            "mamba3-mimo",
+            OperatorFamily::LinearAlgebra,
+            18,
+            5,
+            ShapeRule::Mamba3Mimo,
+        ),
+        // Input projection, normalization and the explicit Mamba-3 states.
+        (
+            "mamba3-mixer",
+            OperatorFamily::LinearAlgebra,
+            16,
+            5,
+            ShapeRule::Mamba3Mixer,
+        ),
+        // Gate each token against the preceding raw value and retain it.
+        ("token-shift", OperatorFamily::Tensor, 4, 2, ShapeRule::Any),
+        // Causal signal/noise head attention over an explicit K/V history.
+        (
+            "differential-attention",
+            OperatorFamily::Attention,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
+        (
+            "projected-differential-attention",
+            OperatorFamily::Attention,
+            17,
+            5,
             ShapeRule::Any,
         ),
         // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
@@ -1316,6 +1427,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::SameShape,
         ),
         (
+            "affine-layernorm",
+            OperatorFamily::Normalization,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        (
             "rope",
             OperatorFamily::PositionEncoding,
             1,
@@ -1325,6 +1443,15 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // Q, K and V; with `latent_kv_width`, the latent K and V's key and
         // value projections (`chunk-latent-prefills`).
         ("attention", OperatorFamily::Attention, 5, 1, ShapeRule::Any),
+        // Single-sequence bidirectional attention with a binary key mask and
+        // an optional inclusive symmetric local radius.
+        (
+            "encoder-attention",
+            OperatorFamily::Attention,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
         (
             "paged-attention",
             OperatorFamily::Attention,
@@ -1354,6 +1481,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::SameShape,
         ),
         (
+            "gelu-exact",
+            OperatorFamily::Activation,
+            1,
+            1,
+            ShapeRule::SameShape,
+        ),
+        (
             "silu",
             OperatorFamily::Activation,
             1,
@@ -1375,6 +1509,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::SameShapeOrScalar,
         ),
         ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
+        ("slice-last", OperatorFamily::Tensor, 1, 1, ShapeRule::Any),
         // `append-kv-history-in-place`: writes `rows` into `store` at
         // `row_offset`, in place; the output resource is the store itself.
         ("kv-write", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1384,6 +1519,15 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             2,
             1,
             ShapeRule::SameShape,
+        ),
+        // A row-wise, learned geodesic residual update. Scale and bias are
+        // tensor inputs so each mixer/MLP keeps its own checkpoint weights.
+        (
+            "geodesic-residual",
+            OperatorFamily::Tensor,
+            4,
+            1,
+            ShapeRule::GeodesicResidual,
         ),
         (
             "dtype-conversion",
@@ -1447,10 +1591,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ]);
         spec.attributes = default_attribute_schema(name);
         // Optional trailing inputs: a scale-less RMSNorm, the experts'
-        // optional per-expert output scale, and latent K and V's projections.
+        // optional selection bias and per-expert output scale, and latent K
+        // and V's projections.
         spec.min_inputs = match name {
             "rmsnorm" => 1,
             "moe-experts" => 5,
+            "mamba2-mixer" => 10,
+            "affine-layernorm" => 2,
             "attention" => 3,
             _ => inputs,
         };
@@ -1467,6 +1614,29 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 .with_workspace()
                 .with_paged_kv_cache();
         }
+        if name == "encoder-attention" {
+            spec.memory = OperatorMemoryBehavior::pure().with_workspace();
+        }
+        if name == "gated-delta-mixer" {
+            spec.layout_contract = OperatorLayoutContract::new([TensorLayoutKind::Contiguous]);
+        }
+        if matches!(
+            name,
+            "encoder-attention"
+                | "mamba2-mixer"
+                | "gated-delta-mixer"
+                | "mamba3-mimo"
+                | "mamba3-mixer"
+                | "token-shift"
+                | "differential-attention"
+                | "projected-differential-attention"
+        ) {
+            spec.dtype_contracts = vec![
+                OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Accumulation, [ComputeDType::Float32]),
+            ];
+        }
         if matches!(
             family,
             OperatorFamily::Normalization | OperatorFamily::Activation
@@ -1477,6 +1647,22 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 OperatorDTypeContract::new(TensorRole::Accumulation, floats),
             ];
         }
+        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last") {
+            spec.dtype_contracts = vec![
+                OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Accumulation, [ComputeDType::Float32]),
+            ];
+        }
+        if name == "geodesic-residual" {
+            // Only the f32 profile is qualified; other output dtypes need
+            // independently validated rounding and conversion semantics.
+            spec.dtype_contracts = vec![
+                OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
+                OperatorDTypeContract::new(TensorRole::Accumulation, [ComputeDType::Float32]),
+            ];
+        }
         catalog = catalog.with_operator(spec);
     }
     catalog
@@ -1484,6 +1670,190 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "differential-attention" => OperatorAttributeSchema::default()
+            .with_rule(
+                "scale",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "softcap",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "window_left",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "round_bfloat16",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "projected-differential-attention" => default_attribute_schema("differential-attention")
+            .with_rule(
+                "query_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "kv_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "rank",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "past_length",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "zero_centered_norm",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "affine-layernorm" => OperatorAttributeSchema::default().with_rule(
+            "epsilon",
+            OperatorAttributeRule::required(OperatorAttributeKind::Float),
+        ),
+        "slice-last" => OperatorAttributeSchema::default()
+            .with_rule(
+                "start",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "width",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            ),
+        "mamba3-mimo" => OperatorAttributeSchema::default()
+            .with_rule(
+                "heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "groups",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "rank",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "state_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "angles",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            ),
+        "mamba3-mixer" => default_attribute_schema("mamba3-mimo")
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "decay_floor",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "zero_centered_norm",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "gated-delta-mixer" => OperatorAttributeSchema::default()
+            .with_rule(
+                "key_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "value_heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "key_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "value_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_kernel",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            ),
+        "mamba2-mixer" => OperatorAttributeSchema::default()
+            .with_rule(
+                "heads",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "groups",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "state_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_kernel",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "dt_min",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "dt_max",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "conv_bias",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            )
+            .with_rule(
+                "linear_bias",
+                OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "encoder-attention" => OperatorAttributeSchema::default()
+            .with_rule(
+                "head_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dimension",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "local_radius",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "scale",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            ),
+        "geodesic-residual" => OperatorAttributeSchema::default().with_rule(
+            "layer_index",
+            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+        ),
         // `cache-latent-attention-history`: `a [T, G*K]` times `b` group by
         // group (`group_count = G`), each group's block `[K, N]` or, with
         // `transpose_b`, `[N, K]` used transposed, giving `[T, G*N]`
@@ -1724,6 +2094,26 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
                 OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
             )
             .with_rule(
+                "routing_scoring",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            .with_rule(
+                "routing_normalization",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            .with_rule(
+                "routing_scale",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "routing_group_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "routing_group_selected",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
                 "expert_first",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             )
@@ -1731,7 +2121,7 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
                 "expert_count",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             )
-            // The experts' gate activation: `silu` (absent) or `gelu_tanh`.
+            // Gate activation `silu`/`gelu_tanh`, or ungated `relu_squared`.
             .with_rule(
                 "activation",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),
@@ -1828,6 +2218,347 @@ fn validate_concat_heads(
     Ok(())
 }
 
+/// Validate gated-delta geometry and all input/output shapes before planning.
+fn validate_gated_delta_mixer_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(), OperatorError> {
+    let invalid = || OperatorError::ShapeMismatch {
+        reason: "invalid gated-delta mixer geometry, attributes or tensor shapes".into(),
+    };
+    if inputs.len() != 13 || outputs.len() != 3 {
+        return Err(invalid());
+    }
+    let positive = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => Ok(*value as u64),
+        _ => Err(invalid()),
+    };
+    let key_heads = positive("key_heads")?;
+    let value_heads = positive("value_heads")?;
+    let key_dim = positive("key_dim")?;
+    let value_dim = positive("value_dim")?;
+    let kernel = positive("conv_kernel")?;
+    let epsilon_valid = matches!(
+        attributes.get("epsilon"),
+        Some(OperatorAttributeValue::Float(value))
+            if value.is_finite() && (*value as f32).is_finite() && *value as f32 > 0.0
+    );
+    if !value_heads.is_multiple_of(key_heads) || !epsilon_valid {
+        return Err(invalid());
+    }
+    let [tokens, hidden] = inputs[0].shape.dimensions.as_slice() else {
+        return Err(invalid());
+    };
+    let keys = key_heads.checked_mul(key_dim).ok_or_else(invalid)?;
+    let values = value_heads.checked_mul(value_dim).ok_or_else(invalid)?;
+    let channels = keys
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(values))
+        .ok_or_else(invalid)?;
+    let shapes = [
+        vec![*tokens, *hidden],
+        vec![channels, kernel],
+        vec![value_heads, key_dim, value_dim],
+        vec![channels, *hidden],
+        vec![values, *hidden],
+        vec![value_heads, *hidden],
+        vec![value_heads, *hidden],
+        vec![channels, kernel],
+        vec![value_heads],
+        vec![value_heads],
+        vec![value_dim],
+        vec![*hidden, values],
+        vec![*tokens],
+    ];
+    let valid = |tensor: &TensorDescriptor, shape: &[u64]| {
+        let f32_dtype = DTypeDescriptor::portable(ComputeDType::Float32);
+        tensor.shape.symbolic.is_none()
+            && tensor.view.is_none()
+            && tensor.dtype == f32_dtype
+            && tensor
+                .storage_dtype
+                .as_ref()
+                .is_none_or(|dtype| dtype == &f32_dtype)
+            && tensor
+                .compute_dtype
+                .as_ref()
+                .is_none_or(|dtype| dtype == &f32_dtype)
+            && tensor.shape.dimensions == shape
+            && shape
+                .iter()
+                .try_fold(1u64, |count, &dim| {
+                    count
+                        .checked_mul(dim)
+                        .filter(|&size| dim > 0 && size <= 67_108_864)
+                })
+                .is_some()
+    };
+    if !inputs
+        .iter()
+        .zip(&shapes)
+        .all(|(tensor, shape)| valid(tensor, shape))
+        || !outputs
+            .iter()
+            .zip(&shapes[..3])
+            .all(|(tensor, shape)| valid(tensor, shape))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Validate fixed Mamba-2 geometry before dispatch or allocating state. The
+/// numerical provider applies the same equations to actual tensor values.
+fn validate_mamba2_mixer_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(), OperatorError> {
+    let invalid = || OperatorError::ShapeMismatch {
+        reason: "invalid mamba2-mixer geometry, attributes or tensor shapes".into(),
+    };
+    let positive = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => Ok(*value as u64),
+        _ => Err(invalid()),
+    };
+    let boolean = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Boolean(value)) => Ok(*value),
+        _ => Err(invalid()),
+    };
+    let float = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Float(value))
+            if value.is_finite() && (*value as f32).is_finite() =>
+        {
+            Ok(*value as f32)
+        }
+        _ => Err(invalid()),
+    };
+    let heads = positive("heads")?;
+    let head_dim = positive("head_dim")?;
+    let groups = positive("groups")?;
+    let state_dim = positive("state_dim")?;
+    let kernel = positive("conv_kernel")?;
+    let epsilon = float("epsilon")?;
+    let dt_min = float("dt_min")?;
+    let dt_max = if attributes.contains_key("dt_max") {
+        float("dt_max")?
+    } else {
+        f32::INFINITY
+    };
+    let conv_bias = boolean("conv_bias")?;
+    let linear_bias = boolean("linear_bias")?;
+    if !heads.is_multiple_of(groups) || epsilon <= 0.0 || dt_min < 0.0 || dt_max < dt_min {
+        return Err(invalid());
+    }
+    let expected_count = 10 + usize::from(conv_bias) + 2 * usize::from(linear_bias);
+    if inputs.len() != expected_count {
+        return Err(OperatorError::InputArityInvalid {
+            expected: expected_count,
+            actual: inputs.len(),
+        });
+    }
+    let [tokens, hidden] = inputs[0].shape.dimensions.as_slice() else {
+        return Err(invalid());
+    };
+    if *tokens == 0 || *hidden == 0 {
+        return Err(invalid());
+    }
+    let inner = heads.checked_mul(head_dim).ok_or_else(invalid)?;
+    let conv = groups
+        .checked_mul(state_dim)
+        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| inner.checked_add(value))
+        .ok_or_else(invalid)?;
+    let projection = inner
+        .checked_add(conv)
+        .and_then(|value| value.checked_add(heads))
+        .ok_or_else(invalid)?;
+    let mut expected = vec![
+        vec![*tokens, *hidden],
+        vec![conv, kernel],
+        vec![heads, head_dim, state_dim],
+        vec![*hidden, projection],
+        vec![conv, kernel],
+        vec![heads],
+        vec![heads],
+        vec![heads],
+        vec![inner],
+        vec![inner, *hidden],
+    ];
+    if conv_bias {
+        expected.push(vec![conv]);
+    }
+    if linear_bias {
+        expected.extend([vec![projection], vec![*hidden]]);
+    }
+    let valid = |tensor: &TensorDescriptor, shape: &[u64]| {
+        tensor.shape.symbolic.is_none()
+            && tensor.shape.dimensions == shape
+            && shape
+                .iter()
+                .try_fold(1u64, |total, dim| total.checked_mul(*dim))
+                .is_some_and(|elements| elements <= 67_108_864)
+    };
+    if !inputs
+        .iter()
+        .zip(&expected)
+        .all(|(tensor, shape)| valid(tensor, shape))
+        || !outputs
+            .iter()
+            .zip(&expected[..3])
+            .all(|(tensor, shape)| valid(tensor, shape))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_mamba3_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+    projected: bool,
+) -> Result<(), OperatorError> {
+    let invalid = || OperatorError::ShapeMismatch {
+        reason: "invalid mamba3 geometry, attributes or tensor shapes".into(),
+    };
+    let positive = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => Ok(*value as u64),
+        _ => Err(invalid()),
+    };
+    let h = positive("heads")?;
+    let g = positive("groups")?;
+    let r = positive("rank")?;
+    let p = positive("head_dim")?;
+    let n = positive("state_dim")?;
+    let a = positive("angles")?;
+    if !h.is_multiple_of(g) || !n.is_multiple_of(2) || a > n / 2 {
+        return Err(invalid());
+    }
+    let tokens = inputs[0]
+        .shape
+        .dimensions
+        .first()
+        .copied()
+        .ok_or_else(invalid)?;
+    if tokens == 0 {
+        return Err(invalid());
+    }
+    let size_ok = |shape: &[u64]| {
+        shape
+            .iter()
+            .try_fold(1u64, |total, dim| total.checked_mul(*dim))
+            .is_some_and(|elements| elements <= 67_108_864)
+    };
+    let (shapes, output_shapes) = if projected {
+        let [_, hidden] = inputs[0].shape.dimensions.as_slice() else {
+            return Err(invalid());
+        };
+        let inner = h.checked_mul(p).ok_or_else(invalid)?;
+        let expected_inner = hidden.checked_mul(2).ok_or_else(invalid)?;
+        let projected_width = p
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(3))
+            .and_then(|v| h.checked_mul(v))
+            .ok_or_else(invalid)?;
+        let dynamic_width = r
+            .checked_mul(n)
+            .and_then(|v| v.checked_mul(2))
+            .and_then(|v| v.checked_add(a))
+            .ok_or_else(invalid)?;
+        let positive_float = |name: &str| match attributes.get(name) {
+            Some(OperatorAttributeValue::Float(value)) => {
+                value.is_finite() && (*value as f32).is_finite() && (*value as f32) > 0.0
+            }
+            _ => false,
+        };
+        if *hidden == 0
+            || g != 1
+            || a != (n / 2) / 2
+            || inner != expected_inner
+            || !positive_float("epsilon")
+            || !positive_float("decay_floor")
+            || !size_ok(&[tokens, projected_width])
+            || !size_ok(&[tokens, dynamic_width])
+            || !size_ok(&[tokens, r, g, n])
+            || !size_ok(&[tokens, h, a])
+        {
+            return Err(invalid());
+        }
+        let shapes = vec![
+            vec![tokens, *hidden],
+            vec![h, a],
+            vec![h, p, n],
+            vec![r, h, n],
+            vec![h, p],
+            vec![*hidden, projected_width],
+            vec![*hidden, dynamic_width],
+            vec![h],
+            vec![n],
+            vec![n],
+            vec![r, h, n],
+            vec![r, h, n],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![h],
+        ];
+        let output_shapes = vec![
+            vec![tokens, inner],
+            shapes[1].clone(),
+            shapes[2].clone(),
+            shapes[3].clone(),
+            shapes[4].clone(),
+        ];
+        (shapes, output_shapes)
+    } else {
+        let shapes = vec![
+            vec![tokens, r, g, n],
+            vec![tokens, r, g, n],
+            vec![tokens, h, p],
+            vec![tokens, h, p],
+            vec![tokens, h],
+            vec![tokens, h],
+            vec![tokens, h],
+            vec![tokens, h, a],
+            vec![h, a],
+            vec![h, p, n],
+            vec![r, h, n],
+            vec![h, p],
+            vec![r, h, n],
+            vec![r, h, n],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![r, h, p],
+            vec![h],
+        ];
+        let output_shapes = vec![
+            vec![tokens, h, p],
+            shapes[8].clone(),
+            shapes[9].clone(),
+            shapes[10].clone(),
+            shapes[11].clone(),
+        ];
+        (shapes, output_shapes)
+    };
+    let valid = |tensor: &TensorDescriptor, shape: &[u64]| {
+        tensor.shape.symbolic.is_none() && tensor.shape.dimensions == shape && size_ok(shape)
+    };
+    if !inputs
+        .iter()
+        .zip(&shapes)
+        .all(|(tensor, shape)| valid(tensor, shape))
+        || !outputs
+            .iter()
+            .zip(&output_shapes)
+            .all(|(tensor, shape)| valid(tensor, shape))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn validate_shape_rule(
     rule: &ShapeRule,
     inputs: &[TensorDescriptor],
@@ -1836,6 +2567,10 @@ fn validate_shape_rule(
 ) -> Result<(), OperatorError> {
     match rule {
         ShapeRule::Any => Ok(()),
+        ShapeRule::Mamba2Mixer => validate_mamba2_mixer_shape(inputs, outputs, attributes),
+        ShapeRule::GatedDeltaMixer => validate_gated_delta_mixer_shape(inputs, outputs, attributes),
+        ShapeRule::Mamba3Mimo => validate_mamba3_shape(inputs, outputs, attributes, false),
+        ShapeRule::Mamba3Mixer => validate_mamba3_shape(inputs, outputs, attributes, true),
         ShapeRule::Rank(rank) => inputs
             .iter()
             .chain(outputs)
@@ -1886,6 +2621,32 @@ fn validate_shape_rule(
                 .ok_or_else(|| OperatorError::ShapeMismatch {
                     reason: "tensor shapes differ and the second input is not a [1] scalar".into(),
                 })
+        }
+        ShapeRule::GeodesicResidual => {
+            let input = &inputs[0].shape.dimensions;
+            if input.is_empty()
+                || input.contains(&0)
+                || inputs[1].shape.dimensions != *input
+                || outputs[0].shape.dimensions != *input
+                || !inputs[2..].iter().all(|tensor| {
+                    tensor.shape.dimensions.is_empty() || tensor.shape.dimensions == [1]
+                })
+            {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "geodesic residual expects equal nonempty input/output shapes and two scalar parameters".into(),
+                });
+            }
+            match attributes.get("layer_index") {
+                Some(OperatorAttributeValue::Integer(index))
+                    if (0..u32::MAX as i64).contains(index) =>
+                {
+                    Ok(())
+                }
+                _ => Err(OperatorError::OperatorAttributeInvalid {
+                    attribute: "layer_index".into(),
+                    reason: "must be a nonnegative original layer index below u32::MAX".into(),
+                }),
+            }
         }
         ShapeRule::Matmul => {
             if inputs.len() < 2 {

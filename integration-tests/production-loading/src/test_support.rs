@@ -33,7 +33,14 @@ pub(crate) fn register_real_qwen_component() {
 /// way an embedder registers its own: each under the digest of its bytes,
 /// trusted because the embedder (here, this test crate) trusts the bytes
 /// it ships.
-const REAL_COMPONENTS: [&str; 4] = ["qwen-real", "llama-real", "gemma-real", "deepseek-real"];
+const REAL_COMPONENTS: [&str; 6] = [
+    "qwen-real",
+    "llama-real",
+    "gemma-real",
+    "deepseek-real",
+    "mistral-real",
+    "olmo-real",
+];
 
 /// Registers [`REAL_COMPONENTS`] and returns the digest of the one whose
 /// manifest declares `family` (`compatibility.architecture_families`) --
@@ -47,10 +54,31 @@ pub(crate) fn real_component_for_architecture_family(
             "{}/../../magnetar-runtime/fixtures/components/{name}.component.wasm",
             env!("CARGO_MANIFEST_DIR")
         );
-        let bytes = fs::read(&path).expect("checked-in real Component .wasm is readable");
-        let manifest = fs::read(format!("{path}.magnetar-component.yaml"))
+        let original = fs::read(&path).expect("checked-in real Component .wasm is readable");
+        let override_path = match name {
+            "qwen-real" => std::env::var_os("MAGNETAR_QWEN_TEST_COMPONENT"),
+            "llama-real" => std::env::var_os("MAGNETAR_LLAMA_TEST_COMPONENT"),
+            "deepseek-real" => std::env::var_os("MAGNETAR_DEEPSEEK_TEST_COMPONENT"),
+            "gemma-real" => std::env::var_os("MAGNETAR_GEMMA_TEST_COMPONENT"),
+            "mistral-real" => std::env::var_os("MAGNETAR_MISTRAL_TEST_COMPONENT"),
+            "olmo-real" => std::env::var_os("MAGNETAR_OLMO_TEST_COMPONENT"),
+            _ => None,
+        };
+        let bytes = match override_path {
+            Some(path) => fs::read(path).expect("fresh Model Component is readable"),
+            None => original.clone(),
+        };
+        let original_digest = magnetar_runtime::ComponentDigest::sha256(&original);
+        let manifest = fs::read_to_string(format!("{path}.magnetar-component.yaml"))
             .expect("checked-in real Component manifest is readable");
         let digest = magnetar_runtime::ComponentDigest::sha256(&bytes);
+        assert!(
+            manifest.contains(&original_digest.value),
+            "the fixture manifest pins its Component"
+        );
+        let manifest = manifest
+            .replace(&original_digest.value, &digest.value)
+            .into_bytes();
         let trust = magnetar_runtime::ComponentTrustStore::default().trust_digest(&digest.value);
         let registered =
             magnetar_runtime::register_inference_component_artifact(bytes, manifest, &trust)

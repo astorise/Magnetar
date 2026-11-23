@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:467bfdf663fcdb6034294599f6a079a9e0af05c1d0be2e8996afe1c2ef463854"
+    value: "sha256:d2f51fb85cf7a33edadc3adcdd8bc7c37f2083e6c18bd461da269092b0ebe114"
 component:
   name: "magnetar.test.synthetic-minimal"
   version: "0.1.0"
@@ -17,10 +17,10 @@ wit:
   imports:
     - package: "magnetar:model-component-graph"
       interface: "graph-builder"
-      version: "1.2.0"
+      version: "1.8.0"
     - package: "magnetar:model-component-graph"
       interface: "model-config"
-      version: "1.2.0"
+      version: "1.8.0"
   exports: []
 capabilities:
   requires: []
