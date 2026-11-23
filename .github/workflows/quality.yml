@@ -104,7 +104,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install cargo-deny
-        uses: taiki-e/install-action@8386a06952ce337fef6f33e6cfdefc01d77b8701 # cargo-deny
+        uses: taiki-e/install-action@d5b78900754d505a5f5f996e23d5f039b418e2f3 # cargo-deny
       - name: Check advisories, bans, licenses and sources
         run: cargo deny --all-features check
 
@@ -186,7 +186,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install wasm-tools
-        uses: taiki-e/install-action@b050602e5cf884cc290b53af42beca341f1a5a76 # wasm-tools
+        uses: taiki-e/install-action@745319f1cc9062cb0c2e6e30639b5180392b1951 # wasm-tools
       - name: Validate WIT packages
         shell: bash
         run: |
@@ -406,7 +406,7 @@ jobs:
             echo "::endgroup::"
           done
       - name: Install wasm-tools
-        uses: taiki-e/install-action@b050602e5cf884cc290b53af42beca341f1a5a76 # wasm-tools
+        uses: taiki-e/install-action@745319f1cc9062cb0c2e6e30639b5180392b1951 # wasm-tools
       - name: Build the SmolLM2 graph component
         shell: bash
         run: |
@@ -585,7 +585,7 @@ jobs:
       - name: Build and test the WGPU Provider
         run: cargo test --locked --manifest-path providers/wgpu/Cargo.toml
       - name: Install cargo-deny
-        uses: taiki-e/install-action@8386a06952ce337fef6f33e6cfdefc01d77b8701 # cargo-deny
+        uses: taiki-e/install-action@d5b78900754d505a5f5f996e23d5f039b418e2f3 # cargo-deny
       # The root `deny` job above never sees this submodule (it checks out
       # without submodules by design, `externalize-runtime-extension-
       # modules`'s "zero compile-time dependency on any externalized
@@ -789,7 +789,7 @@ jobs:
       # submodule recursively, so it is the natural place to close the
       # rest.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@8386a06952ce337fef6f33e6cfdefc01d77b8701 # cargo-deny
+        uses: taiki-e/install-action@d5b78900754d505a5f5f996e23d5f039b418e2f3 # cargo-deny
       - name: Check the submodule workspace's dependency graph (advisories, bans, licenses, sources)
         # `--allow wildcard --allow unlicensed`: `magnetar-format-safetensors`
         # and `magnetar-loader-huggingface` (external submodules this
@@ -902,7 +902,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@a138c079db095d22c78af31fc3e0890136adf687 # cargo-llvm-cov
+        uses: taiki-e/install-action@41e135bca37b18b5a9cc134855b5b3bccbedbf26 # cargo-llvm-cov
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Prepare coverage output
