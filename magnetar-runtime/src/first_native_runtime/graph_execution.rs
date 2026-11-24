@@ -1874,6 +1874,8 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "rmsnorm"
                 | "rope"
                 | "concat"
+                // Reads only its input's shape (`support-qwen38-flash-next`).
+                | "split"
         );
         let inputs_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let mut inputs = Vec::with_capacity(node.inputs.len());

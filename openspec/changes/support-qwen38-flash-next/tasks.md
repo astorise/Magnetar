@@ -45,7 +45,10 @@
   - Mixer tensors are named without `proj`, so they keep checkpoint `[out, in]` order; `conv1d` `[C, 1, K]` becomes `[C, K]`.
   - The vision tower and MTP head are left out.
   - Tested against the pinned 0.8B-Base `config.json` and the names in its safetensors header (488 tensors).
-- [ ] 2.5 CPU Provider: `rmsnorm.weight_offset` and per-head `split`. cpu-native: decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states.
+- [ ] 2.5 CPU Provider.
+  - [x] `rmsnorm.weight_offset` and a `split` kernel (with `head_count`) are implemented and advertised. The executor passes a resident `split` input through.
+  - [x] The tiny hybrid checkpoint matches `transformers` on the Reference CPU Provider (1.1e-5) and on cpu-native (8.6e-6).
+  - [ ] cpu-native decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states. The mixer runs the shared f32 semantics, one thread, today.
 - [ ] 2.6 CUDA: the same forms (norm offset, per-head split, both mixer forms), qualified on the GPU runner.
 - [ ] 2.7 Qualify Qwen3.5-0.8B-Base (revision dc7cdfe…, digest pinned) on Reference CPU, cpu-native and CUDA:
   - last-position logits against Transformers;
