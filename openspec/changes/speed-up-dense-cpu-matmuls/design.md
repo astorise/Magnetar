@@ -62,6 +62,16 @@ The pool keeps one thread per logical CPU (`available_parallelism`); `MAGNETAR_C
 - On Intel Xeon 6 the prefill first favored one thread per core (TTFT 60.7 against 80.2 ms, run 45383670846), until the input-major tiles read their weights in blocks of 8 rows. With the blocks, every logical CPU wins there too: TTFT 49.6 against 57.0 ms, TPOT 34.3 against 37.5 ms (run 45387956437).
 - The CPU benchmark reruns Magnetar on one thread per physical core after the campaign, so the choice stays measured.
 
+### Decode step streaming
+
+A local 64-token profile (4 cores, no SMT, a 9 GB/s per-thread sequential read ceiling, 33 GB/s on 4 threads) put a replayed decode step at about 31 ms of dense products and 6 ms of everything else. A traced pool run showed why the small products were slow: the query projection's four tasks of 400 KB each ran at 6-7 GB/s per thread, its rows of 1,792 bytes ending before the hardware prefetchers caught up.
+
+- **Software prefetch.** A one-row input-major pass reads the next pass's eight rows ahead, one prefetch per cache line, when its rows are up to 16 KiB. An output-major step reads the next rows ahead only when they are up to 4 KiB: the down projection's 9,728-byte rows, sixteen at a time, did not gain. Over a step's real matmul sequence (in-process A/B, alternating step by step): the o projection 25-35% faster, query/key/value 20-28%, gate/up 5-15%.
+- **Grouped products at replay.** The query, key and value projections run in one pool run. The Runtime's order puts the rope and KV write of the key between the query and value projections, so the replay moves the value projection ahead of them when nothing conflicts (requirement "Grouped dense products in a replayed step"). Each product keeps the tasks it has alone, so its values do not change.
+- **Gated products.** Both products in one pool run, then their partial sums and the activation across the pool, instead of a single-threaded sum and activation.
+- **Smaller costs.** Bias and residual sums in place; a vectorizable greedy scan of the 151,936 logits (0.41 ms per step before); invocations without an advancing attribute borrowed at replay.
+- **Tried and dropped.** Reading the next product's weights ahead on the workers, in the background, while the caller runs the small Kernels: no measurable gain on top of the above. Storing every weight output-major and reading one row at a time, as llama.cpp does: slower here (35.2 against 28.6 ms for a step's matmuls).
+
 ### Numerics
 
 Products are accumulated in f32 with fused multiply-adds, in another order than the Reference CPU kernel's. Results agree to rounding, not bit for bit, as the packed kernels' do. Tests compare them within the existing tolerance (`2e-5` of the largest value).

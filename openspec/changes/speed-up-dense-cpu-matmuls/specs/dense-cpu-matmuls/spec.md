@@ -56,6 +56,20 @@ The optimized CPU Provider SHALL size its worker pool to the logical CPUs the pr
 - **WHEN** the CPU benchmark runs
 - **THEN** its summary reports Magnetar on one thread per physical core beside the campaign's default run
 
+### Requirement: Grouped dense products in a replayed step
+
+A replayed step on the optimized CPU Provider SHALL leave every resource with the values that running its recorded invocations one by one, in their recorded order, leaves. It MAY run dense products of one input on compact weights in one pool run, a later product moving ahead of invocations only when none of them writes what it reads or reads or writes what it writes, and only when no product of the group writes what another reads.
+
+#### Scenario: Query, key and value projections
+
+- **WHEN** a replayed step's key and query projections, a rope and a KV write, then its value projection read the same normalized activations
+- **THEN** the three products run in one pool run, and every output equals the one-by-one run's bit for bit
+
+#### Scenario: A product that writes the shared input
+
+- **WHEN** a product overwrites the activations the group reads
+- **THEN** it runs after the group, as recorded
+
 ### Requirement: The benchmark's CPU Provider
 
 The real-checkpoint qualification campaign SHALL accept `cpu-native` in `MAGNETAR_QUALIFICATION_PROVIDERS`, and the benchmark's CPU cell SHALL select it.

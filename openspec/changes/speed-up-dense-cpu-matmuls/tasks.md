@@ -134,3 +134,15 @@
   | Ollama (FP16 GGUF, 4 prompt tokens cached, `n_threads = 2`) | 738 ms | — | 42.8 ms |
 
   On Intel, the 8-row blocks moved the prefill on 4 threads from 80.2 ms (run 45383670846, Xeon 6973P-C) to 49.6 ms, now ahead of one thread per core. Magnetar leads llama-server and Ollama by about 24% per request on this host. The Xeon 8370C runner has no kernel diagnostic sample yet.
+
+## 7. Decode step streaming (Ollama's decode on Zen 4)
+
+Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally, the replayed step ran its dense products at their kernels' streaming speed, but the small ones at half the large ones' bandwidth, with about 6 ms per token outside the products.
+
+- [x] 7.1 Diagnostics: `decode_step_matmul_costs` streams a step's real matmul sequence (24 layers and the LM head, about 1 GB) and compares variants step by step in one process; `MAGNETAR_CPU_PROFILE` now attributes grouped products. The local host's DRAM is shared, and runs of one build varied by up to 8 ms per token, so variants were compared in one process or by interleaved runs of one binary per version.
+- [x] 7.2 Software prefetch of the next rows in the one-row kernels (design "Decode step streaming"); AVX-512 and AVX2.
+- [x] 7.3 Grouped query, key and value projections at replay, the value projection moved ahead of the key's rope and KV write. Test: `replayed_product_groups_match_products_run_one_by_one` (1 and 3 rows; a product of another input passed over, a product writing the shared input kept after).
+- [x] 7.4 `gated-matmul`'s two products in one pool run, then the sums and activation across the pool. Test: `gated_matmuls_match_the_reference_cpu` now also checks bit-for-bit equality with the two products then `silu_times`, for weights held as written and transposed.
+- [x] 7.5 Bias and residual sums in place; a block scan for greedy selection (test: `greedy_columns_match_a_one_by_one_scan`); borrowed invocations at replay.
+- [x] 7.6 Locally, 8 interleaved runs of a 64-token profile per version: TPOT median 37.6 ms before, 34.3 ms after (paired difference -3.9 ms on average), with the same tokens (providers/cpu 2e523a4).
+- [ ] 7.7 The CPU benchmark on the runners, Zen 4 first: Magnetar against llama-server and Ollama per token.
