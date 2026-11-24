@@ -559,6 +559,8 @@ impl E2eRuntimeModelExecutionEngine {
             Some(&graphs.decode_memo),
             kv_stores,
             Some(&namespace),
+            // A namespace keeps its resources whatever happens.
+            false,
         )?;
         self.step_replay.pooled_decode_warmed(key);
         Ok(Some((output, None)))
