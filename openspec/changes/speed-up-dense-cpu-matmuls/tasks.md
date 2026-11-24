@@ -120,3 +120,17 @@
   | Ollama (FP16 GGUF, 4 prompt tokens cached, `n_threads = 2`) | 503 ms | — | 29.3 ms |
 
   Magnetar matches llama-server per request on this host. Ollama's decode is about 4.7 ms per token faster: its kernels reach about 34 GB/s on the model, against Magnetar's 29.
+
+  Third sample, Intel with the 8-row prefill blocks: run 45387956437, Intel Xeon 6975P-C (AMX), 2 cores × 2 threads, Magnetar 8add7ce, providers/cpu 03706fb.
+  - The stored orientations stream at 34.8 GB/s (gate/up) and 33.4 GB/s (down), against 24-25 GB/s for the other layouts. AVX2 equals AVX-512 again.
+  - The Ollama cell passed: its placement evidence records the CPU as the only discovered compute, with the repacked weights in `size_vram`.
+  - All engines in one job, 5 prompt and 16 generated tokens. Magnetar's bf16 weights pick "third" at token 12, where both FP16 GGUF engines pick "second"; the 11 tokens before match.
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar `cpu-native`, 4 threads (default) | 565 ms | 49.6 ms (48.1-84.9) | 34.3 ms |
+  | Magnetar `cpu-native`, 2 threads (one per core) | — | 57.0 ms | 37.5 ms |
+  | llama-server (FP16 GGUF) | 741 ms | — | 44.6 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached, `n_threads = 2`) | 738 ms | — | 42.8 ms |
+
+  On Intel, the 8-row blocks moved the prefill on 4 threads from 80.2 ms (run 45383670846, Xeon 6973P-C) to 49.6 ms, now ahead of one thread per core. Magnetar leads llama-server and Ollama by about 24% per request on this host. The Xeon 8370C runner has no kernel diagnostic sample yet.

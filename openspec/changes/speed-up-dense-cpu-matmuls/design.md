@@ -59,6 +59,7 @@ The pool keeps one thread per logical CPU (`available_parallelism`); `MAGNETAR_C
   - TPOT 35.8 against 34.8 ms.
 
   So the default stayed on logical CPUs.
+- On Intel Xeon 6 the prefill first favored one thread per core (TTFT 60.7 against 80.2 ms, run 45383670846), until the input-major tiles read their weights in blocks of 8 rows. With the blocks, every logical CPU wins there too: TTFT 49.6 against 57.0 ms, TPOT 34.3 against 37.5 ms (run 45387956437).
 - The CPU benchmark reruns Magnetar on one thread per physical core after the campaign, so the choice stays measured.
 
 ### Numerics
