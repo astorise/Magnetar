@@ -1313,6 +1313,7 @@ pub(super) fn dispatch_first_native_graph_node(
                 node_id,
                 input,
                 [Some(output_target), Some(second_output_target)],
+                node.attributes.clone(),
             )
         }
         other => Err(InferenceApiError::OperatorUnsupported {

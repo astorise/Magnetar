@@ -1824,6 +1824,7 @@ pub(super) fn dispatch_qwen_oracle_mlp_gate_up(
         &format!("{layer_id}.split"),
         gate_up,
         [None, None],
+        BTreeMap::new(),
     )?;
     let [gate, up]: [NodeValue; 2] =
         split_outputs

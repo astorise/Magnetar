@@ -22,12 +22,17 @@
 
 ## 2. Qwen3.5 hybrid graph (Qwen Component, Providers)
 
-- [ ] 2.1 Pin the Transformers Qwen3.5 modeling source used for semantics and fixtures; list its attention-block operators missing from the catalog.
-- [ ] 2.2 Add the missing operators additively with Reference CPU semantics and fixtures.
+- [x] 2.1 Pin the modeling source and list the missing operators. The source is Transformers 2f1bc5e (`modeling_qwen3_5.py`, SHA-256 `c4d847b7…`); the installed 5.23.0 copy differs only in the cache argument's name.
+  - Already in the catalog: per-head `rmsnorm`, the half-split `rope` over the rotary dimension (M-RoPE reduces to it for text, where all three positions are equal), grouped `attention`, the sigmoid `activation`, `mul`, the gated MLP and `gated-delta-mixer`.
+  - Missing: the zero-centered norm `x · (1 + w)` and the per-head `[query | gate]` split of `q_proj`.
+- [x] 2.2 Add the missing forms additively, with Reference CPU semantics and a fixture.
+  - `rmsnorm.weight_offset` and `split.head_count` are gated by the `rmsnorm-weight-offset` and `split-per-head` Kernel features. The executor now forwards both attributes; it dropped them before.
+  - The fixture `qwen35-attention-reference.json` comes from the pinned `Qwen3_5Attention`. `qwen35_gated_attention_block_matches_pinned_reference` matches it on the Reference CPU.
+  - The CPU and CUDA Providers do not advertise these features yet (2.5, 2.6).
 - [ ] 2.3 Qwen Component: recognize the Qwen3.5 text configuration; emit the hybrid prefill and decode graphs with `conv`/`delta` recurrent slots; rebuild and repin the wasm. Update the WIT `recurrent-resource` comment, which still says execution refuses such graphs.
 - [ ] 2.4 Hugging Face loader: map the Qwen3.5 tensor names and configuration.
-- [ ] 2.5 cpu-native: decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states.
-- [ ] 2.6 CUDA: the same two forms, qualified on the GPU runner.
+- [ ] 2.5 CPU Provider: `rmsnorm.weight_offset` and per-head `split`. cpu-native: decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states.
+- [ ] 2.6 CUDA: the same forms (norm offset, per-head split, both mixer forms), qualified on the GPU runner.
 - [ ] 2.7 Qualify Qwen3.5-0.8B-Base (revision dc7cdfe…, digest pinned) on Reference CPU, cpu-native and CUDA:
   - last-position logits against Transformers;
   - 16 greedy tokens equal;

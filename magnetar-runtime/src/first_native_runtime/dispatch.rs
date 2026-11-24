@@ -1458,6 +1458,7 @@ pub(super) fn dispatch_qwen_split(
     operation_id: &str,
     input: NodeValue,
     output_targets: [Option<OutputTarget>; 2],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     let (rows, cols) = input.rows_cols()?;
     if cols % 2 != 0 || cols == 0 {
@@ -1503,7 +1504,8 @@ pub(super) fn dispatch_qwen_split(
         dispatch_operator_id("split", OperatorFamily::Tensor),
         vec![node_input_resource(operation_id, "input", input)],
         vec![left_output, right_output],
-        BTreeMap::new(),
+        // `head_count` splits each head's block (`split-per-head`).
+        attributes,
     );
     if result.is_err() {
         if left_pre_admitted {
@@ -1820,9 +1822,14 @@ pub(super) fn dispatch_qwen_rmsnorm(
 }
 
 /// The `rmsnorm` node attributes forwarded to the Kernel when the graph sets
-/// them (`dispatch-layered-model-forms`): per-head normalization and a
-/// scale-less RMSNorm.
-const RMSNORM_NODE_ATTRIBUTES: [&str; 3] = ["head_count", "head_dimension", "with_scale"];
+/// them (`dispatch-layered-model-forms`): per-head normalization, a
+/// scale-less RMSNorm and a zero-centered weight (`support-qwen38-flash-next`).
+const RMSNORM_NODE_ATTRIBUTES: [&str; 4] = [
+    "head_count",
+    "head_dimension",
+    "with_scale",
+    "weight_offset",
+];
 
 /// [`dispatch_qwen_rmsnorm`] for a graph node: no weight for a scale-less
 /// RMSNorm, and the node's per-head attributes.

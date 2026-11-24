@@ -216,6 +216,9 @@ pub enum ShapeRule {
     RmsNorm,
     RowBroadcastAdd,
     RowConcat,
+    /// The last dimension into two halves; with `head_count`, each head's
+    /// block of it splits in half.
+    Split,
     Rank(u64),
 }
 
@@ -312,6 +315,17 @@ pub const RMSNORM_PER_HEAD_FEATURE: &str = "rmsnorm-per-head";
 /// Kernel feature an `rmsnorm` Kernel advertises when it accepts a single
 /// input (no weight, scale 1).
 pub const RMSNORM_WITHOUT_WEIGHT_FEATURE: &str = "rmsnorm-without-weight";
+
+/// Kernel feature an `rmsnorm` Kernel advertises when it honours
+/// `weight_offset`: the normalized row is multiplied by `offset + weight`
+/// (Qwen3.5's zero-centered norms, `support-qwen38-flash-next`).
+pub const RMSNORM_WEIGHT_OFFSET_FEATURE: &str = "rmsnorm-weight-offset";
+
+/// Kernel feature a `split` Kernel advertises when it honours `head_count`:
+/// each of the `head_count` equal blocks of a row is split in half, the
+/// first halves forming the first output and the second halves the second
+/// (Qwen3.5's per-head query and gate, `support-qwen38-flash-next`).
+pub const SPLIT_PER_HEAD_FEATURE: &str = "split-per-head";
 
 /// Kernel feature a `rope` Kernel advertises when it honours
 /// `partial_rotary_factor`.
@@ -410,6 +424,14 @@ pub fn required_kernel_features(
             }
         }
         "embedding" if present("scale") => features.push(EMBEDDING_SCALE_FEATURE),
+        "split" => {
+            if !matches!(
+                attributes.get("head_count"),
+                None | Some(OperatorAttributeValue::Integer(1))
+            ) {
+                features.push(SPLIT_PER_HEAD_FEATURE);
+            }
+        }
         "activation" => {
             if matches!(attributes.get("kind"), Some(OperatorAttributeValue::String(kind)) if kind == "relu_squared")
             {
@@ -419,6 +441,11 @@ pub fn required_kernel_features(
         "rmsnorm" => {
             if present("head_count") || present("head_dimension") {
                 features.push(RMSNORM_PER_HEAD_FEATURE);
+            }
+            if attributes.get("weight_offset").is_some_and(
+                |value| !matches!(value, OperatorAttributeValue::Float(offset) if *offset == 0.0),
+            ) {
+                features.push(RMSNORM_WEIGHT_OFFSET_FEATURE);
             }
             if input_count < 2
                 || matches!(
@@ -1574,7 +1601,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // existing rule expresses "half the last dimension of the input,"
         // and inventing one for a single deliberately-minimal proof
         // operator is not warranted.
-        ("split", OperatorFamily::Tensor, 1, 2, ShapeRule::Any),
+        ("split", OperatorFamily::Tensor, 1, 2, ShapeRule::Split),
     ] {
         let mut spec = OperatorSpec::new(OperatorId::magnetar(name, 1, family), inputs, outputs)
             .with_shape_rule(shape)
@@ -2079,7 +2106,17 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "with_scale",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+            )
+            // The row is multiplied by `weight_offset + weight` (default 0).
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
             ),
+        // Each of `head_count` (default 1) equal row blocks splits in half.
+        "split" => OperatorAttributeSchema::default().with_rule(
+            "head_count",
+            OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+        ),
         "moe-experts" => OperatorAttributeSchema::default()
             .with_rule(
                 "experts",
@@ -2171,6 +2208,57 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
         ),
         _ => OperatorAttributeSchema::default(),
     }
+}
+
+/// `split`: the last dimension into two halves; with `head_count` heads,
+/// each `width / head_count` block of it splits in half.
+fn validate_split_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(), OperatorError> {
+    let head_count = match attributes.get("head_count") {
+        None => 1,
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+        Some(_) => {
+            return Err(OperatorError::OperatorAttributeInvalid {
+                attribute: "head_count".into(),
+                reason: "must be a positive integer".into(),
+            });
+        }
+    };
+    let [input] = inputs else {
+        return Err(OperatorError::InputArityInvalid {
+            expected: 1,
+            actual: inputs.len(),
+        });
+    };
+    let Some((&width, outer)) = input.shape.dimensions.split_last() else {
+        return Err(OperatorError::ShapeUnsupported {
+            reason: "split takes an input with at least one dimension".into(),
+        });
+    };
+    if width == 0 || !width.is_multiple_of(2 * head_count) {
+        return Err(OperatorError::ShapeMismatch {
+            reason: format!(
+                "split of width {width} into halves of {head_count} head(s) needs a multiple of {}",
+                2 * head_count
+            ),
+        });
+    }
+    let mut half = outer.to_vec();
+    half.push(width / 2);
+    for output in outputs {
+        if output.shape.dimensions != half {
+            return Err(OperatorError::ShapeMismatch {
+                reason: format!(
+                    "split expects outputs {half:?}, got {:?}",
+                    output.shape.dimensions
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A head-wise `concat` ([`ConcatAxis::Heads`]): `[T, H * a]` and `[T, b']`
@@ -2664,6 +2752,7 @@ fn validate_shape_rule(
             }
             Ok(())
         }
+        ShapeRule::Split => validate_split_shape(inputs, outputs, attributes),
         ShapeRule::RmsNorm => {
             if inputs.is_empty() {
                 return Err(OperatorError::InputArityInvalid {
@@ -2683,6 +2772,16 @@ fn validate_shape_rule(
                 return Err(OperatorError::ShapeMismatch {
                     reason: "RMSNorm output shape must match input".into(),
                 });
+            }
+            match attributes.get("weight_offset") {
+                None => {}
+                Some(OperatorAttributeValue::Float(offset)) if offset.is_finite() => {}
+                Some(_) => {
+                    return Err(OperatorError::OperatorAttributeInvalid {
+                        attribute: "weight_offset".into(),
+                        reason: "must be a finite float".into(),
+                    });
+                }
             }
             // A scale-less RMSNorm has no weight.
             let Some(weight) = inputs.get(1).map(|weight| &weight.shape.dimensions) else {

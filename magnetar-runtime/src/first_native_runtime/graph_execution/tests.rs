@@ -2258,6 +2258,9 @@ fn the_reference_cpu_declares_every_layered_form() {
         ("attention", ATTENTION_VALUE_HEAD_DIMENSION_FEATURE),
         ("concat", CONCAT_HEADS_FEATURE),
         ("rope", ROPE_YARN_FREQUENCY_SCALING_FEATURE),
+        // `support-qwen38-flash-next`.
+        ("rmsnorm", RMSNORM_WEIGHT_OFFSET_FEATURE),
+        ("split", SPLIT_PER_HEAD_FEATURE),
     ] {
         assert!(
             provider_kernels_declare(&runtime, &provider, operator, feature),
@@ -2765,6 +2768,251 @@ fn prefill_and_decode_an_expanded_latent_attention_layer(device_resident: bool) 
         assert_eq!(
             executor.resident_shape(&state.v).unwrap()[1],
             MLA_HEADS * MLA_VALUE
+        );
+    }
+}
+
+/// Qwen3.5's gated full-attention block, built from portable operators the
+/// way the Qwen Component emits it, against the pinned upstream class
+/// (`support-qwen38-flash-next`): per-head query/gate split, zero-centered
+/// per-head norms, partial half-split rotary, grouped attention and the
+/// sigmoid output gate.
+#[test]
+fn qwen35_gated_attention_block_matches_pinned_reference() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        hidden_size: u64,
+        tokens: u64,
+        heads: u64,
+        kv_heads: u64,
+        head_dim: u64,
+        rotary_dim: u64,
+        rope_theta: f64,
+        epsilon: f64,
+        hidden: Vec<f32>,
+        weights: BTreeMap<String, Vec<f32>>,
+        output: Vec<f32>,
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../fixtures/qwen35-attention-reference.json"
+    ))
+    .unwrap();
+    let (rows, hidden) = (fixture.tokens, fixture.hidden_size);
+    let (heads, kv_heads, dim) = (fixture.heads, fixture.kv_heads, fixture.head_dim);
+    let int = |value: u64| OperatorAttributeValue::Integer(value as i64);
+    let mut g = FormsGraph {
+        graph: ExecutionGraph::new(
+            ExecutionGraphId::new("qwen35-attention"),
+            ExecutionGraphPhase::Prefill,
+        ),
+    };
+    let x = g.input("hidden", &[rows, hidden]);
+    // Projections as the loaders deliver them: `[in, out]`.
+    let weight_shapes = [
+        ("q_proj.weight", vec![hidden, 2 * heads * dim]),
+        ("k_proj.weight", vec![hidden, kv_heads * dim]),
+        ("v_proj.weight", vec![hidden, kv_heads * dim]),
+        ("o_proj.weight", vec![heads * dim, hidden]),
+        ("q_norm.weight", vec![dim]),
+        ("k_norm.weight", vec![dim]),
+    ];
+    let weight: BTreeMap<_, _> = weight_shapes
+        .iter()
+        .map(|(name, shape)| (*name, g.input(name, shape)))
+        .collect();
+    let transposed = Vec::new;
+    let projected = g.node(
+        "q_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![x.clone(), weight["q_proj.weight"].clone()],
+        &[rows, 2 * heads * dim],
+    );
+    // Each head's projection is [query | gate].
+    let split = ExecutionNodeId::new("q_split");
+    let (query, gate) = (
+        TensorEdgeId::new("edge.q_split.0"),
+        TensorEdgeId::new("edge.q_split.1"),
+    );
+    for edge in [&query, &gate] {
+        g.graph.edges.insert(
+            edge.clone(),
+            TensorEdge::new(
+                edge.clone(),
+                f32_tensor_descriptor_from_shape(&[rows, heads * dim]),
+            )
+            .with_producer(split.clone()),
+        );
+    }
+    g.graph
+        .edges
+        .get_mut(&projected)
+        .unwrap()
+        .consumers
+        .insert(split.clone());
+    g.graph.nodes.insert(
+        split.clone(),
+        ExecutionNode::new(
+            split,
+            OperatorId::magnetar("split", 1, OperatorFamily::Tensor),
+        )
+        .with_input(projected)
+        .with_output(query.clone())
+        .with_output(gate.clone())
+        .with_attribute("head_count", int(heads)),
+    );
+    let norm = |g: &mut FormsGraph, id: &str, input: TensorEdgeId, w: &str, count: u64| {
+        g.node(
+            id,
+            "rmsnorm",
+            OperatorFamily::Normalization,
+            vec![
+                ("epsilon", OperatorAttributeValue::Float(fixture.epsilon)),
+                ("head_count", int(count)),
+                ("head_dimension", int(dim)),
+                ("weight_offset", OperatorAttributeValue::Float(1.0)),
+            ],
+            vec![input, weight[w].clone()],
+            &[rows, count * dim],
+        )
+    };
+    let rope = |g: &mut FormsGraph, id: &str, input: TensorEdgeId, count: u64| {
+        g.node(
+            id,
+            "rope",
+            OperatorFamily::PositionEncoding,
+            vec![
+                ("base", OperatorAttributeValue::Float(fixture.rope_theta)),
+                ("dimension", int(fixture.rotary_dim)),
+                ("head_count", int(count)),
+                ("position_offset", int(0)),
+                (
+                    "rotation_pairing",
+                    OperatorAttributeValue::String("half_split".into()),
+                ),
+            ],
+            vec![input],
+            &[rows, count * dim],
+        )
+    };
+    let q = norm(&mut g, "q_norm", query, "q_norm.weight", heads);
+    let q = rope(&mut g, "q_rope", q, heads);
+    let k = g.node(
+        "k_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![x.clone(), weight["k_proj.weight"].clone()],
+        &[rows, kv_heads * dim],
+    );
+    let k = norm(&mut g, "k_norm", k, "k_norm.weight", kv_heads);
+    let k = rope(&mut g, "k_rope", k, kv_heads);
+    let v = g.node(
+        "v_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![x, weight["v_proj.weight"].clone()],
+        &[rows, kv_heads * dim],
+    );
+    let attended = g.node(
+        "attention",
+        "attention",
+        OperatorFamily::Attention,
+        vec![
+            ("causal", OperatorAttributeValue::Boolean(true)),
+            ("head_count", int(heads)),
+            ("kv_head_count", int(kv_heads)),
+            ("head_dimension", int(dim)),
+        ],
+        vec![q, k, v],
+        &[rows, heads * dim],
+    );
+    let gate = g.node(
+        "gate",
+        "activation",
+        OperatorFamily::Activation,
+        vec![("kind", OperatorAttributeValue::String("sigmoid".into()))],
+        vec![gate],
+        &[rows, heads * dim],
+    );
+    let gated = g.node(
+        "gated",
+        "mul",
+        OperatorFamily::Tensor,
+        vec![],
+        vec![attended, gate],
+        &[rows, heads * dim],
+    );
+    let output = g.node(
+        "o_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![gated, weight["o_proj.weight"].clone()],
+        &[rows, hidden],
+    );
+    let graph = g.graph;
+    graph.validate(&initial_operator_catalog()).unwrap();
+
+    let e2e = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&e2e);
+    let (instance, _) = load_fixture_instance(&e2e, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        rows,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    let mut bindings = BTreeMap::from([(
+        TensorEdgeId::new("input.hidden"),
+        HostTensor::new([rows, hidden], fixture.hidden.clone()).unwrap(),
+    )]);
+    for (name, shape) in &weight_shapes {
+        let values = &fixture.weights[*name];
+        // The checkpoint's `[out, in]` projection, transposed.
+        let values = match shape.as_slice() {
+            [inputs, outputs] => (0..inputs * outputs)
+                .map(|index| values[((index % outputs) * inputs + index / outputs) as usize])
+                .collect(),
+            _ => values.clone(),
+        };
+        bindings.insert(
+            TensorEdgeId::new(format!("input.{name}")),
+            HostTensor::new(shape.clone(), values).unwrap(),
+        );
+    }
+    let (_, outputs, _, _) = execute_first_native_graph_materializing(
+        &mut runtime,
+        &e2e,
+        &instance,
+        &KvCacheId::new("qwen35-attention").unwrap(),
+        &graph,
+        &mut plan,
+        bindings,
+        None,
+        Some(0),
+        &mut Vec::new(),
+        MaterializedEdges::All,
+        None,
+        None,
+    )
+    .unwrap();
+    let actual = &outputs[&output].data;
+    assert_eq!(actual.len(), fixture.output.len());
+    for (index, (a, b)) in actual.iter().zip(&fixture.output).enumerate() {
+        assert!(
+            (a - b).abs() <= 2e-6 + 1e-5 * b.abs(),
+            "output[{index}]: {a} != {b}"
         );
     }
 }
