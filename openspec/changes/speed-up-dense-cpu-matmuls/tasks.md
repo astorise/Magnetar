@@ -143,6 +143,6 @@ Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally,
 - [x] 7.2 Software prefetch of the next rows in the one-row kernels (design "Decode step streaming"); AVX-512 and AVX2.
 - [x] 7.3 Grouped query, key and value projections at replay, the value projection moved ahead of the key's rope and KV write. Test: `replayed_product_groups_match_products_run_one_by_one` (1 and 3 rows; a product of another input passed over, a product writing the shared input kept after).
 - [x] 7.4 `gated-matmul`'s two products in one pool run, then the sums and activation across the pool. Test: `gated_matmuls_match_the_reference_cpu` now also checks bit-for-bit equality with the two products then `silu_times`, for weights held as written and transposed.
-- [x] 7.5 Bias and residual sums in place; a block scan for greedy selection (test: `greedy_columns_match_a_one_by_one_scan`); borrowed invocations at replay.
+- [x] 7.5 Bias and residual sums in place; a block scan for greedy selection, its block maximum in sixteen lanes (264 to 47.5 us for the 151,936 logits; test: `greedy_columns_match_a_one_by_one_scan`); borrowed invocations at replay.
 - [x] 7.6 Locally, 8 interleaved runs of a 64-token profile per version: TPOT median 37.6 ms before, 34.3 ms after (paired difference -3.9 ms on average), with the same tokens (providers/cpu 2e523a4).
 - [ ] 7.7 The CPU benchmark on the runners, Zen 4 first: Magnetar against llama-server and Ollama per token.
