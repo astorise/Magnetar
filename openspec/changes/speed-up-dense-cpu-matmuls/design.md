@@ -61,6 +61,7 @@ The pool keeps one thread per logical CPU (`available_parallelism`); `MAGNETAR_C
   So the default stayed on logical CPUs.
 - On Intel Xeon 6 the prefill first favored one thread per core (TTFT 60.7 against 80.2 ms, run 45383670846), until the input-major tiles read their weights in blocks of 8 rows. With the blocks, every logical CPU wins there too: TTFT 49.6 against 57.0 ms, TPOT 34.3 against 37.5 ms (run 45387956437).
 - The CPU benchmark reruns Magnetar on one thread per physical core after the campaign, so the choice stays measured.
+- Once the one-row kernels read their next rows ahead ("Decode step streaming"), one thread per core decoded faster than every logical CPU on Intel Xeon 6 (32.5 against 34.2 ms per token, run 45406355532), while the prefill still preferred every logical CPU (46.1 against 52.5 ms). `MAGNETAR_CPU_DECODE_THREADS` runs one-row Kernels on a pool of their own, so a host can decode on one thread per core and prefill on all; the benchmark measures it, and the default stays every logical CPU until a Zen 4 sample agrees.
 
 ### Decode step streaming
 

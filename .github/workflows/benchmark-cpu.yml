@@ -70,6 +70,29 @@ jobs:
               real_checkpoint_qualification_campaign -- --include-ignored --nocapture > "$out/log.txt" 2>&1
           summary="$(grep -E '^\[cpu-native\] [0-9]+ prompt tokens: load' "$out/log.txt")"
           echo "Magnetar on $cores threads (one per physical core): $summary" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Magnetar decoding on one thread per physical core (thread-count check)
+        # Prefill on every logical CPU, decode steps (one-row Kernels) on a
+        # pool of one thread per physical core (MAGNETAR_CPU_DECODE_THREADS):
+        # a core's second hardware thread helps the compute-bound prefill
+        # and can slow the memory-bound decode step.
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/benchmark-results/magnetar-decode-physical-cores"
+          mkdir -p "$out"
+          cores="$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)"
+          MAGNETAR_CPU_DECODE_THREADS="$cores" \
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$RUNNER_TEMP/benchmark-work/qwen2.5-0.5b-instruct" \
+          MAGNETAR_QUALIFICATION_PROVIDERS=cpu-native \
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS="$BENCH_TOKENS" \
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS="$BENCH_RUNS" \
+          MAGNETAR_QUALIFICATION_REPORT_DIR="$out" \
+            cargo test --release --manifest-path integration-tests/production-loading/Cargo.toml \
+              real_checkpoint_qualification_campaign -- --include-ignored --nocapture > "$out/log.txt" 2>&1
+          summary="$(grep -E '^\[cpu-native\] [0-9]+ prompt tokens: load' "$out/log.txt")"
+          echo "Magnetar decoding on $cores threads (one per physical core), prefill on every logical CPU: $summary" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: CPU kernel bandwidth (diagnostic)
         # Streams each decode matmul shape of a Qwen2.5-0.5B layer from
         # memory, in both stored layouts, with the default kernels and with
