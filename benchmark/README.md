@@ -43,6 +43,36 @@ TTFT ; prompts de 4K et 16K tokens : prefill). L'artefact contient le journal
 du setup, la configuration générée, les journaux du serveur, la mémoire GPU et
 RAM occupée et les rapports.
 
+### Référence mesurée (run 45446491115, 2026-11-24)
+
+Runner `arc-gpu-magnetar` : 2 × RTX 3060 12 Go (PCIe 3.0), Intel Core
+i7-7700 (4 cœurs, 8 threads), 31 Go de RAM, NVMe. Strata d46f5f2, moteur
+précompilé 0.1.67 (CUDA 13), Qwen3.8-Flash-Next IQ2_XS d'ISTA-DASLab (deux
+fichiers : 39,2 Go de modèle, 28,8 Go de table n-gram), contexte 8 192, cache
+KV int8. Téléchargement et préparation : 23 minutes.
+
+Placement choisi par Strata :
+- couches réparties entre les deux cartes (`layer split auto`) ;
+- experts **non copiés en RAM** : réécrits une fois dans un fichier de 33 Gio,
+  puis mappés depuis le SSD (`--mmap-experts`), le cache de pages de l'OS en
+  gardant ~24 Go ; RAM utilisée par le processus : 7 à 9 Go ;
+- cache d'experts GPU : 6 483 experts sur 24 576 (8,57 Gio de VRAM), taux de
+  succès de 87 à 98 % en décodage une fois chaud (73 à 86 % aux premières
+  requêtes) ; 11,1 à 11,3 Go de VRAM occupés par carte.
+
+| Mesure (`strata_bench.py`, médiane et étendue) | Sans drafting | Avec drafting (DFlash2) |
+| --- | --- | --- |
+| Décodage, questions courtes (100 tokens) | 23,3 tok/s (16,1–34,1) | 38,3 tok/s (21,9–43,7) |
+| TTFT, prompt de ~46 tokens | 1,15 s (0,74–1,59) | 1,03 s (0,77–1,50) |
+| Prefill, prompt de 4 019 tokens | 353 tok/s (268–546) | 369 tok/s (246–513) |
+
+- Le setup a choisi le drafter DFlash2 (1,21 Go) plutôt que la couche MTP du
+  modèle ; `"mtp": false` a retiré tout drafting (le prompt lookup `--spec`
+  reste). La colonne sans drafting est la référence pour Magnetar.
+- Le prompt de 16K n'a pas été mesuré : le contexte était de 8 192 tokens.
+- Cellule du harness (prompt de la campagne, raisonnement actif, arrêt naturel
+  vers 30 tokens) : 1,05 à 1,07 s par requête.
+
 ## Résultats et interprétation
 
 Le résumé du job et l'artefact contiennent `comparison.md`, `status.tsv`, les
