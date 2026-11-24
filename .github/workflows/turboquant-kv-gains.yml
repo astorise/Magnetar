@@ -59,7 +59,7 @@ jobs:
       - name: Checkout the submodules the test builds
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf
+          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf components/laya components/modernbert components/nemotron components/olala
       - name: Verify GPU is visible
         run: |
           set -eux

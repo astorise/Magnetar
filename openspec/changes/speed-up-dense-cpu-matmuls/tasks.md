@@ -30,3 +30,17 @@
   - Ollama: prompt 26.8 ms (4 tokens cached), 25.1 ms per token.
 
   llama-server did not build in this run.
+
+## 4. Stored orientation, decode kernels and pool size
+
+- [x] 4.1 A compact weight with more rows than columns is held transposed and used the other way round; reads, shapes and lookups (a column gather) return its logical values.
+- [x] 4.2 Decode kernels: sixteen outputs (eight on AVX2) at a time output-major, eight weight rows per pass input-major; AVX-512 for one row too.
+- [x] 4.3 Splits: row blocks for input-major weights narrower than 4,096 columns per thread; one or two wide column blocks per thread otherwise; output-major tasks of whole groups of sixteen outputs.
+- [x] 4.4 The pool's default size is one thread per physical core (`native::topology`); `MAGNETAR_CPU_THREADS` overrides it.
+- [x] 4.5 Tests:
+  - `matmul_kernels_and_lookups_read_compact_weights` over a tall and a wide weight, used transposed and not, with 1 and 3 rows;
+  - one-row cases with tails in `dense_matmuls_match_the_reference_cpu` and `both_vector_widths_match_the_reference_cpu`;
+  - `cpu_lists_parse_as_linux_writes_them` and `the_default_pool_never_exceeds_the_logical_cpus`;
+  - `pool_and_streamed_matmul_costs` (diagnostic) streams each decode shape of a Qwen2.5-0.5B layer in both layouts.
+- [x] 4.6 Local qualification on Qwen2.5-0.5B (4 cores without SMT, AVX-512, profiling on, the same 16 generated tokens): TPOT median 43.3 ms before, 35.4 ms after; `matmul-residual` 0.310 to 0.179 ms per call, `matmul-bias` 0.060 to 0.050 ms.
+- [ ] 4.7 Benchmark CPU on the same machine as Ollama and llama-server, with the thread-count check on every logical CPU.

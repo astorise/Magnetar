@@ -40,7 +40,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Initialize Magnetar dependencies
-        run: git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf
+        run: git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf components/laya components/modernbert components/nemotron components/olala
       - name: Record CPU and run all engines sequentially
         shell: bash
         run: |
@@ -48,6 +48,27 @@ jobs:
           mkdir -p "$RUNNER_TEMP/benchmark-results"
           lscpu | tee "$RUNNER_TEMP/benchmark-results/cpu-info.txt"
           bash benchmark/campaign.sh
+      - name: Magnetar on every logical CPU (thread-count check)
+        # The campaign runs the optimized CPU Provider on one thread per
+        # physical core (its default); this reruns it, already built, on
+        # every logical CPU of the same host, so the default stays measured.
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/benchmark-results/magnetar-all-logical-cpus"
+          mkdir -p "$out"
+          MAGNETAR_CPU_THREADS="$(nproc)" \
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$RUNNER_TEMP/benchmark-work/qwen2.5-0.5b-instruct" \
+          MAGNETAR_QUALIFICATION_PROVIDERS=cpu-native \
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS="$BENCH_TOKENS" \
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS="$BENCH_RUNS" \
+          MAGNETAR_QUALIFICATION_REPORT_DIR="$out" \
+            cargo test --release --manifest-path integration-tests/production-loading/Cargo.toml \
+              real_checkpoint_qualification_campaign -- --include-ignored --nocapture > "$out/log.txt" 2>&1
+          summary="$(grep -E '^\[cpu-native\] [0-9]+ prompt tokens: load' "$out/log.txt")"
+          echo "Magnetar on $(nproc) threads: $summary" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Upload benchmark results
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
