@@ -108,7 +108,7 @@ jobs:
             echo "== kernels: $simd" | tee -a "$out"
             if [[ "$simd" == avx2 ]]; then export MAGNETAR_CPU_SIMD=avx2; else unset MAGNETAR_CPU_SIMD; fi
             cargo test --release --manifest-path providers/cpu/Cargo.toml --lib -- \
-              --ignored --nocapture streamed_matmul_costs 2>&1 \
+              --ignored --nocapture --test-threads=1 streamed_matmul_costs 2>&1 \
               | grep -E 'pool run|streamed' | tee -a "$out"
           done
           { echo '```'; cat "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
