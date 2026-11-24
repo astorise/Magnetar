@@ -44,17 +44,17 @@ The optimized CPU Provider SHALL hold a compact weight with more rows than colum
 
 ### Requirement: Worker pool size of the optimized CPU Provider
 
-The optimized CPU Provider SHALL size its worker pool to one thread per physical core the process may run on, and never more than the logical CPUs it may use, unless `MAGNETAR_CPU_THREADS` sets a positive count. Where the host does not report which logical CPUs share a core, it SHALL use every logical CPU it may use.
+The optimized CPU Provider SHALL size its worker pool to the logical CPUs the process may use, unless `MAGNETAR_CPU_THREADS` sets a positive count. The CPU benchmark SHALL rerun it on one thread per physical core of the same host, so that this default stays measured.
 
-#### Scenario: Linux CPU lists
+#### Scenario: An explicit count
 
-- **WHEN** Linux CPU lists such as `0-3`, `0,2` and `0-1,4,6-7` are read
-- **THEN** they give the listed CPUs, and a malformed list (`3-1`, `a`) gives none
+- **WHEN** `MAGNETAR_CPU_THREADS=2` is set on a 4-CPU host
+- **THEN** the pool runs tasks on 2 threads in all
 
-#### Scenario: Default size
+#### Scenario: The benchmark's check
 
-- **WHEN** the pool takes its default size
-- **THEN** it has at least one thread and no more than the process's available parallelism
+- **WHEN** the CPU benchmark runs
+- **THEN** its summary reports Magnetar on one thread per physical core beside the campaign's default run
 
 ### Requirement: The benchmark's CPU Provider
 

@@ -41,7 +41,15 @@ A decode step reads each weight once, a few stored rows side by side. Locally (4
 
 ### Thread count
 
-The pool takes one thread per physical core the process may run on (Linux `thread_siblings_list` over the CPUs in `Cpus_allowed_list`, never more than `available_parallelism`), every logical CPU where the topology is unknown; `MAGNETAR_CPU_THREADS` overrides it. The benchmark runners have 2 cores with 2 hardware threads each. A decode step streams weights, which a core's second hardware thread does not speed up, and a pool thread polling between Kernels takes issue slots from its sibling. llama.cpp (Ollama's backend) defaults to the physical core count too (`n_threads = 2` on those runners). The CPU benchmark reruns Magnetar on every logical CPU of the same host after the campaign, so this default stays measured.
+The pool keeps one thread per logical CPU (`available_parallelism`); `MAGNETAR_CPU_THREADS` overrides it.
+
+- The runners have 2 cores with 2 hardware threads each, and llama.cpp (Ollama's backend) defaults to the physical core count (`n_threads = 2`).
+- One thread per physical core was tried and measured on the same host (run 45343428878, AMD EPYC 9V74). It was slower than every logical CPU:
+  - TTFT 81.3 against 71.5 ms, since the prefill is compute-bound and the second hardware threads help;
+  - TPOT 35.8 against 34.8 ms.
+
+  So the default stayed on logical CPUs.
+- The CPU benchmark reruns Magnetar on one thread per physical core after the campaign, so the choice stays measured.
 
 ### Numerics
 

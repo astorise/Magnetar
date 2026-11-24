@@ -48,18 +48,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/benchmark-results"
           lscpu | tee "$RUNNER_TEMP/benchmark-results/cpu-info.txt"
           bash benchmark/campaign.sh
-      - name: Magnetar on every logical CPU (thread-count check)
-        # The campaign runs the optimized CPU Provider on one thread per
-        # physical core (its default); this reruns it, already built, on
-        # every logical CPU of the same host, so the default stays measured.
+      - name: Magnetar on one thread per physical core (thread-count check)
+        # The campaign runs the optimized CPU Provider on every logical CPU
+        # (its default); this reruns it, already built, on one thread per
+        # physical core of the same host, so the default stays measured.
         if: ${{ always() }}
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/benchmark-results/magnetar-all-logical-cpus"
+          out="$RUNNER_TEMP/benchmark-results/magnetar-physical-cores"
           mkdir -p "$out"
-          MAGNETAR_CPU_THREADS="$(nproc)" \
+          cores="$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)"
+          MAGNETAR_CPU_THREADS="$cores" \
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$RUNNER_TEMP/benchmark-work/qwen2.5-0.5b-instruct" \
           MAGNETAR_QUALIFICATION_PROVIDERS=cpu-native \
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS="$BENCH_TOKENS" \
@@ -68,7 +69,7 @@ jobs:
             cargo test --release --manifest-path integration-tests/production-loading/Cargo.toml \
               real_checkpoint_qualification_campaign -- --include-ignored --nocapture > "$out/log.txt" 2>&1
           summary="$(grep -E '^\[cpu-native\] [0-9]+ prompt tokens: load' "$out/log.txt")"
-          echo "Magnetar on $(nproc) threads: $summary" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Magnetar on $cores threads (one per physical core): $summary" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Upload benchmark results
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
