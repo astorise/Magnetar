@@ -82,6 +82,16 @@
 
   On this host Magnetar is ahead of both, per request and per token. The host is an Intel CPU, not the Zen 4 of runs 44529384440 and 45343428878, so the Zen 4 TTFT question of task 4.8 needs a campaign on a Zen 4 runner.
 
+  A second Intel host (run 45382158317, Intel Xeon 6975P-C, 2 cores × 2 threads, same commit, the same tokens as llama-server):
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar `cpu-native`, 4 threads (default) | 618 ms | 80-83 ms | 35.3-35.8 ms |
+  | Magnetar `cpu-native`, 2 threads (one per core) | — | 59-60 ms | 38-39 ms |
+  | llama-server (FP16 GGUF) | 755 ms | — | 45.3 ms |
+
+  Ollama did not run: the benchmark's Ollama adapter refused the placement Ollama reported (`size_vram=987926364` on a CPU-only job). Since section 5, the prefill is compute-bound: two hardware threads on one core compete for its FMA units, and on this host one thread per core prefills about 22 ms faster, while the decode, bound by bandwidth, is 3 ms per token faster on every logical CPU. Whether the prefill should use one thread per core is decided on more runner models (task 6.3).
+
 ## 6. Gated matmuls and kernel diagnostics on the runners
 
 - [x] 6.1 Both CPU Providers advertise `gated-matmul` with the Runtime's Reference semantics, so the Runtime folds a gated MLP's two matmuls and `silu-mul` into one node. The optimized CPU Provider computes both products as the matmul family does (packed, compact or f32) and applies the activation in place. Test: `gated_matmuls_match_the_reference_cpu` (compact, f32 and packed weights; 1 and 5 rows). Locally, over 64 tokens: the same text, 0.602 ms per layer against 0.614 ms for the two matmuls and `silu-mul` (providers/cpu 6ec6040).
