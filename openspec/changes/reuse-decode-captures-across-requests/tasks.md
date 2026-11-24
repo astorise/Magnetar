@@ -14,4 +14,11 @@
 
 ## 2. Qualification
 
-- [ ] 2.1 Benchmark GPU (`magnetar`, 16 tokens, 5 runs) on Qwen2.5-0.5B: no slow decode step after the first requests, request latency against run 44490170115, and the same tokens.
+- [x] 2.1 Benchmark GPU on Qwen2.5-0.5B, all engines in one job (run 44516315731, RTX 3060). Every measured request's inter-token latencies are 4.1 ms, with no slow first decode step, and the tokens are the same:
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar (CUDA) | 72.9 ms | 10.7 ms | 4.1 ms |
+  | Ollama (FP16 GGUF) | 80.0 ms | 5.0 ms | 4.54 ms |
+
+  Before this change, run 44490170115 measured Magnetar at 92.6 ms per request, with its first two decode steps at 11.7-16.7 ms. llama-server did not build in this run (llama.cpp's prebuilt web UI assets were missing; `benchmark/ci.sh` now builds it without them).
