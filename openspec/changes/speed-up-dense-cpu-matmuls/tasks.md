@@ -158,7 +158,20 @@ Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally,
 
   - Streamed alone, the `[896, 896]` input-major product (query and o projections) went from 24.2 to 31.1 GB/s, the gate/up projection from 34.8 to 36.5 GB/s.
   - On one thread per core the decode step gained 5 ms (13%), and it is now faster there than on every logical CPU (32.5 against 34.2 ms). On every logical CPU it did not change: two hardware threads of a core share its line fill buffers, which the prefetches now keep busy from one thread. The prefill still prefers every logical CPU (46.1 against 52.5 ms).
-- [ ] 7.8 A decode pool of its own: `MAGNETAR_CPU_DECODE_THREADS=N` runs one-row Kernels (dense and packed products, gated sums, attention over one query) on N threads, Kernels of several rows on the main pool (test: `one_row_kernels_run_on_the_decode_pool`; providers/cpu c2967a3). The CPU benchmark measures it on one thread per physical core (step "Magnetar decoding on one thread per physical core"). Whether it becomes the default on hosts with two threads per core is decided on a Zen 4 sample.
+  Second sample: run 45435917000, Intel Xeon Platinum 8573C, 2 cores × 2 threads, Magnetar cb71986, providers/cpu c2967a3. The same 16 tokens.
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar, 4 threads (default) | 620 ms | 49.9 ms | 37.9 ms |
+  | Magnetar, 2 threads (one per core) | — | 56.8 ms | 39.9 ms |
+  | Magnetar, decode on 2 threads, prefill on 4 | — | 51.9 ms | 39.8 ms |
+  | llama-server (FP16 GGUF) | 720 ms | — | 43.7 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached) | 790 ms | — | 46.4 ms |
+
+  - On this host every logical CPU decodes faster (37.9 against 39.8 ms), unlike the Xeon 6975P-C: the better thread count for the decode step depends on the CPU model.
+  - Streamed alone, its kernels reach 30.1 GB/s (gate/up) and 29.3 GB/s (down), below the Xeon 6 hosts.
+
+- [ ] 7.8 A decode pool of its own: `MAGNETAR_CPU_DECODE_THREADS=N` runs one-row Kernels (dense and packed products, gated sums, attention over one query) on N threads, Kernels of several rows on the main pool (test: `one_row_kernels_run_on_the_decode_pool`; providers/cpu c2967a3). The CPU benchmark measures it on one thread per physical core (step "Magnetar decoding on one thread per physical core"). Whether it becomes the default on hosts with two threads per core is decided on a Zen 4 sample. First samples disagree: one thread per core decoded faster on the Xeon 6975P-C (32.5 against 34.2 ms), slower on the Xeon Platinum 8573C (39.8 against 37.9 ms).
 - [x] 7.9 Small Kernels in a replayed step (rmsnorm, rope, kv-write, attention: about 170 calls per token, 9-11 us each for 896 values, about 1.8 ms per token). Timed in the model, an rmsnorm call split into its input copy (1.6 us), its weight copy (2.0), the arithmetic (2.0) and the output store with its result (2.6); a rope call computed `sin_cos` per head (448 times for a 14-head query row).
   - rope computes a row's rotations once for every head; rmsnorm and rope read their inputs where they are stored; an output keeps its slot's key; a replay builds no `KernelResult` (providers/cpu 3b22bd5). The same values and tokens.
   - Result: rope 10 -> 9 us, rmsnorm unchanged at 9-10 us. The copies' cost moved into cache misses: the input was just written by other cores' pool tasks, the norm weight last read a step ago. What remains is memory latency on the step's critical path, not instructions.
