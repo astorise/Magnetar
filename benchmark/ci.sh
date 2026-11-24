@@ -65,7 +65,10 @@ case "$BENCH_ENGINE" in
     git clone --no-tags https://github.com/ggml-org/llama.cpp.git "$work/llama.cpp"
     git -C "$work/llama.cpp" checkout --detach "${BENCH_ENGINE_REF:-bafa0420c1e57edf04d71587d32fe57d45df7b95}"
     engine_revision=$(git -C "$work/llama.cpp" rev-parse HEAD)
-    cmake_args=(-DCMAKE_BUILD_TYPE=Release)
+    # No web UI: the benchmark never serves it, and fetching its prebuilt
+    # assets from a Hugging Face bucket at build time can fail (run
+    # 44516315731: the pinned release's assets were missing).
+    cmake_args=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF)
     if [[ "$BENCH_DEVICE" == gpu ]]; then cmake_args+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native); fi
     cmake -S "$work/llama.cpp" -B "$work/llama.cpp/build" "${cmake_args[@]}"
     target=llama-completion
