@@ -146,3 +146,15 @@ Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally,
 - [x] 7.5 Bias and residual sums in place; a block scan for greedy selection, its block maximum in sixteen lanes (264 to 47.5 us for the 151,936 logits; test: `greedy_columns_match_a_one_by_one_scan`); borrowed invocations at replay.
 - [x] 7.6 Locally, 8 interleaved runs of a 64-token profile per version: TPOT median 37.6 ms before, 34.3 ms after (paired difference -3.9 ms on average), with the same tokens (providers/cpu 2e523a4).
 - [ ] 7.7 The CPU benchmark on the runners, Zen 4 first: Magnetar against llama-server and Ollama per token.
+
+  First sample: run 45406355532, Intel Xeon 6975P-C (AMX), 2 cores × 2 threads, Magnetar d16a71c, providers/cpu 2e523a4, against run 45387956437 on the same CPU model (providers/cpu 03706fb). The same 16 tokens.
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar, 4 threads (default) | 565 → 559 ms | 49.6 → 46.1 ms | 34.3 → 34.2 ms |
+  | Magnetar, 2 threads (one per core) | — | 57.0 → 52.5 ms | 37.5 → 32.5 ms |
+  | llama-server (FP16 GGUF) | 748 ms | — | 45.0 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached) | 741 ms | — | 43.3 ms |
+
+  - Streamed alone, the `[896, 896]` input-major product (query and o projections) went from 24.2 to 31.1 GB/s, the gate/up projection from 34.8 to 36.5 GB/s.
+  - On one thread per core the decode step gained 5 ms (13%), and it is now faster there than on every logical CPU (32.5 against 34.2 ms). On every logical CPU it did not change: two hardware threads of a core share its line fill buffers, which the prefetches now keep busy from one thread. The prefill still prefers every logical CPU (46.1 against 52.5 ms).
