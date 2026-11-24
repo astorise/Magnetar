@@ -62,7 +62,9 @@
   | 2e5e7f0 (after the merge) | 20b34ce | 95 ms | 48.2 ms |
   | dab7c3f (section 4) | 3c01cf3 | 87.3 ms | 38.3 ms |
 
-  Step capture still replays: with `MAGNETAR_CPU_STEP_CAPTURE=0` the last row becomes TTFT 110.6 ms and TPOT 49.8 ms. The runner's regression may be specific to Zen 4, in the several-row (prefill) kernels that section 4's orientation routes the down, k and v projections through. Section 5 replaces those kernels. The next campaign tells whether the runner's TTFT comes back.
+  Step capture still replays: with `MAGNETAR_CPU_STEP_CAPTURE=0` the last row becomes TTFT 110.6 ms and TPOT 49.8 ms. The runner's regression may be specific to Zen 4, in the several-row (prefill) kernels that section 4's orientation routes the down, k and v projections through. Section 5 replaces those kernels.
+
+  Resolved: on the same CPU model with the section 5 and 6 kernels (run 45387558163, EPYC 9V74, providers/cpu 03706fb), the five measured requests' TTFT are 46.3-47.4 ms, back below the 48.2 ms of run 44529384440.
 
 ## 5. Register-tiled prefill kernels
 
@@ -103,4 +105,18 @@
   - All engines in one job, the same tokens:
     - Magnetar: 637 ms per request; TTFT 80.2 ms and 36.8 ms per token on 4 threads, 60.7 ms and 40.7 ms on one thread per core;
     - llama-server: 790 ms per request, 47.7 ms per token.
-  - Ollama ran on the CPU (its log: `library=cpu`, no usable GPU) but reported its whole model in `size_vram`, which the benchmark adapter reads as GPU placement. Its cell failed, as on run 45382158317.
+  - Ollama ran on the CPU (its log: `library=cpu`, no usable GPU) but reported its whole model in `size_vram`, which the benchmark adapter reads as GPU placement. Its cell failed, as on run 45382158317. The adapter now accepts that on the CPU cell only when the server discovered the CPU alone (`--server-log`).
+
+  Second sample, Zen 4: run 45387558163, AMD EPYC 9V74, 2 cores × 2 threads, providers/cpu 03706fb.
+  - The stored orientations stream at 36.4 GB/s (gate/up) and 36.1 GB/s (down), against 29-30 GB/s for the other layouts. AVX2 equals AVX-512 again.
+  - No kernel choice needs to depend on the CPU model so far: on both hosts the one-row step is bound by memory, and the stored orientations are the faster ones.
+  - All engines in one job, the same tokens:
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar `cpu-native`, 4 threads (default) | 557 ms | 46.3-47.4 ms | 34.0 ms |
+  | Magnetar `cpu-native`, 2 threads (one per core) | — | 48.3 ms | 34.6 ms |
+  | llama-server (FP16 GGUF) | 559 ms | — | 33.9 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached, `n_threads = 2`) | 503 ms | — | 29.3 ms |
+
+  Magnetar matches llama-server per request on this host. Ollama's decode is about 4.7 ms per token faster: its kernels reach about 34 GB/s on the model, against Magnetar's 29.
