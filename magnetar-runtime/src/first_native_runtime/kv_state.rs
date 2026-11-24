@@ -205,7 +205,7 @@ pub(super) fn promote_pending_kv_layer(
         "k",
         &pending.k,
     )?;
-    let v = promote_pending_kv_layer_role(
+    let v = match promote_pending_kv_layer_role(
         runtime,
         executor,
         provider_binding,
@@ -213,7 +213,16 @@ pub(super) fn promote_pending_kv_layer(
         layer,
         "v",
         &pending.v,
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            // K was copied under a new identity, but the pair is not yet in
+            // the transaction's promoted list. Release it here so aborting a
+            // later V failure cannot leak that uncommitted allocation.
+            release_pending_kv_resource(runtime, executor, &k.0);
+            return Err(error);
+        }
+    };
     Ok(KvLayerResourceBinding {
         k: k.0,
         v: v.0,
@@ -419,7 +428,7 @@ impl E2eRuntimeModelExecutionEngine {
                 }
             }
         }
-        execute_first_native_graph_materializing(
+        execute_first_native_graph_namespaced(
             runtime,
             &self.fixture,
             model_instance,
@@ -433,6 +442,8 @@ impl E2eRuntimeModelExecutionEngine {
             MaterializedEdges::Only(&["logits"]),
             Some(&graphs.decode_memo),
             kv_stores,
+            None,
+            true,
         )
         .map(|output| (output, None))
     }
@@ -679,6 +690,7 @@ impl E2eRuntimeModelExecutionEngine {
             Some(step.memo),
             kv_stores,
             step.resource_namespace,
+            false,
         );
         let end_clock = runtime.phase_ledger().clock();
         let captured = match executed {

@@ -580,6 +580,418 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        name @ ("mamba2-mixer" | "gated-delta-mixer") => {
+            let valid_inputs = if name == "mamba2-mixer" {
+                (10..=13).contains(&inputs.len())
+            } else {
+                inputs.len() == 13
+            };
+            if !valid_inputs || node.outputs.len() != 3 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has invalid {name} arity"),
+                });
+            }
+            if let Some(graph) = ctx.graph.as_ref() {
+                for (index, edge_id) in node.outputs.iter().enumerate() {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != inputs[index].shape() {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' output {index} has the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let second: OutputTarget = (
+                ctx.edge_resource(node.outputs[1].as_str()),
+                resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                ctx.output_owner(kv_cache_id),
+            );
+            let third: OutputTarget = (
+                ctx.edge_resource(node.outputs[2].as_str()),
+                resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                ctx.output_owner(kv_cache_id),
+            );
+            dispatch_three_output_mixer(
+                ctx,
+                node_id,
+                dispatch_operator_id(name, OperatorFamily::LinearAlgebra),
+                inputs,
+                [output_target, second, third],
+                node.attributes.clone(),
+            )
+        }
+        "mamba3-mimo" => {
+            if inputs.len() != 18 || node.outputs.len() != 5 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 18 inputs and 5 outputs"),
+                });
+            }
+            if let Some(graph) = ctx.graph.as_ref() {
+                for (edge_id, input_index) in node.outputs.iter().zip([2, 8, 9, 10, 11]) {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != inputs[input_index].shape() {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' has an output with the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let target = |index: usize| -> OutputTarget {
+                (
+                    ctx.edge_resource(node.outputs[index].as_str()),
+                    resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                    ctx.output_owner(kv_cache_id),
+                )
+            };
+            let targets = [output_target, target(1), target(2), target(3), target(4)];
+            dispatch_mamba3_mimo(ctx, node_id, inputs, targets, node.attributes.clone())
+        }
+        "mamba3-mixer" => {
+            if inputs.len() != 16 || node.outputs.len() != 5 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 16 inputs and 5 outputs"),
+                });
+            }
+            let config = crate::operator_semantics::mamba3_mixer_from_attributes(&node.attributes)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let [tokens, hidden] = inputs[0].shape() else {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects rank-two hidden states"),
+                });
+            };
+            let width = config
+                .geometry
+                .heads
+                .checked_mul(config.geometry.head_dim)
+                .and_then(|width| u64::try_from(width).ok())
+                .filter(|&width| hidden.checked_mul(2) == Some(width) && *tokens > 0 && *hidden > 0)
+                .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has invalid hidden geometry"),
+                })?;
+            let output_shape = [*tokens, width];
+            if let Some(graph) = ctx.graph.as_ref() {
+                let expected: [&[u64]; 5] = [
+                    &output_shape,
+                    inputs[1].shape(),
+                    inputs[2].shape(),
+                    inputs[3].shape(),
+                    inputs[4].shape(),
+                ];
+                for (edge_id, shape) in node.outputs.iter().zip(expected) {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != shape {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' has an output with the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let target = |index: usize| -> OutputTarget {
+                (
+                    ctx.edge_resource(node.outputs[index].as_str()),
+                    resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                    ctx.output_owner(kv_cache_id),
+                )
+            };
+            let targets = [output_target, target(1), target(2), target(3), target(4)];
+            dispatch_mamba3_mixer(
+                ctx,
+                node_id,
+                inputs,
+                targets,
+                node.attributes.clone(),
+                output_shape,
+            )
+        }
+        "projected-differential-attention" => {
+            if inputs.len() != 17 || node.outputs.len() != 5 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 17 inputs and 5 outputs"),
+                });
+            }
+            let config =
+                crate::operator_semantics::projected_differential_attention_from_attributes(
+                    &node.attributes,
+                )
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let [tokens, _hidden] = inputs[0].shape() else {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects rank-two hidden states"),
+                });
+            };
+            let total = u64::try_from(config.past_length)
+                .ok()
+                .and_then(|n| n.checked_add(*tokens))
+                .filter(|&n| n > 0 && *tokens > 0)
+                .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has an invalid sequence length"),
+                })?;
+            let output_shape = [
+                *tokens,
+                (config.query_heads - config.kv_heads) as u64,
+                config.head_dim as u64,
+            ];
+            let history_shape = [total, config.kv_heads as u64, config.head_dim as u64];
+            if let Some(graph) = ctx.graph.as_ref() {
+                let shapes: [&[u64]; 5] = [
+                    &output_shape,
+                    inputs[1].shape(),
+                    inputs[2].shape(),
+                    &history_shape,
+                    &history_shape,
+                ];
+                for (edge_id, shape) in node.outputs.iter().zip(shapes) {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != shape {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' has an output with the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let target = |index: usize| -> OutputTarget {
+                (
+                    ctx.edge_resource(node.outputs[index].as_str()),
+                    resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                    ctx.output_owner(kv_cache_id),
+                )
+            };
+            let targets = [output_target, target(1), target(2), target(3), target(4)];
+            dispatch_projected_differential_attention(
+                ctx,
+                node_id,
+                inputs,
+                targets,
+                node.attributes.clone(),
+                output_shape,
+                history_shape,
+            )
+        }
+        "token-shift" => {
+            if inputs.len() != 4 || node.outputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 4 inputs and 2 outputs"),
+                });
+            }
+            if let Some(graph) = ctx.graph.as_ref() {
+                for (edge_id, input_index) in node.outputs.iter().zip([0, 3]) {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if edge.descriptor.shape.dimensions != inputs[input_index].shape() {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' has an output with the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let state_target = (
+                ctx.edge_resource(node.outputs[1].as_str()),
+                resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                ctx.output_owner(kv_cache_id),
+            );
+            dispatch_token_shift(
+                ctx,
+                node_id,
+                inputs,
+                [output_target, state_target],
+                node.attributes.clone(),
+            )
+        }
+        "affine-layernorm" => {
+            if !(2..=3).contains(&inputs.len()) {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' expects input, scale and optional bias"
+                    ),
+                });
+            }
+            let shape = inputs[0].shape().to_vec();
+            if let Some(graph) = ctx.graph.as_ref()
+                && graph
+                    .graph()
+                    .edges
+                    .get(&node.outputs[0])
+                    .is_none_or(|edge| edge.descriptor.shape.dimensions != shape)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' has an invalid affine-layernorm output shape"
+                    ),
+                });
+            }
+            let resources = inputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| node_input_resource(node_id, &format!("input{index}"), value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("affine-layernorm", OperatorFamily::Normalization),
+                resources,
+                f32_tensor_descriptor_from_shape(&shape),
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "slice-last" => {
+            if inputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects one slice input"),
+                });
+            }
+            let input = inputs.remove(0);
+            let (rows, columns) = input.rows_cols()?;
+            let (start, width) = crate::operator_semantics::slice_last_attributes(&node.attributes)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            if rows == 0 || start.checked_add(width).is_none_or(|end| end > columns) {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has an invalid slice range"),
+                });
+            }
+            let shape = [rows, width];
+            if let Some(graph) = ctx.graph.as_ref()
+                && graph
+                    .graph()
+                    .edges
+                    .get(&node.outputs[0])
+                    .is_none_or(|edge| edge.descriptor.shape.dimensions != shape)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has an invalid slice output shape"),
+                });
+            }
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("slice-last", OperatorFamily::Tensor),
+                vec![node_input_resource(node_id, "input", input)],
+                f32_tensor_descriptor_from_shape(&shape),
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "differential-attention" => {
+            if inputs.len() != 4 || node.outputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects q, k, v and lambda logits"),
+                });
+            }
+            crate::operator_semantics::differential_attention_from_attributes(&node.attributes)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let ([tokens, query_heads, width], [keys, kv_heads, key_width]) =
+                (inputs[0].shape(), inputs[1].shape())
+            else {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects rank-three q and k"),
+                });
+            };
+            if *tokens == 0
+                || *keys < *tokens
+                || *kv_heads == 0
+                || *width == 0
+                || *key_width != *width
+                || query_heads / kv_heads < 2
+                || !query_heads.is_multiple_of(*kv_heads)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' has invalid differential attention geometry"
+                    ),
+                });
+            }
+            let shape = [*tokens, query_heads - kv_heads, *width];
+            if let Some(graph) = ctx.graph.as_ref()
+                && graph
+                    .graph()
+                    .edges
+                    .get(&node.outputs[0])
+                    .is_none_or(|edge| edge.descriptor.shape.dimensions != shape)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' has an invalid differential attention output shape"
+                    ),
+                });
+            }
+            let resources = inputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| node_input_resource(node_id, &format!("input{index}"), value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("differential-attention", OperatorFamily::Attention),
+                resources,
+                f32_tensor_descriptor_from_shape(&shape),
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "encoder-attention" => {
+            if inputs.len() != 4 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects q, k, v and a key mask"),
+                });
+            }
+            let output_descriptor = f32_tensor_descriptor_from_shape(inputs[0].shape());
+            let resources = ["q", "k", "v", "key_mask"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("encoder-attention", OperatorFamily::Attention),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "attention" => {
             // Five inputs: latent K and V and their key and value
             // projections (`latent_kv_width`, `chunk-latent-prefills`).
@@ -613,17 +1025,73 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
-        "moe-experts" => {
-            // A sixth input scales each expert's output
-            // (`dispatch-layered-model-forms`).
-            if !(5..=6).contains(&inputs.len()) {
+        "geodesic-residual" => {
+            if inputs.len() != 4 {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 5 or 6 moe-experts inputs"),
+                    reason: format!("graph node '{node_id}' expects 4 geodesic-residual inputs"),
+                });
+            }
+            let output_descriptor = f32_tensor_descriptor_from_shape(inputs[0].shape());
+            let resources = ["residual", "branch", "scale", "bias"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("geodesic-residual", OperatorFamily::Tensor),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "moe-experts" => {
+            // The sigmoid form adds a selection bias before the optional
+            // per-expert scale. The baseline sixth input remains the scale.
+            let sigmoid_form = matches!(
+                node.attributes.get("routing_scoring"),
+                Some(OperatorAttributeValue::String(scoring)) if scoring == "sigmoid"
+            );
+            let ungated = matches!(
+                node.attributes.get("activation"),
+                Some(OperatorAttributeValue::String(name)) if name == "relu_squared"
+            );
+            if ungated && !sigmoid_form {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' requires sigmoid routing for ungated relu_squared experts"
+                    ),
+                });
+            }
+            let valid_inputs = if ungated {
+                5..=6
+            } else if sigmoid_form {
+                6..=7
+            } else {
+                5..=6
+            };
+            if !valid_inputs.contains(&inputs.len()) {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' has the wrong number of moe-experts inputs"
+                    ),
                 });
             }
             let (rows, cols) = inputs[0].rows_cols()?;
             let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, cols]);
-            let resources = ["h", "logits", "gate", "up", "down", "per_expert_scale"]
+            let mut roles = vec!["h", "logits", "gate"];
+            if !ungated {
+                roles.push("up");
+            }
+            roles.push("down");
+            if sigmoid_form {
+                roles.push("selection_bias");
+            }
+            roles.push("per_expert_scale");
+            let resources = roles
                 .into_iter()
                 .zip(inputs)
                 .map(|(role, value)| node_input_resource(node_id, role, value))
@@ -718,7 +1186,7 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
-        "gelu" => {
+        "gelu" | "gelu-exact" => {
             if inputs.len() != 1 {
                 return Err(InferenceApiError::GraphPlanningFailed {
                     reason: format!("graph node '{node_id}' expects 1 gelu input"),
@@ -729,7 +1197,7 @@ pub(super) fn dispatch_first_native_graph_node(
             dispatch_qwen_unary(
                 ctx,
                 node_id,
-                "gelu",
+                node.operator.name(),
                 OperatorFamily::Activation,
                 input,
                 node.attributes.clone(),
@@ -986,6 +1454,7 @@ pub(super) fn execute_first_native_graph_materializing(
         memo,
         kv_stores,
         None,
+        false,
     )
 }
 
@@ -1008,6 +1477,7 @@ pub(super) fn execute_first_native_graph_namespaced(
     memo: Option<&GraphExecutionMemo>,
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
+    cleanup_on_failure: bool,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
@@ -1025,6 +1495,7 @@ pub(super) fn execute_first_native_graph_namespaced(
         memo,
         kv_stores,
         resource_namespace,
+        cleanup_on_failure,
     )
 }
 
@@ -1088,6 +1559,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     memo: Option<&GraphExecutionMemo>,
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
+    cleanup_on_failure: bool,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
@@ -1145,7 +1617,10 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     // concurrent execution. Walking the graph is delegated to a helper
     // (rather than continuing inline) purely for readability now, not to
     // manage a restore point.
-    let (dispatch, bindings, layer_kv) = execute_first_native_graph_nodes(
+    let event_start = node_events.len();
+    let cleanup_failed_resources = cleanup_on_failure && resource_namespace.is_none();
+    let mut written_resources = Vec::new();
+    let result = execute_first_native_graph_nodes(
         order,
         runtime,
         fixture,
@@ -1162,7 +1637,23 @@ pub(super) fn execute_first_native_graph_with_resident_input(
         materialized,
         kv_stores,
         resource_namespace,
-    )?;
+        cleanup_failed_resources.then_some(&mut written_resources),
+    );
+    if result.is_err() && cleanup_failed_resources {
+        // Only resources actually uploaded or produced by this invocation
+        // are eligible: resident inputs and weights belong to the caller.
+        // Namespaced replay buffers have a separate lifecycle and may be
+        // shared with a recording, so they stay with that namespace.
+        let produced = node_events[event_start..]
+            .iter()
+            .filter(|event| event.kind == InferenceApiObservationKind::TensorResourceProduced)
+            .filter_map(|event| event.resource.clone());
+        let resources: BTreeSet<_> = written_resources.into_iter().chain(produced).collect();
+        for resource in resources {
+            release_pending_kv_resource(runtime, &executor, &resource);
+        }
+    }
+    let (dispatch, bindings, layer_kv) = result?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
 
@@ -1184,8 +1675,21 @@ pub(super) fn execute_first_native_graph_nodes(
     materialized: MaterializedEdges<'_>,
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
+    mut written_resources: Option<&mut Vec<TensorResourceId>>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
+    // Recurrent edges are validated by the graph contract, but this executor
+    // does not yet own their transactional session lifecycle. Never treat them
+    // as ordinary inputs/outputs or KV history in the meantime.
+    if graph
+        .edges
+        .values()
+        .any(|edge| edge.recurrent_state.is_some())
+    {
+        return Err(InferenceApiError::KernelUnavailable {
+            reason: "recurrent state lifecycle is not implemented by this executor".into(),
+        });
+    }
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph
@@ -1259,6 +1763,9 @@ pub(super) fn execute_first_native_graph_nodes(
                     }
                 }
             })?;
+        if let Some(written) = written_resources.as_mut() {
+            written.push(resource_id.clone());
+        }
         bindings.insert(edge_id, (resource_id, shape));
     }
     dispatch_ctx
@@ -1341,14 +1848,26 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "gated-matmul"
                 | "silu-mul"
                 | "moe-experts"
+                | "mamba2-mixer"
+                | "gated-delta-mixer"
+                | "mamba3-mimo"
+                | "mamba3-mixer"
+                | "token-shift"
+                | "differential-attention"
+                | "projected-differential-attention"
+                | "affine-layernorm"
+                | "slice-last"
                 | "row-scale"
                 | "activation"
                 | "attention"
+                | "encoder-attention"
                 | "gelu"
+                | "gelu-exact"
                 | "silu"
                 | "add"
                 | "mul"
                 | "residual-add"
+                | "geodesic-residual"
                 | "embedding"
                 | "rmsnorm"
                 | "rope"
@@ -1407,6 +1926,36 @@ pub(super) fn execute_first_native_graph_nodes(
             && last_row_heads.contains(node_id)
         {
             last_row_only(&*dispatch_ctx.provider, &mut inputs[0], row)?;
+        }
+        // Host-visible inputs lose their source resource IDs when converted
+        // to NodeValue::Host. Check the original graph bindings before
+        // admitting these pure operators' outputs, so an edge-derived ID
+        // cannot overwrite a live graph input, intermediate or model weight.
+        if matches!(
+            node.operator.name(),
+            "mamba2-mixer"
+                | "gated-delta-mixer"
+                | "mamba3-mimo"
+                | "mamba3-mixer"
+                | "token-shift"
+                | "differential-attention"
+                | "projected-differential-attention"
+                | "affine-layernorm"
+                | "gelu-exact"
+                | "slice-last"
+        ) {
+            for edge_id in &node.outputs {
+                let output_id = dispatch_ctx.edge_resource(edge_id.as_str());
+                if bindings.values().any(|(id, _)| id == &output_id)
+                    || weight_bindings.values().any(|id| id == &output_id)
+                {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' output aliases a live tensor resource"
+                        ),
+                    });
+                }
+            }
         }
         dispatch_ctx
             .runtime
@@ -1914,6 +2463,9 @@ pub(super) fn execute_first_native_graph_nodes(
                         }
                     }
                 })?;
+                if let Some(written) = written_resources.as_mut() {
+                    written.push(output_resource_id.clone());
+                }
                 dispatch_ctx.runtime.phase_ledger_mut().record_operator(
                     edge_clock,
                     StepPhase::EdgeWrite,
@@ -2164,4 +2716,22 @@ pub(super) fn materialize_first_native_graph_bindings(
 }
 
 #[cfg(test)]
+mod differential_attention_tests;
+#[cfg(test)]
+mod encoder_ops_tests;
+#[cfg(test)]
+mod gated_delta_mixer_tests;
+#[cfg(test)]
+mod mamba2_tests;
+#[cfg(test)]
+mod mamba3_mixer_tests;
+#[cfg(test)]
+mod mamba3_tests;
+#[cfg(test)]
+mod modernbert_graph_tests;
+#[cfg(test)]
+mod projected_differential_attention_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod token_shift_tests;

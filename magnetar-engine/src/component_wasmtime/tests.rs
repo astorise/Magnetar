@@ -29,6 +29,11 @@ const BOUNDED_LOOP_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/bounded-loop.component.wat");
 const QWEN_GRAPH_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/qwen-graph.component.wat");
+const RECURRENT_STATE_COMPONENT: &[u8] =
+    include_bytes!("../../../magnetar-runtime/fixtures/components/recurrent-state.component.wasm");
+const LEGACY_RECURRENT_STATE_COMPONENT: &[u8] = include_bytes!(
+    "../../../magnetar-runtime/fixtures/components/recurrent-state-legacy.component.wasm"
+);
 const CAPABILITY_ECHO_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/capability-echo.component.wat");
 /// The first real, minimal Qwen Model Component (task 11.4,
@@ -47,6 +52,9 @@ const LAYER_LAYOUT_PROBE_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/layer-layout-probe.component.wat");
 const LATENT_ATTENTION_PROBE_COMPONENT: &str = include_str!(
     "../../../magnetar-runtime/fixtures/components/latent-attention-probe.component.wat"
+);
+const EXPERT_NORMALIZATION_PROBE_COMPONENT: &str = include_str!(
+    "../../../magnetar-runtime/fixtures/components/expert-normalization-probe.component.wat"
 );
 /// Imports `model-config@1.4.0`'s `rope-scaling`, whose variant has only the
 /// `banded` case, and returns the scaling's case (`run`).
@@ -341,13 +349,13 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
     let model_config_capability = Arc::new(crate::ModelConfigCapability::new());
     let mut engine = WasmtimeComponentEngine::new().unwrap();
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.5.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.8.0");
     engine.register_capability(
         graph_builder_interface.clone(),
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.5.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.8.0");
     engine.register_capability(
         model_config_interface.clone(),
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -355,7 +363,7 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
 
     let export_interface = WitInterface::new(
         "magnetar:model-component-graph/model-component-graph-producer",
-        "1.5.0",
+        "1.8.0",
     );
     let definition = ComponentDefinition {
         id: ComponentDefinitionId::new(200),
@@ -426,6 +434,8 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             rope_theta: 10_000.0,
             rope_scaling_factor: None,
             rope_frequency_scaling: None,
+            rope_layers: None,
+            hidden_activation: Some("silu".into()),
             tie_word_embeddings: true,
             attention_bias: false,
             mixture_of_experts: None,
@@ -500,6 +510,239 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
         crate::GraphKvCacheBehavior::Output
     );
 
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wasmtime_engine_builds_and_validates_recurrent_state_graphs() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-recurrent-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("recurrent.component.wasm");
+    std::fs::write(&artifact, RECURRENT_STATE_COMPONENT).unwrap();
+    let capability = Arc::new(crate::GraphBuilderCapability::new());
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.11.0");
+    engine.register_capability(
+        interface.clone(),
+        capability.clone() as Arc<dyn HostCapability>,
+    );
+    let export_interface = WitInterface::new(
+        "magnetar:model-component-graph/model-component-graph-producer",
+        "1.11.0",
+    );
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(205),
+        metadata: crate::ComponentMetadata::new("recurrent", "1", "state graph probe")
+            .with_import(interface.clone())
+            .with_export(export_interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+    let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+    for (export, argument, expected_phase) in [
+        (
+            "build-prefill-graph",
+            1,
+            crate::ExecutionGraphPhase::Prefill,
+        ),
+        ("build-decode-graph", 3, crate::ExecutionGraphPhase::Decode),
+    ] {
+        capability.prepare_session(
+            instance.engine_key(),
+            crate::graph_builder_capability::SessionContext {
+                component_id: "recurrent".into(),
+                compatibility_key: "model-v1".into(),
+                kv_namespace: "probe".into(),
+                weight_shapes: BTreeMap::new(),
+                output_edge_name: "logits".into(),
+            },
+        );
+        let result = engine
+            .invoke(
+                &instance,
+                &ComponentInvocation::new(
+                    crate::ComponentInstanceId::new(205),
+                    export_interface.clone(),
+                    export,
+                )
+                .with_arguments(vec![ComponentValue::S64(argument)]),
+            )
+            .unwrap();
+        let [ComponentValue::String(handle)] = result.values.as_slice() else {
+            panic!("expected graph handle")
+        };
+        let graph = capability
+            .take_graph(instance.engine_key(), handle)
+            .unwrap();
+        assert_eq!(graph.phase, expected_phase);
+        graph.validate(&crate::default_graph_catalog()).unwrap();
+        let state: Vec<_> = graph
+            .edges
+            .values()
+            .filter_map(|edge| edge.recurrent_state.as_ref())
+            .collect();
+        assert_eq!(state.len(), 2);
+        assert!(state.iter().all(|metadata| metadata.layer == 2
+            && metadata.slot == "conv"
+            && metadata.compatibility_key == "model-v1"));
+        assert_ne!(state[0].behavior, state[1].behavior);
+        let split = &graph.nodes[&crate::ExecutionNodeId::new("split")];
+        assert_eq!(split.outputs.len(), 2);
+        assert_ne!(split.outputs[0], split.outputs[1]);
+        assert!(matches!(
+            crate::plan_execution_graph(
+                &graph,
+                &crate::default_graph_catalog(),
+                &crate::GraphPlanningPolicy::default(),
+                None
+            ),
+            Err(crate::GraphError::ProviderCapabilityUnavailable(_))
+        ));
+    }
+    capability.prepare_session(
+        instance.engine_key(),
+        crate::graph_builder_capability::SessionContext {
+            component_id: "recurrent".into(),
+            compatibility_key: "model-v1".into(),
+            kv_namespace: "probe".into(),
+            weight_shapes: BTreeMap::new(),
+            output_edge_name: "logits".into(),
+        },
+    );
+    let result = engine
+        .invoke(
+            &instance,
+            &ComponentInvocation::new(
+                crate::ComponentInstanceId::new(205),
+                export_interface,
+                "build-prefill-graph-segment",
+            )
+            .with_arguments(vec![
+                ComponentValue::S64(2),
+                ComponentValue::U32(0),
+                ComponentValue::U32(1),
+            ]),
+        )
+        .unwrap();
+    let [ComponentValue::String(handle)] = result.values.as_slice() else {
+        panic!("expected graph handle")
+    };
+    let graph = capability
+        .take_graph(instance.engine_key(), handle)
+        .unwrap();
+    assert_eq!(
+        graph.nodes[&crate::ExecutionNodeId::new("split")]
+            .outputs
+            .len(),
+        2
+    );
+    assert!(
+        crate::plan_execution_graph(
+            &graph,
+            &crate::default_graph_catalog(),
+            &crate::GraphPlanningPolicy::default(),
+            None
+        )
+        .is_ok()
+    );
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn earlier_recurrent_component_links_after_multi_output_extension() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-recurrent-legacy-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("legacy.component.wasm");
+    std::fs::write(&artifact, LEGACY_RECURRENT_STATE_COMPONENT).unwrap();
+    let capability = Arc::new(crate::GraphBuilderCapability::new());
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.11.0");
+    engine.register_capability(
+        interface.clone(),
+        capability.clone() as Arc<dyn HostCapability>,
+    );
+    let export = WitInterface::new(
+        "magnetar:model-component-graph/model-component-graph-producer",
+        "1.11.0",
+    );
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(206),
+        metadata: crate::ComponentMetadata::new(
+            "recurrent-legacy",
+            "1",
+            "previous state graph probe",
+        )
+        .with_import(interface.clone())
+        .with_export(export.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link = ComponentLinkPlan::default();
+    link.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+    let instance = engine.instantiate(&prepared, &link).unwrap();
+    capability.prepare_session(
+        instance.engine_key(),
+        crate::graph_builder_capability::SessionContext {
+            component_id: "recurrent-legacy".into(),
+            compatibility_key: "model-v1".into(),
+            kv_namespace: "probe".into(),
+            weight_shapes: BTreeMap::new(),
+            output_edge_name: "logits".into(),
+        },
+    );
+    let result = engine
+        .invoke(
+            &instance,
+            &ComponentInvocation::new(
+                crate::ComponentInstanceId::new(206),
+                export,
+                "build-prefill-graph",
+            )
+            .with_arguments(vec![ComponentValue::S64(1)]),
+        )
+        .unwrap();
+    let [ComponentValue::String(handle)] = result.values.as_slice() else {
+        panic!("expected graph handle")
+    };
+    let graph = capability
+        .take_graph(instance.engine_key(), handle)
+        .unwrap();
+    assert_eq!(
+        graph
+            .edges
+            .values()
+            .filter(|edge| edge.recurrent_state.is_some())
+            .count(),
+        2
+    );
+    assert!(
+        !graph
+            .nodes
+            .contains_key(&crate::ExecutionNodeId::new("split"))
+    );
+    graph.validate(&crate::default_graph_catalog()).unwrap();
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -1533,6 +1776,36 @@ fn yarn_scaling() -> crate::RopeFrequencyScaling {
 }
 
 #[test]
+fn wasmtime_engine_lowers_expert_normalization_into_a_real_component() {
+    for (mode, expected) in [
+        (None, 0),
+        (Some(crate::ExpertNormalization::Never), 10),
+        (Some(crate::ExpertNormalization::MultipleExperts), 11),
+        (Some(crate::ExpertNormalization::Always), 12),
+    ] {
+        let config = crate::ModelArchitectureConfig {
+            expert_routing: Some(crate::ExpertRoutingConfig {
+                scoring: crate::ExpertScoring::Sigmoid,
+                groups: None,
+                routed_scaling_factor: 1.0,
+                selection_bias: true,
+                normalization: mode,
+                shared_expert_gated: false,
+            }),
+            ..Default::default()
+        };
+        let result = run_model_config_probe(
+            "expert-normalization-probe",
+            EXPERT_NORMALIZATION_PROBE_COMPONENT,
+            "1.10.0",
+            config,
+            &["run"],
+        );
+        assert_eq!(result, vec![Ok(expected)]);
+    }
+}
+
+#[test]
 fn wasmtime_engine_lowers_the_1_7_0_latent_attention_routing_and_yarn_into_a_real_component() {
     let u32_result = |value: u32| Ok::<u32, String>(value);
     let exports = ["mla", "layers", "routing", "rope"];
@@ -1560,6 +1833,7 @@ fn wasmtime_engine_lowers_the_1_7_0_latent_attention_routing_and_yarn_into_a_rea
             qk_nope_head_dim: 3,
             qk_rope_head_dim: 2,
             v_head_dim: 5,
+            norm_eps: None,
         }),
         moe_layers: Some(vec![false, true, true]),
         expert_routing: Some(crate::ExpertRoutingConfig {
@@ -1571,6 +1845,7 @@ fn wasmtime_engine_lowers_the_1_7_0_latent_attention_routing_and_yarn_into_a_rea
             }),
             routed_scaling_factor: 2.5,
             selection_bias: true,
+            normalization: None,
             shared_expert_gated: false,
         }),
         ..Default::default()
@@ -1659,3 +1934,4 @@ fn a_component_predating_yarn_cannot_receive_it() {
 }
 
 mod gemma_component_tests;
+mod smollm_component_tests;

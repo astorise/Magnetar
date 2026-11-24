@@ -85,9 +85,328 @@ Evidence (RTX 3060, GPU CI run 42186542821):
   - No Reference CPU or logit comparison yet. The checkpoint in f32 (about 5 GB) does not fit the runner next to the test.
   - The plain-text prompt is encoded without `<|begin_of_text|>`, the same `add_bos_token` gap as DeepSeek-R1-Distill.
 
+### Experimental Olala expert network and hybrid state
+
+At revision `b40f8165ee2254c18601220e19842600c6d91794`, Olala uses
+selection-biased sigmoid routing and an **ungated** expert network
+`W_out(relu(W_in(x))²)`, with optional routed input/output projections and a
+separate shared ReLU² MLP. The existing gated `silu(gate) * up` expert form
+cannot represent it. Extend portable `moe-experts@1` with
+`activation = "relu_squared"`: the explicitly selected sigmoid form takes
+`h`, logits, stacked `W_in`, stacked `W_out`, selection bias, and optionally
+per-expert scale. The ungated form requires a new `moe-relu-squared` Kernel
+feature as well as sigmoid routing and any other required feature; a Provider
+advertising the older generic activation feature alone is ineligible. Preserve
+the existing gated forms and input positions. The separate portable
+`activation@1` kind `relu_squared` requires its own
+`activation-relu-squared` Kernel feature. Other dtypes or Providers are not
+qualified by a CPU-only fixture.
+
+Selection uses sigmoid scores plus the learned bias, while expert mixture
+weights use unbiased scores. The `multiple` normalization mode divides by
+the selected-score sum plus `1e-20` only when more than one expert is used;
+the routed scaling factor is applied afterwards. Exact ties across a selection
+boundary are rejected because upstream does not specify their ordering.
+The portable routing tests cover top-1, top-2 and the published top-6 of 256,
+bias-driven selection changes, saturated scores, invalid values and ties.
+Synthetic Olala MoE-to-logit fixtures execute pinned upstream PyTorch classes;
+separately, tiny Kimi top-1/top-2 checkpoints exercise the same routing mode
+end to end through Hugging Face loading, a Component and both CPU Providers.
+Neither test qualifies Olala's full hybrid model or a GPU Provider.
+
+An Olala-side f32 reference covers the preprocessed Mamba-3 MIMO recurrence:
+rotary angles, the SSM, the previous rotated key and previous input are four
+separate state tensors. The pure step preserves prior state on error and
+accepts explicit grouped Q/K, MIMO projections, decay, dt and trap values.
+Synthetic tests compare every output and state with the pinned upstream
+PyTorch prefill and cached-step implementations, including chunk continuation
+and zero-state reset. This standalone reference does not implement the
+layer's learned projections or provide Runtime-managed state.
+
+The additive portable `mamba3-mimo@1` operator covers the same f32,
+single-sequence preprocessed recurrence without assuming a model family.
+Its 18 inputs are Q/K `[T,R,G,N]`, input/gate `[T,H,P]`, decay/dt/trap
+`[T,H]`, angle projection `[T,H,A]`, the four prior states (angle `[H,A]`,
+SSM `[H,P,N]`, key `[R,H,N]`, input `[H,P]`), Q/K biases `[R,H,N]`,
+three MIMO projections `[R,H,P]`, and skip `[H]`. Its five independent
+outputs are `[T,H,P]` and the four next states with matching shapes. Positive
+`H,G,R,P,N,A`, `H % G == 0`, even `N`, and `A <= N/2` are required; dt is
+positive, preprocessed decay nonpositive and trap in `[0,1]`. Inputs and
+outputs may not alias, every tensor must be finite, and unsupported dtypes,
+geometries or missing Kernel forms fail closed. This pure operator does not
+itself allocate, reset, commit or isolate a session's recurrent state.
+
+For the pinned single-group, biasless-projection Mamba-3 profile, the
+additive `mamba3-mixer@1` composes the learned input projections and Q/K
+RMS normalizations with that recurrence. It receives hidden states, four
+prior states, two input matrices, dt bias, two normalization weights, Q/K
+biases, three MIMO projections and the skip weight. It returns the flattened
+`[T,H*P]` activation and four next states. It requires `H*P = 2*hidden`,
+the upstream rotary fraction, positive epsilon and decay floor, and an
+explicit zero-centered normalization flag. More general grouping, optional
+projection forms, post-gate normalization or auxiliary linear branches are
+not assumed. As with `mamba3-mimo`, explicit state tensors do not establish
+Runtime-managed session state. The Operator catalog validates both forms'
+geometry, all input and output state shapes, bounded intermediate sizes and
+the projected mixer's numerical attributes before a graph is planned.
+The Olala library now plans this f32 invocation for all 29 Mamba-3 layers
+of the pinned mini configuration. Its eleven checkpoint names, shapes and
+storage dtypes match the verified Safetensors header; matrix transposition and
+the head/rank permutation are explicit after storage decoding. An opt-in test
+decodes the first layer's real BF16/F32 weights through Runtime's loader and
+compares the f32 mixer output and all four states with the pinned PyTorch
+class, using synthetic hidden states. This does not qualify BF16 arithmetic,
+full-model inference or state ownership in Runtime.
+
+The portable `token-shift@1` operator expresses the previous-token mixing
+used by the pinned Olala attention profile without equating it to KV history.
+Its f32 inputs are raw values `[T,H,D]`, gate logits `[T,H]`, explicit
+document-start flags `[T]` (exactly zero or one), and the previous raw token
+`[H,D]`. The first output is `sigmoid(logit) * previous + (1-sigmoid(logit))
+* current`; at a document start it is exactly the current value. The second
+output is the last **raw**, not mixed, token. Both are fresh allocations.
+This operator can be used independently for keys and values, but does not
+manage their session state, KV attention history or a full attention layer.
+
+The experimental `differential-attention@1` core accepts already-normalized
+and position-scaled queries `[T,Hq,D]`, key/value history `[S,Hkv,D]` and
+per-token mixing logits `[T,Hkv]`. `S >= T`, `Hq` is a multiple of `Hkv`, and
+each KV head groups one noise head after one or more signal heads. It applies
+causal attention with an explicit score scale, optional left-window and score
+softcap, then subtracts sigmoid-weighted noise from each associated signal.
+An explicit bfloat16-rounding flag models the upstream eager attention's Q/K/V
+and attention-output conversions; the contract never silently assumes that
+precision. This primitive does not project Q/K/V, update history, apply RoPE,
+or manage token-shift state and therefore does not qualify a full V block.
+
+For the pinned no-RoPE, biasless, Q/K-normalized and scalable-softmax profile,
+the `projected-differential-attention@1` composes Q and low-rank K/V
+projections, separate raw token shifts, Q/K RMS normalization, position scaling
+and differential attention. It takes hidden states, previous raw K/V, prior
+attention history (normalized K and shifted V), positions and eleven learned tensors, and returns the
+attention output, two next raw states and two updated histories. A zero past
+uses a single ignored history row because execution graphs require nonempty
+shapes; `past_length` explicitly states the number of valid rows. Positions
+must be contiguous from that length. A document reset is a new call with zero
+past and position zero, which suppresses any supplied prior raw state. Packed
+multi-document attention, RoPE, value embeddings, XSA and biased/CosNet
+projections are outside this profile and must not silently use it. These
+explicit tensors do not implement Runtime-managed recurrent or KV lifecycle.
+The Olala profile can reorder decoded f32 weights into this operator's
+layout. An opt-in integration test decodes the pinned checkpoint's first
+differential-attention layer and compares its f32 projections and explicit
+states with the upstream PyTorch class on synthetic hidden states, retaining
+the class's bfloat16 attention-boundary rounding. This is not a qualification
+of native BF16 projections or end-to-end hybrid inference.
+
+Hybrid recurrent state uses an additive graph Capability version, not KV
+aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
+`recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.
+The host issues identities; slot names are 1-64 ASCII letters, digits, `_` or
+`-`, and fixed, nonempty f32 shapes are capped at 67,108,864 elements. Graph
+validation requires one consumed input and one produced output per identity,
+with matching descriptor, layer, slot and compatibility key. State edges cannot
+alias or be KV/prefix edges. Fingerprints include state metadata and fusion
+cannot remove a state edge. A real Wasmtime Component tests both graph phases;
+older Components continue linking through their original versions. Planning and
+execution explicitly reject these graphs while lifecycle support is absent.
+Before a decoder graph pair is returned, the Runtime also checks that prefill
+and decode declare the same state identities, layers, slots, compatibility
+keys and tensor descriptors; mismatched phases, schemas or out-of-range layers
+are rejected. Segment graphs may only read or produce recurrent states in
+their own declared layer interval.
+The graph contract extracts each validated input/output binding and its logical
+layout in deterministic resource-id order. Cross-phase comparisons use the
+layout, since edge names are local to each graph. Extraction checks the
+recurrent boundary only and never replaces whole-graph validation; its logical
+identity is not a session, model instance, Provider or allocation identity.
+The existing first-native KV path retains the request's session, model,
+tokenizer metadata and prompt fingerprint with both pending and committed
+state. It checks them before decode, retry, commit or release, including when
+an abandoned cache has already been forgotten. A colliding request id alone
+does not authorize access to or cleanup of another request's state.
+KV compatibility validation also compares declared component architecture,
+model revision, tokenizer vocabulary size and attention implementation;
+an absent declaration does not match a present one.
+First-native generation records its Component identity and version together
+with the supplied artifact digest (or its built-in default marker), and the
+tokenizer vocabulary size. A changed Component cannot read or release an
+existing request's state solely by reusing the same request id.
+Each first-native KV generation also records its accepted token sequence.
+Decode and commit require the exact previously accepted sequence, while a
+second prefill cannot overwrite an existing committed generation. A rejected
+history leaves both the prior cache and any pending step intact. Token IDs are
+not printed by the state diagnostic representation.
+
+For the future execution path, initial state is zero; continuing calls read
+the last committed generation. State slots are keyed by session, model and
+component compatibility, layer, slot and dtype/shape, and never contain
+Provider handles in WIT. Outputs remain pending until the token/segment and
+all matching KV changes commit together. Failed dispatch, sampling,
+cancellation, incompatible shape/affinity or unsupported Provider features
+must leave the prior committed generation unchanged. State reset and document
+boundaries clear only the relevant sequence, while close/expiry releases all
+its leases after in-flight work completes. Multi-output graph production,
+old/new component linking, cross-segment isolation and completion-safe
+retirement need explicit tests before this experimental profile can run. The
+standalone Mamba-2 reference is evidence for numeric equations, not an
+implementation of this Runtime contract.
+
+Stateful scans naturally return their activation and several new state tensors
+from the same computation. The additive `graph-builder@1.11.0` also exposes
+`add-node-outputs` with the existing node identity, attributes and input list,
+plus a list of 1-16 output shapes and a returned edge for each output.
+Each output remains independently validated and may subsequently be bound to
+a recurrent slot; this form does not attach KV metadata. The old single-output
+`add-node` stays unchanged. Multi-output description alone does not enable
+recurrent execution or relax the unsupported behavior above.
+
+The initial experimental `mamba2-mixer@1` CPU operator is a pure function of
+one sequence and two explicit f32 state tensors. Inputs are `[T,H]` hidden
+states, `[C,K]` oldest-first convolution history, `[heads,head_dim,state_dim]`
+SSM state, `[H,P]` input projection, `[C,K]` depthwise convolution weights,
+`[heads]` dt bias, A-log and D, `[heads*head_dim]` gated-normalization weight,
+and `[heads*head_dim,H]` output projection. Boolean attributes explicitly
+declare an optional `[C]` convolution bias and optional `[P]`/`[H]` linear
+biases, appended in that order. `C = heads*head_dim + 2*groups*state_dim` and
+`P = heads*head_dim + C + heads`. Required attributes are integer `heads`,
+`head_dim`, `groups`, `state_dim`, `conv_kernel`, float `epsilon`, `dt_min`,
+and boolean `conv_bias`, `linear_bias`; optional float `dt_max` is finite when
+present and absent means unbounded. Epsilon is positive and the minimum dt is
+nonnegative. The three ordered outputs are `[T,H]` mixer output and
+same-shaped next convolution and SSM states. The CPU form follows the pinned
+Nemotron-H SiLU convolution, selective update and grouped gated RMS norm;
+Mamba-3 is a different operator. Invalid shapes, values, unsupported bias
+forms or missing Kernel support fail closed. Explicit state inputs/outputs are
+not Runtime-managed session state; graph-level recurrent execution stays
+disabled until the transactional lifecycle is implemented and tested.
+The Operator catalog validates state, weight and output shapes, bias-dependent
+arity and numerical attributes before a graph can be accepted for planning.
+
+The pinned Nano remote model source has a separate whole-model qualification
+ambiguity: `NemotronHBlock.forward` forwards `cache_position` to attention but
+does not pass its `cache_params` as `past_key_value` or forward the attention
+mask. Its Mamba call forwards `cache_params`, but not the Mamba mask. The
+attention implementation updates its cache only when `past_key_value` is
+supplied. `components/nemotron/tests/fixtures/check_nano_block_forwarding.py`
+executes the SHA-256-verified upstream block with spies to reproduce this
+wiring without weights or CUDA. The standalone Mamba-2 numerical fixtures do
+not settle whether a complete cached hybrid graph should match this source or
+the intended attention-history contract; neither is qualified by them.
+
+The Nemotron component also derives an invocation plan for the pinned Nano
+mixer geometry. Checkpoint tensor names, shapes and dtypes for all 23 Mamba
+layers were checked against 12 real Safetensors shard headers, including BF16 matrices and
+F32 A-log/D vectors. The source configuration's `time_step_min` and
+`time_step_max` initialize parameters; its default inference limit is zero to
+unbounded. This is a shape and conversion plan for the f32 operator, not
+checkpoint loading, BF16 numerical qualification or recurrent execution.
+
+### Experimental masked encoder attention
+
+ModernBERT's attention is bidirectional; its local window is symmetric and
+inclusive, unlike the decoder's causal window. Define a separate portable
+`encoder-attention@1` with f32 `q`, `k`, `v` of shape `[T, heads * head_dim]`
+and a `[T]` key-validity mask whose values are exactly 0 or 1. Output has the
+same shape as `q`; padded queries are still evaluated as upstream does, but
+only valid keys contribute. An optional nonnegative `local_radius` admits
+keys with `abs(query_index-key_index) <= local_radius`; absent means global.
+Every query must have at least one admitted key, otherwise fail explicitly.
+The optional finite positive `scale` defaults to `1/sqrt(head_dim)`. Position
+encoding is supplied by the Component before attention; this single-sequence
+form does not infer positions, concatenate documents or silently repurpose a
+decoder KV cache. ModernBERT's default position IDs are physical indices and
+its local radius is `local_attention / 2` at the pinned Transformers profile.
+This primitive does not by itself implement an encoder, padding-aware batching
+or Laya's learned decision head. Unsupported Providers do not advertise it.
+
+The f32 graph profile for an encoder also needs three additive, independently
+negotiated operators. `affine-layernorm@1` accepts `[T,H]` input, `[H]` scale
+and an optional trailing `[H]` bias, with a required positive finite `epsilon`;
+it returns `[T,H]` using population variance and f32 accumulation. The
+separate `gelu-exact@1` uses the erf form of GELU and preserves its input
+shape, avoiding the existing tanh-approximate `gelu@1` semantics. CPU
+implementations may numerically approximate erf but must match the independent
+f32 reference within the declared test tolerance; they must not substitute
+the distinct tanh GELU formula.
+`slice-last@1` accepts `[T,H]`, nonnegative integer `start`, and positive
+integer `width`, and returns `[T,width]` from the specified contiguous column
+range. All three reject malformed, non-finite or unsupported inputs, and no
+Provider advertises them without implementing their stated semantics. These
+operators enable exact graph construction; they do not themselves supply an
+encoder Component or a decision API.
+
+The additive `model-component-graph@1.12.0` contract introduces an explicit
+`encode` graph phase and a separate `encoder-component-graph-producer` world.
+Its `build-encoder-graph(sequence-length)` exports one single-sequence graph
+whose inputs are token IDs and a binary key mask, and whose output is the
+per-token hidden-state tensor. This is neither decoder prefill nor generation.
+An optional `model-config.encoder-config` supplies a finite positive LayerNorm
+epsilon, the maximum position count, independent normalization/attention/MLP
+bias flags and one ordered record per layer: its optional inclusive symmetric
+local radius, positive RoPE theta and whether attention normalization exists.
+Hidden/head/intermediate/vocabulary sizes still come from the existing
+architecture record. Components must read any declared encoder configuration;
+an older Component that cannot do so is rejected. Unbound, invalid, stale or
+incompatible configurations fail closed. The first profile uses physical
+zero-based positions and f32 tensors; arbitrary position IDs, batching,
+decision-head execution and checkpoint weight mapping remain separate work.
+The registered Component runtime can construct an encoder graph from an
+explicit architecture, encoder profile and caller-provided weight inventory;
+it checks input and output descriptors, requires both token IDs and the mask
+to be connected to the hidden-state output, and releases temporary Component
+state even on failure. This dataflow check cannot prove the numerical meaning
+of a mask; independent reference comparisons are still necessary. It does not
+yet load an encoder checkpoint or run inference.
+
+### Typed decision results
+
+The additive `magnetar:decision@1.0.0` types and their Rust counterpart
+represent one question without padded options. Each option has its raw
+finite score and probability in input order; the result distinguishes an
+option index, a finite numeric prediction and explicit abstention. An optional
+action distribution uses the checkpoint-declared order and does not imply an
+abstention threshold. Confidence, when supplied, is a statistic in `[0,1]`,
+not a calibration claim. Every present distribution must be nonempty, finite,
+nonnegative, at most one per entry, and sum to one within `1e-6`; an option
+prediction must be in range. Multiple questions can carry separate results
+with different option counts. This is a result contract, not a claim that
+the inference API can already load or execute a decision checkpoint.
+
+The standalone Laya f32 head can construct its parameters from decoded,
+named tensors after validating geometry, shapes and finite values. Its 35
+expected head tensors match the pinned checkpoint's F16 header. A separate
+opt-in test compares the real head weights, converted to f32, with the pinned
+PyTorch head using synthetic padded and variable-option encoder outputs. This
+does not decode the checkpoint in Runtime or qualify the real encoder, a BF16
+execution path, calibration, or an end-to-end decision request.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
+
+### Gated-delta mixer profile
+
+The experimental `gated-delta-mixer@1` is an additive, single-sequence f32
+operator. It takes hidden states [T,H], convolution history [C,K], recurrence
+[Vh,Kd,Vd], QKV/Z/A/B matrices, depthwise convolution weights, A_log, dt_bias,
+normalization weights, the output projection, and a 0/1 mask. Matrices use
+checkpoint order [output,input]; C is 2*Kh*Kd + Vh*Vd. It returns [T,H] and
+the two next states, without mutating its inputs. Required attributes declare
+Kh, Vh, Kd, Vd, K and epsilon; Vh must be a multiple of Kh. Only contiguous f32
+tensors and finite values are supported. Invalid geometry, masks, aliases and
+unsupported layouts fail before a result is published. Both CPU Providers
+advertise this optional operator; an unqualified Provider must decline it.
+The WIT graph-builder already transports operator identifiers and typed
+attributes, so no WIT version is changed by this addition.
+
+Synthetic fixtures compare the real CPU graph's prefill, chunked continuation,
+single-token steps, grouped heads, mask handling, output and both explicit
+states with independently executed pinned Transformers functions. The
+component's opt-in real-weight f32 test covers one verified base-checkpoint
+mixer separately. Neither test enables model graphs or Runtime-managed
+recurrent sessions; those remain explicitly rejected until lifecycle and
+atomic commit requirements are implemented.
 
 ### Compatibility and WIT evolution
 

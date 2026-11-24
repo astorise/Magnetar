@@ -2657,15 +2657,26 @@ impl ComponentManager {
             return Err(error);
         }
 
-        let distribution_dir = std::env::temp_dir().join(format!(
-            "magnetar-distributed-component-{}-{}",
-            computed.value.replace(':', "-"),
-            NEXT_DISTRIBUTED_PACKAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&distribution_dir).map_err(|source| ComponentError::Distribution {
-            category: ComponentDistributionErrorCategory::PolicyDenied,
-            message: source.to_string(),
-        })?;
+        // Independent Runtime processes may materialize the same digest at
+        // once. Never reuse another process's directory (or a stale one).
+        let distribution_dir = loop {
+            let candidate = std::env::temp_dir().join(format!(
+                "magnetar-distributed-component-{}-{}-{}",
+                computed.value.replace(':', "-"),
+                std::process::id(),
+                NEXT_DISTRIBUTED_PACKAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(ComponentError::Distribution {
+                        category: ComponentDistributionErrorCategory::PolicyDenied,
+                        message: source.to_string(),
+                    });
+                }
+            }
+        };
         let artifact_path = distribution_dir.join("component.wasm");
         let manifest_path = distribution_dir.join("component.wasm.magnetar-component.yaml");
         fs::write(&artifact_path, &package.component_bytes).map_err(|source| {

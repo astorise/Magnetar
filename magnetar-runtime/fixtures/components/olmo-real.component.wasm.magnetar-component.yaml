@@ -1,0 +1,45 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:6963759fefda16575761d3f2c130b5583b767e8b3a3aa3bd9ffe405a6ca538c2"
+component:
+  name: "magnetar.olmo3.graph"
+  version: "0.1.0"
+  description: "OLMo 3 decoder graph with validated activation"
+  role: "olmo-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.2"
+compatibility:
+  architecture_families:
+    - olmo3
+  artifact_formats:
+    - huggingface
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.8.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.8.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/olmo-real.component.wasm"
+signatures: []

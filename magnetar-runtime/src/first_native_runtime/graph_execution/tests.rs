@@ -12,6 +12,157 @@ fn e2e_graph_nodes_transport_stays_tensor_value_typed() {
     );
 }
 
+#[test]
+fn recurrent_graph_planning_is_refused_before_allocating_resources() {
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut graph =
+        ExecutionGraph::new(ExecutionGraphId::new("state"), ExecutionGraphPhase::Decode);
+    let input = TensorEdgeId::new("state.in");
+    let output = TensorEdgeId::new("state.out");
+    let metadata = |behavior| GraphRecurrentStateMetadata {
+        resource_id: "state.layer0.conv".into(),
+        layer: 0,
+        slot: "conv".into(),
+        behavior,
+        compatibility_key: "model-v1".into(),
+    };
+    let mut input_edge = TensorEdge::new(input.clone(), f32_tensor_descriptor_from_shape(&[1, 2]));
+    input_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Input));
+    let mut output_edge =
+        TensorEdge::new(output.clone(), f32_tensor_descriptor_from_shape(&[1, 2]));
+    output_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Output));
+    graph = graph
+        .with_edge(input_edge)
+        .with_edge(output_edge)
+        .with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("update"),
+                OperatorId::magnetar("silu", 1, OperatorFamily::Activation),
+            )
+            .with_input(input)
+            .with_output(output),
+        );
+    graph.validate(&initial_operator_catalog()).unwrap();
+    let active_before = runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    let result = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        1,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    );
+    assert!(matches!(
+        result,
+        Err(E2eConformanceError::KernelCoverageMissing { .. })
+    ));
+    assert_eq!(
+        runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+            .count(),
+        active_before
+    );
+}
+
+#[test]
+fn multiple_output_graph_executes_and_uses_both_results() {
+    let input = TensorEdgeId::new("input.data");
+    let left = TensorEdgeId::new("edge.split.0");
+    let right = TensorEdgeId::new("edge.split.1");
+    let logits = TensorEdgeId::new("logits");
+    let graph = ExecutionGraph::new(
+        ExecutionGraphId::new("multi-output"),
+        ExecutionGraphPhase::Prefill,
+    )
+    .with_edge(TensorEdge::new(
+        input.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 6]),
+    ))
+    .with_edge(TensorEdge::new(
+        left.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 3]),
+    ))
+    .with_edge(TensorEdge::new(
+        right.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 3]),
+    ))
+    .with_edge(TensorEdge::new(
+        logits.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 3]),
+    ))
+    .with_node(
+        ExecutionNode::new(
+            ExecutionNodeId::new("split"),
+            OperatorId::magnetar("split", 1, OperatorFamily::Tensor),
+        )
+        .with_input(input.clone())
+        .with_output(left.clone())
+        .with_output(right.clone()),
+    )
+    .with_node(
+        ExecutionNode::new(
+            ExecutionNodeId::new("output"),
+            OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+        )
+        .with_input(left)
+        .with_input(right)
+        .with_output(logits.clone()),
+    );
+    graph.validate(&initial_operator_catalog()).unwrap();
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        2,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    let values = HostTensor::new(
+        [2, 6],
+        (1..=12).map(|value| value as f32).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let (_, outputs, _, _) = execute_first_native_graph_materializing(
+        &mut runtime,
+        &fixture,
+        &instance,
+        &KvCacheId::new("multi-output").unwrap(),
+        &graph,
+        &mut plan,
+        BTreeMap::from([(input, values)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+        MaterializedEdges::Only(&["logits"]),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outputs[&logits].data, vec![5.0, 7.0, 9.0, 17.0, 19.0, 21.0]);
+}
+
 /// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
 /// Decision 7) / 6.3: a failure in the Kernel's own execution/completion
 /// (here, `ctx.provider.complete_kernel` itself, injected via
@@ -331,6 +482,9 @@ fn kv_update_transaction_falls_back_to_reference_cpu_when_unbound() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
+        session: None,
+        tokenizer: generation_tokenizer_reference(&e2e_fixture().unwrap()),
+        generated: FirstNativeCommittedTokens::default(),
         layer_kv: LayerKvMap::new(),
         provider: None,
     };
@@ -910,6 +1064,325 @@ struct FormsGraph {
     graph: ExecutionGraph,
 }
 
+#[test]
+fn bidirectional_encoder_attention_graph_matches_pinned_modernbert_reference() {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        mask: Vec<f32>,
+        radius: Option<i64>,
+        scale: Option<f64>,
+        output: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        tokens: u64,
+        heads: u64,
+        head_dim: u64,
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        cases: Vec<Case>,
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../fixtures/encoder-attention-reference.json"
+    ))
+    .unwrap();
+    let width = fixture.heads * fixture.head_dim;
+    for case in fixture.cases {
+        let mut builder = FormsGraph {
+            graph: ExecutionGraph::new(
+                ExecutionGraphId::new("encoder-attention"),
+                ExecutionGraphPhase::Prefill,
+            ),
+        };
+        let q = builder.input("q", &[fixture.tokens, width]);
+        let k = builder.input("k", &[fixture.tokens, width]);
+        let v = builder.input("v", &[fixture.tokens, width]);
+        let mask = builder.input("mask", &[fixture.tokens]);
+        let mut attributes = vec![
+            (
+                "head_count",
+                OperatorAttributeValue::Integer(fixture.heads as i64),
+            ),
+            (
+                "head_dimension",
+                OperatorAttributeValue::Integer(fixture.head_dim as i64),
+            ),
+        ];
+        if let Some(radius) = case.radius {
+            attributes.push(("local_radius", OperatorAttributeValue::Integer(radius)));
+        }
+        if let Some(scale) = case.scale {
+            attributes.push(("scale", OperatorAttributeValue::Float(scale)));
+        }
+        let output = builder.node(
+            "encoder",
+            "encoder-attention",
+            OperatorFamily::Attention,
+            attributes,
+            vec![q, k, v, mask],
+            &[fixture.tokens, width],
+        );
+        let mut graph = builder.graph;
+        let mut edge = graph.edges.remove(&output).unwrap();
+        edge.id = TensorEdgeId::new("logits");
+        graph.edges.insert(edge.id.clone(), edge);
+        graph
+            .nodes
+            .get_mut(&ExecutionNodeId::new("encoder"))
+            .unwrap()
+            .outputs = vec![TensorEdgeId::new("logits")];
+        let model = e2e_fixture().unwrap();
+        let mut runtime = build_runtime_trusting_fixture(&model);
+        let (instance, _) = load_fixture_instance(&model, &mut runtime).unwrap();
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            fixture.tokens,
+            PreparedExecutionPlanGeneration::new(1),
+            &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+        )
+        .unwrap();
+        let shape = [fixture.tokens, width];
+        let bindings = BTreeMap::from([
+            (
+                TensorEdgeId::new("input.q"),
+                HostTensor::new(shape, fixture.q.clone()).unwrap(),
+            ),
+            (
+                TensorEdgeId::new("input.k"),
+                HostTensor::new(shape, fixture.k.clone()).unwrap(),
+            ),
+            (
+                TensorEdgeId::new("input.v"),
+                HostTensor::new(shape, fixture.v.clone()).unwrap(),
+            ),
+            (
+                TensorEdgeId::new("input.mask"),
+                HostTensor::new([fixture.tokens], case.mask).unwrap(),
+            ),
+        ]);
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &model,
+            &instance,
+            &KvCacheId::new("encoder").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = &outputs[&TensorEdgeId::new("logits")].data;
+        assert_eq!(actual.len(), case.output.len());
+        for (&a, &b) in actual.iter().zip(&case.output) {
+            assert!((a - b).abs() < 2e-6, "{}: {a} != {b}", case.name);
+        }
+    }
+}
+
+/// Runs an entire Olala MoE including routed bottleneck, shared expert and
+/// logits head against the independently executed pinned PyTorch implementation.
+#[test]
+fn olala_relu_squared_moe_graph_matches_upstream_logits() {
+    #[derive(serde::Deserialize)]
+    struct TensorFixture {
+        shape: Vec<u64>,
+        data: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        top_k: i64,
+        scale: f64,
+        experts: i64,
+        tensors: BTreeMap<String, TensorFixture>,
+    }
+    let fixtures: Vec<Fixture> =
+        serde_json::from_str(include_str!("../../../fixtures/olala-moe-reference.json")).unwrap();
+    for expected in fixtures {
+        let mut builder = FormsGraph {
+            graph: ExecutionGraph::new(
+                ExecutionGraphId::new("olala-relu-squared"),
+                ExecutionGraphPhase::Prefill,
+            ),
+        };
+        let mut bindings = BTreeMap::new();
+        let mut input = |name: &str, builder: &mut FormsGraph| {
+            let tensor = &expected.tensors[name];
+            let id = builder.input(name, &tensor.shape);
+            bindings.insert(
+                id.clone(),
+                HostTensor::new(tensor.shape.clone(), tensor.data.clone()).unwrap(),
+            );
+            id
+        };
+        let hidden = input("hidden", &mut builder);
+        let router = input("router", &mut builder);
+        let routed_in = input("routed_in", &mut builder);
+        let expert_in = input("expert_in", &mut builder);
+        let expert_out = input("expert_out", &mut builder);
+        let bias = input("bias", &mut builder);
+        let routed_out = input("routed_out", &mut builder);
+        let shared_in = input("shared_in", &mut builder);
+        let shared_out = input("shared_out", &mut builder);
+        let head = input("head", &mut builder);
+        let router_logits = builder.node(
+            "router",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden.clone(), router],
+            &[4, 4],
+        );
+        let routed = builder.node(
+            "routed_in",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden.clone(), routed_in],
+            &[4, 3],
+        );
+        let routed = builder.node(
+            "experts",
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            vec![
+                ("experts", OperatorAttributeValue::Integer(expected.experts)),
+                ("top_k", OperatorAttributeValue::Integer(expected.top_k)),
+                (
+                    "activation",
+                    OperatorAttributeValue::String("relu_squared".into()),
+                ),
+                (
+                    "routing_scoring",
+                    OperatorAttributeValue::String("sigmoid".into()),
+                ),
+                (
+                    "routing_normalization",
+                    OperatorAttributeValue::String("multiple".into()),
+                ),
+                (
+                    "routing_scale",
+                    OperatorAttributeValue::Float(expected.scale),
+                ),
+            ],
+            vec![routed, router_logits, expert_in, expert_out, bias],
+            &[4, 3],
+        );
+        let routed = builder.node(
+            "routed_out",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![routed, routed_out],
+            &[4, 5],
+        );
+        let shared = builder.node(
+            "shared_in",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden, shared_in],
+            &[4, 6],
+        );
+        let shared = builder.node(
+            "shared_activation",
+            "activation",
+            OperatorFamily::Activation,
+            vec![(
+                "kind",
+                OperatorAttributeValue::String("relu_squared".into()),
+            )],
+            vec![shared],
+            &[4, 6],
+        );
+        let shared = builder.node(
+            "shared_out",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![shared, shared_out],
+            &[4, 5],
+        );
+        let combined = builder.node(
+            "combined",
+            "add",
+            OperatorFamily::Tensor,
+            vec![],
+            vec![routed, shared],
+            &[4, 5],
+        );
+        let result = builder.node(
+            "head",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![combined, head],
+            &[4, 7],
+        );
+        let mut graph = builder.graph;
+        let mut edge = graph.edges.remove(&result).unwrap();
+        edge.id = TensorEdgeId::new("logits");
+        graph.edges.insert(edge.id.clone(), edge);
+        graph
+            .nodes
+            .get_mut(&ExecutionNodeId::new("head"))
+            .unwrap()
+            .outputs = vec![TensorEdgeId::new("logits")];
+        let fixture = e2e_fixture().unwrap();
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            4,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("olala-moe").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = &outputs[&TensorEdgeId::new("logits")].data;
+        let reference = &expected.tensors["logits"].data;
+        for (&a, &b) in actual.iter().zip(reference) {
+            assert!((a - b).abs() < 2e-6, "top-{}: {a} != {b}", expected.top_k);
+        }
+    }
+}
+
 impl FormsGraph {
     fn input(&mut self, name: &str, shape: &[u64]) -> TensorEdgeId {
         let id = TensorEdgeId::new(format!("input.{name}"));
@@ -953,6 +1426,252 @@ impl FormsGraph {
         );
         self.graph.nodes.insert(node_id, node);
         output
+    }
+}
+
+/// Two independent learned residual updates exercise the portable graph
+/// path with original layer indices and distinct mixer/MLP weight edges.
+#[test]
+fn geodesic_residual_graph_preserves_parameters_and_original_layer_indices() {
+    let mut builder = FormsGraph {
+        graph: ExecutionGraph::new(
+            ExecutionGraphId::new("geodesic-residuals"),
+            ExecutionGraphPhase::Prefill,
+        ),
+    };
+    let x = builder.input("residual", &[1, 4]);
+    let g = builder.input("branch", &[1, 4]);
+    let mixer_scale = builder.input("layers.0.geodesic_mixer.scale", &[1]);
+    let mixer_bias = builder.input("layers.0.geodesic_mixer.bias", &[1]);
+    let mlp_scale = builder.input("layers.11.geodesic_mlp.scale", &[1]);
+    let mlp_bias = builder.input("layers.11.geodesic_mlp.bias", &[1]);
+    let mixer = builder.node(
+        "mixer",
+        "geodesic-residual",
+        OperatorFamily::Tensor,
+        vec![("layer_index", OperatorAttributeValue::Integer(0))],
+        vec![x.clone(), g.clone(), mixer_scale, mixer_bias],
+        &[1, 4],
+    );
+    let mlp = builder.node(
+        "mlp",
+        "geodesic-residual",
+        OperatorFamily::Tensor,
+        vec![("layer_index", OperatorAttributeValue::Integer(11))],
+        vec![x, g, mlp_scale, mlp_bias],
+        &[1, 4],
+    );
+    let output = builder.node(
+        "sum",
+        "add",
+        OperatorFamily::Tensor,
+        vec![],
+        vec![mixer, mlp],
+        &[1, 4],
+    );
+    let mut graph = builder.graph;
+    let mut edge = graph.edges.remove(&output).unwrap();
+    edge.id = TensorEdgeId::new("logits");
+    graph.edges.insert(edge.id.clone(), edge);
+    graph
+        .nodes
+        .get_mut(&ExecutionNodeId::new("sum"))
+        .unwrap()
+        .outputs = vec![TensorEdgeId::new("logits")];
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        1,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider,
+    )
+    .unwrap();
+    for (mlp_parameter, expected) in [
+        (1.2, vec![2.9013255, -2.2552404, -0.391_262, 8.194331]),
+        (0.0, vec![2.8208141, -2.37731, -0.28452742, 8.144489]),
+    ] {
+        let tensors = [
+            (
+                "residual",
+                HostTensor::new([1, 4], vec![1.0, -2.0, 0.5, 4.0]).unwrap(),
+            ),
+            (
+                "branch",
+                HostTensor::new([1, 4], vec![0.7, 1.2, -1.0, 0.3]).unwrap(),
+            ),
+            (
+                "layers.0.geodesic_mixer.scale",
+                HostTensor::new([1], vec![1.2]).unwrap(),
+            ),
+            (
+                "layers.0.geodesic_mixer.bias",
+                HostTensor::new([1], vec![0.04]).unwrap(),
+            ),
+            (
+                "layers.11.geodesic_mlp.scale",
+                HostTensor::new([1], vec![mlp_parameter]).unwrap(),
+            ),
+            (
+                "layers.11.geodesic_mlp.bias",
+                HostTensor::new([1], vec![if mlp_parameter == 0.0 { 0.0 } else { 0.04 }]).unwrap(),
+            ),
+        ];
+        let bindings = tensors
+            .into_iter()
+            .map(|(name, value)| (TensorEdgeId::new(format!("input.{name}")), value))
+            .collect();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("geodesic").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_logits_close(
+            &outputs[&TensorEdgeId::new("logits")].data,
+            &expected,
+            "geodesic graph",
+        );
+    }
+}
+
+/// Grouped sigmoid routing crosses graph planning, capability admission and
+/// dispatch with the bias and the optional output scale in distinct slots.
+#[test]
+fn sigmoid_moe_graph_dispatches_bias_and_scale() {
+    for with_scale in [false, true] {
+        let tensors = vec![
+            ("h", HostTensor::new([1, 1], vec![1.0]).unwrap()),
+            (
+                "router",
+                HostTensor::new([1, 8], vec![2.0, -1.0, 0.2, -2.0, 1.0, 0.1, -1.0, 0.4]).unwrap(),
+            ),
+            ("gate", HostTensor::new([1, 8], vec![1.0; 8]).unwrap()),
+            ("up", HostTensor::new([1, 8], vec![1.0; 8]).unwrap()),
+            (
+                "down",
+                HostTensor::new([1, 8], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap(),
+            ),
+            (
+                "bias",
+                HostTensor::new([8], vec![-0.9, 0.4, 0.0, 0.0, 0.0, 0.3, 0.1, 0.2]).unwrap(),
+            ),
+            (
+                "scale",
+                HostTensor::new([8], vec![1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5]).unwrap(),
+            ),
+        ];
+        let mut builder = FormsGraph {
+            graph: ExecutionGraph::new(
+                ExecutionGraphId::new("sigmoid-moe"),
+                ExecutionGraphPhase::Prefill,
+            ),
+        };
+        let inputs: Vec<_> = tensors
+            .iter()
+            .take(if with_scale { 7 } else { 6 })
+            .map(|(name, tensor)| builder.input(name, &tensor.shape))
+            .collect();
+        let output = builder.node(
+            "experts",
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            vec![
+                ("experts", OperatorAttributeValue::Integer(8)),
+                ("top_k", OperatorAttributeValue::Integer(2)),
+                (
+                    "routing_scoring",
+                    OperatorAttributeValue::String("sigmoid".into()),
+                ),
+                (
+                    "routing_normalization",
+                    OperatorAttributeValue::String("always".into()),
+                ),
+                ("routing_scale", OperatorAttributeValue::Float(2.45)),
+                ("routing_group_count", OperatorAttributeValue::Integer(2)),
+                ("routing_group_selected", OperatorAttributeValue::Integer(1)),
+            ],
+            inputs,
+            &[1, 1],
+        );
+        let mut graph = builder.graph;
+        let mut edge = graph.edges.remove(&output).unwrap();
+        edge.id = TensorEdgeId::new("logits");
+        graph.edges.insert(edge.id.clone(), edge);
+        graph
+            .nodes
+            .get_mut(&ExecutionNodeId::new("experts"))
+            .unwrap()
+            .outputs = vec![TensorEdgeId::new("logits")];
+        let fixture = e2e_fixture().expect("fixture builds");
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            1,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        let bindings = tensors
+            .into_iter()
+            .take(if with_scale { 7 } else { 6 })
+            .map(|(name, value)| (TensorEdgeId::new(format!("input.{name}")), value))
+            .collect();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("sigmoid-moe").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let silu_one = 1.0 / (1.0 + (-1.0_f32).exp());
+        let expected = if with_scale {
+            silu_one * (6.0 * 2.0 * 1.144_644_5 + 8.0 * 0.5 * 1.305_355_7)
+        } else {
+            silu_one * (6.0 * 1.144_644_5 + 8.0 * 1.305_355_7)
+        };
+        assert_logits_close(
+            &outputs[&TensorEdgeId::new("logits")].data,
+            &[expected],
+            "sigmoid routing graph",
+        );
     }
 }
 
@@ -1342,6 +2061,9 @@ fn the_reference_cpu_declares_every_layered_form() {
         ("rope", ROPE_PARTIAL_ROTARY_FEATURE),
         ("moe-experts", MOE_EXPERTS_ACTIVATION_FEATURE),
         ("moe-experts", MOE_PER_EXPERT_SCALE_FEATURE),
+        ("moe-experts", MOE_SIGMOID_ROUTING_FEATURE),
+        ("moe-experts", MOE_RELU_SQUARED_FEATURE),
+        ("activation", ACTIVATION_RELU_SQUARED_FEATURE),
         // `express-latent-attention-forms`.
         ("attention", ATTENTION_VALUE_HEAD_DIMENSION_FEATURE),
         ("concat", CONCAT_HEADS_FEATURE),

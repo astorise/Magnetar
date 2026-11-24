@@ -104,7 +104,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install cargo-deny
-        uses: taiki-e/install-action@189504a963cde105ae7493e3447085686df99d38 # cargo-deny
+        uses: taiki-e/install-action@d5b78900754d505a5f5f996e23d5f039b418e2f3 # cargo-deny
       - name: Check advisories, bans, licenses and sources
         run: cargo deny --all-features check
 
@@ -186,7 +186,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install wasm-tools
-        uses: taiki-e/install-action@d270f69d9016a914699316c97c419c84d5e96475 # wasm-tools
+        uses: taiki-e/install-action@745319f1cc9062cb0c2e6e30639b5180392b1951 # wasm-tools
       - name: Validate WIT packages
         shell: bash
         run: |
@@ -365,11 +365,10 @@ jobs:
           done < <(find magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-provider-api/src magnetar-engine/src magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
           exit "$fail"
 
-  # Component integration (task 15.6): Component submodules only, sparse
-  # checkout. Split out from the single consolidated `submodule-integration`
-  # job below now that `components/qwen` is real (task group 11);
-  # `components/nemotron`, `gemma`, `kimi`, `mistral` and `deepseek` are
-  # templates and pass trivially until they have real content of their own.
+  # Component integration (task 15.6): independently exercise each
+  # Component, then build and run the SmolLM2 test Component through the
+  # engine and production loader. Per-crate tests distinguish graph or
+  # reference implementations from qualified model inference.
   component-integration:
     name: quality / component integration
     runs-on: ubuntu-latest
@@ -377,7 +376,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout Component submodules
-        run: git submodule update --init -- components/qwen components/llama components/nemotron components/gemma components/kimi components/mistral components/deepseek
+        run: git submodule update --init -- components/qwen components/llama components/nemotron components/gemma components/kimi components/mistral components/deepseek components/glm components/olala components/kev components/laya components/modernbert components/smollm components/olmo
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -393,12 +392,111 @@ jobs:
             components/gemma/Cargo.toml \
             components/kimi/Cargo.toml \
             components/mistral/Cargo.toml \
-            components/deepseek/Cargo.toml
+            components/deepseek/Cargo.toml \
+            components/glm/Cargo.toml \
+            components/olala/Cargo.toml \
+            components/kev/Cargo.toml \
+            components/laya/Cargo.toml \
+            components/modernbert/Cargo.toml \
+            components/smollm/Cargo.toml \
+            components/olmo/Cargo.toml
           do
             echo "::group::$manifest"
             cargo test --locked --manifest-path "$manifest"
             echo "::endgroup::"
           done
+      - name: Install wasm-tools
+        uses: taiki-e/install-action@745319f1cc9062cb0c2e6e30639b5180392b1951 # wasm-tools
+      - name: Build the SmolLM2 graph component
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          cargo build --locked --release --manifest-path components/smollm/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/smollm/target/wasm32-unknown-unknown/release/magnetar_component_smollm.wasm -o "$RUNNER_TEMP/smollm2.component.wasm"
+          wasm-tools validate "$RUNNER_TEMP/smollm2.component.wasm" --features component-model
+      - name: Run the freshly built SmolLM component in the Magnetar engine
+        env:
+          MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
+        run: cargo test --locked -p magnetar-engine --features wasmtime-component-engine smollm
+      - name: Build and validate the ModernBERT encoder component
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path components/modernbert/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/modernbert/target/wasm32-unknown-unknown/release/magnetar_component_modernbert.wasm -o "$RUNNER_TEMP/modernbert.component.wasm"
+          wasm-tools validate "$RUNNER_TEMP/modernbert.component.wasm" --features component-model
+      - name: Compare the ModernBERT component graph with Transformers
+        env:
+          MAGNETAR_MODERNBERT_TEST_COMPONENT: ${{ runner.temp }}/modernbert.component.wasm
+        run: cargo test --locked -p magnetar-runtime modernbert_component_graph_matches_pinned_transformers
+      - name: Checkout SmolLM2 numerical test dependencies
+        run: git submodule update --init -- providers/cpu providers/cuda loaders/huggingface loaders/gguf formats/gguf formats/safetensors
+      - name: Build activation-validated Qwen, Llama and DeepSeek components
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path components/qwen/Cargo.toml --target wasm32-unknown-unknown
+          cargo build --locked --release --manifest-path components/llama/Cargo.toml --target wasm32-unknown-unknown
+          cargo build --locked --release --manifest-path components/deepseek/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/qwen/target/wasm32-unknown-unknown/release/magnetar_component_Qwen.wasm -o "$RUNNER_TEMP/qwen.component.wasm"
+          wasm-tools component new components/llama/target/wasm32-unknown-unknown/release/magnetar_component_Llama.wasm -o "$RUNNER_TEMP/llama.component.wasm"
+          wasm-tools component new components/deepseek/target/wasm32-unknown-unknown/release/magnetar_component_deepseek.wasm -o "$RUNNER_TEMP/deepseek.component.wasm"
+          for component in qwen llama deepseek; do
+            wasm-tools validate "$RUNNER_TEMP/$component.component.wasm" --features component-model
+          done
+      - name: Compare freshly built decoder components with reference fixtures
+        env:
+          MAGNETAR_QWEN_TEST_COMPONENT: ${{ runner.temp }}/qwen.component.wasm
+          MAGNETAR_LLAMA_TEST_COMPONENT: ${{ runner.temp }}/llama.component.wasm
+          MAGNETAR_DEEPSEEK_TEST_COMPONENT: ${{ runner.temp }}/deepseek.component.wasm
+        run: |
+          cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_gguf_loading_e2e
+          cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_deepseek_v2_logits
+      - name: Build the Gemma 4 graph component
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path components/gemma/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/gemma/target/wasm32-unknown-unknown/release/magnetar_component_gemma.wasm -o "$RUNNER_TEMP/gemma.component.wasm"
+          wasm-tools validate "$RUNNER_TEMP/gemma.component.wasm" --features component-model
+      - name: Check the freshly built Gemma component and reference logits
+        env:
+          MAGNETAR_GEMMA_TEST_COMPONENT: ${{ runner.temp }}/gemma.component.wasm
+        run: |
+          cargo test --locked -p magnetar-engine --features wasmtime-component-engine gemma_
+          cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_gemma4_logits
+      - name: Compare SmolLM2 and SmolLM3 prefill and decode with Transformers
+        env:
+          MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_smollm
+      - name: Compare block-FP8 weights with Transformers
+        env:
+          MAGNETAR_SMOLLM2_TEST_COMPONENT: ${{ runner.temp }}/smollm2.component.wasm
+          MAGNETAR_DEEPSEEK_TEST_COMPONENT: ${{ runner.temp }}/deepseek.component.wasm
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading tests_fp8_logits
+      - name: Build the Mistral graph component
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path components/mistral/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/mistral/target/wasm32-unknown-unknown/release/magnetar_component_mistral.wasm -o "$RUNNER_TEMP/mistral.component.wasm"
+          wasm-tools validate "$RUNNER_TEMP/mistral.component.wasm" --features component-model
+      - name: Compare Mistral prefill and decode with independent logits
+        env:
+          MAGNETAR_MISTRAL_TEST_COMPONENT: ${{ runner.temp }}/mistral.component.wasm
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading mistral_prefill_and_cached_decode_match_independent_logits
+      - name: Build the OLMo 3 graph component
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path components/olmo/Cargo.toml --target wasm32-unknown-unknown
+          wasm-tools component new components/olmo/target/wasm32-unknown-unknown/release/magnetar_component_olmo.wasm -o "$RUNNER_TEMP/olmo.component.wasm"
+          wasm-tools validate "$RUNNER_TEMP/olmo.component.wasm" --features component-model
+      - name: Compare OLMo 3 prefill and decode with independent logits
+        env:
+          MAGNETAR_OLMO_TEST_COMPONENT: ${{ runner.temp }}/olmo.component.wasm
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-integration-production-loading olmo3_
 
   # Format integration (task 15.7): Format submodules only, sparse checkout.
   # `cargo test` already runs each crate's malformed-input corpus regression
@@ -457,7 +555,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout Provider submodules
-        run: git submodule update --init -- providers/cpu providers/cuda providers/rocm providers/metal providers/wgpu providers/npu providers/tpu providers/qnn
+        run: git submodule update --init -- providers/cpu providers/cuda providers/rocm providers/metal providers/wgpu providers/openvino providers/tpu providers/qnn
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -470,8 +568,8 @@ jobs:
         run: cargo test --locked --manifest-path providers/rocm/Cargo.toml
       - name: "Build and test the Metal Provider (unconditionally unavailable on every non-macOS platform)"
         run: cargo test --locked --manifest-path providers/metal/Cargo.toml
-      - name: "Build and test the NPU Provider (no Level Zero NPU driver here: exercises its graceful-unavailability path)"
-        run: cargo test --locked --manifest-path providers/npu/Cargo.toml
+      - name: "Build and test the OpenVINO repository's NPU Provider (no Level Zero NPU driver here: exercises its graceful-unavailability path)"
+        run: cargo test --locked --manifest-path providers/openvino/Cargo.toml
       - name: "Build and test the TPU Provider (no Coral Edge TPU attached here: exercises its graceful-unavailability path)"
         run: cargo test --locked --manifest-path providers/tpu/Cargo.toml
       - name: "Build and test the QNN (Qualcomm) Provider (no QNN SDK here: exercises its graceful-unavailability path)"
@@ -487,7 +585,7 @@ jobs:
       - name: Build and test the WGPU Provider
         run: cargo test --locked --manifest-path providers/wgpu/Cargo.toml
       - name: Install cargo-deny
-        uses: taiki-e/install-action@189504a963cde105ae7493e3447085686df99d38 # cargo-deny
+        uses: taiki-e/install-action@d5b78900754d505a5f5f996e23d5f039b418e2f3 # cargo-deny
       # The root `deny` job above never sees this submodule (it checks out
       # without submodules by design, `externalize-runtime-extension-
       # modules`'s "zero compile-time dependency on any externalized
@@ -498,7 +596,7 @@ jobs:
       # `providers/rocm`'s `libloading` and `providers/wgpu`'s `wgpu`/
       # `pollster` are the identical class of new, dynamic-library-adjacent
       # dependency, each with their own `deny.toml` for the same reason.
-      # `providers/npu` and `providers/tpu` both use the same `libloading`
+      # `providers/openvino` and `providers/tpu` both use the same `libloading`
       # dependency as `providers/rocm`.
       - name: Check the CUDA Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/cuda/Cargo.toml check
@@ -506,8 +604,8 @@ jobs:
         run: cargo deny --manifest-path providers/rocm/Cargo.toml check
       - name: Check the WGPU Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/wgpu/Cargo.toml check
-      - name: Check the NPU Provider's own dependency graph (advisories, bans, licenses, sources)
-        run: cargo deny --manifest-path providers/npu/Cargo.toml check
+      - name: Check the OpenVINO repository's NPU Provider dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path providers/openvino/Cargo.toml check
       - name: Check the TPU Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/tpu/Cargo.toml check
       - name: Check the QNN (Qualcomm) Provider's own dependency graph (advisories, bans, licenses, sources)
@@ -544,6 +642,13 @@ jobs:
             components/kimi/Cargo.toml \
             components/mistral/Cargo.toml \
             components/deepseek/Cargo.toml \
+            components/glm/Cargo.toml \
+            components/olala/Cargo.toml \
+            components/kev/Cargo.toml \
+            components/laya/Cargo.toml \
+            components/modernbert/Cargo.toml \
+            components/smollm/Cargo.toml \
+            components/olmo/Cargo.toml \
             formats/gguf/Cargo.toml \
             formats/safetensors/Cargo.toml \
             providers/cpu/Cargo.toml \
@@ -551,7 +656,7 @@ jobs:
             providers/rocm/Cargo.toml \
             providers/metal/Cargo.toml \
             providers/wgpu/Cargo.toml \
-            providers/npu/Cargo.toml \
+            providers/openvino/Cargo.toml \
             providers/tpu/Cargo.toml \
             providers/qnn/Cargo.toml \
             loaders/huggingface/Cargo.toml \
@@ -684,7 +789,7 @@ jobs:
       # submodule recursively, so it is the natural place to close the
       # rest.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@189504a963cde105ae7493e3447085686df99d38 # cargo-deny
+        uses: taiki-e/install-action@d5b78900754d505a5f5f996e23d5f039b418e2f3 # cargo-deny
       - name: Check the submodule workspace's dependency graph (advisories, bans, licenses, sources)
         # `--allow wildcard --allow unlicensed`: `magnetar-format-safetensors`
         # and `magnetar-loader-huggingface` (external submodules this
@@ -797,7 +902,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@9299c56f1fb893650f348425bb02c3acf492ebd2 # cargo-llvm-cov
+        uses: taiki-e/install-action@41e135bca37b18b5a9cc134855b5b3bccbedbf26 # cargo-llvm-cov
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Prepare coverage output

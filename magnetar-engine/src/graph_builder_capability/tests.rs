@@ -28,6 +28,73 @@ fn context() -> SessionContext {
 }
 
 #[test]
+fn encoder_phase_is_distinct_and_refuses_decoder_offsets() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("encoder", context());
+    let begin = |length, offset| {
+        [
+            ComponentValue::Enum("encode".into()),
+            ComponentValue::S64(length),
+            ComponentValue::S64(offset),
+        ]
+    };
+    assert!(
+        capability
+            .call("encoder", "begin-graph", &begin(0, 0))
+            .is_err()
+    );
+    assert!(
+        capability
+            .call("encoder", "begin-graph", &begin(4, 1))
+            .is_err()
+    );
+    capability
+        .call("encoder", "begin-graph", &begin(4, 0))
+        .unwrap();
+    let input = capability
+        .call(
+            "encoder",
+            "declare-input",
+            &[ComponentValue::String("values".into()), shape(vec![4, 8])],
+        )
+        .unwrap();
+    let ComponentValue::String(input) = &input[0] else {
+        panic!("missing encoder input")
+    };
+    let output = capability
+        .call(
+            "encoder",
+            "add-node",
+            &[
+                ComponentValue::String("activation".into()),
+                ComponentValue::String("silu".into()),
+                ComponentValue::String("Activation".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                shape(vec![4, 8]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(output) = &output[0] else {
+        panic!("missing encoder output")
+    };
+    let result = capability
+        .call(
+            "encoder",
+            "finish-graph",
+            &[ComponentValue::String(output.clone())],
+        )
+        .unwrap();
+    let ComponentValue::String(handle) = &result[0] else {
+        panic!("missing encoder graph handle")
+    };
+    let graph = capability.take_graph("encoder", handle).unwrap();
+    assert_eq!(graph.phase, ExecutionGraphPhase::Encode);
+    graph.validate(&crate::default_graph_catalog()).unwrap();
+}
+
+#[test]
 fn builds_a_minimal_two_node_graph_end_to_end() {
     let capability = GraphBuilderCapability::new();
     capability.prepare_session("instance-1", context());
@@ -851,4 +918,606 @@ fn call_rejects_an_unknown_operation() {
         result,
         Err(ComponentError::CapabilityCallRejected { .. })
     ));
+}
+
+#[test]
+fn recurrent_state_slots_are_runtime_issued_paired_and_distinct_from_kv() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("state", context());
+    capability
+        .call(
+            "state",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("decode".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(3),
+            ],
+        )
+        .unwrap();
+    let declare = |slot: &str| -> String {
+        let result = capability
+            .call(
+                "state",
+                "recurrent-resource",
+                &[
+                    ComponentValue::S64(2),
+                    ComponentValue::String(slot.into()),
+                    shape(vec![2, 3]),
+                ],
+            )
+            .unwrap();
+        let ComponentValue::String(id) = &result[0] else {
+            panic!("expected resource identity")
+        };
+        id.clone()
+    };
+    let conv = declare("conv");
+    let ssm = declare("ssm");
+    assert_ne!(conv, ssm);
+    assert_eq!(conv, declare("conv"));
+    let build_state = |id: &str, name: &str| -> String {
+        let result = capability
+            .call(
+                "state",
+                "recurrent-input",
+                &[ComponentValue::String(id.into())],
+            )
+            .unwrap();
+        let ComponentValue::String(input) = &result[0] else {
+            panic!("expected input edge")
+        };
+        let result = capability
+            .call(
+                "state",
+                "add-node",
+                &[
+                    ComponentValue::String(name.into()),
+                    ComponentValue::String("silu".into()),
+                    ComponentValue::String("Activation".into()),
+                    ComponentValue::List(vec![]),
+                    ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                    shape(vec![2, 3]),
+                    ComponentValue::Option(None),
+                ],
+            )
+            .unwrap();
+        let ComponentValue::String(output) = &result[0] else {
+            panic!("expected output edge")
+        };
+        capability
+            .call(
+                "state",
+                "recurrent-output",
+                &[
+                    ComponentValue::String(id.into()),
+                    ComponentValue::String(output.clone()),
+                ],
+            )
+            .unwrap();
+        output.clone()
+    };
+    let conv_output = build_state(&conv, "conv");
+    let ssm_output = build_state(&ssm, "ssm");
+    let result = capability
+        .call(
+            "state",
+            "add-node",
+            &[
+                ComponentValue::String("merge".into()),
+                ComponentValue::String("add".into()),
+                ComponentValue::String("Tensor".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![
+                    ComponentValue::String(conv_output),
+                    ComponentValue::String(ssm_output),
+                ]),
+                shape(vec![2, 3]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(output) = &result[0] else {
+        panic!("expected output")
+    };
+    let result = capability
+        .call(
+            "state",
+            "finish-graph",
+            &[ComponentValue::String(output.clone())],
+        )
+        .unwrap();
+    let ComponentValue::String(handle) = &result[0] else {
+        panic!("expected handle")
+    };
+    let graph = capability.take_graph("state", handle).unwrap();
+    graph.validate(&initial_operator_catalog()).unwrap();
+    let slots: Vec<_> = graph
+        .edges
+        .values()
+        .filter_map(|edge| edge.recurrent_state.as_ref())
+        .collect();
+    assert_eq!(slots.len(), 4);
+    assert_eq!(
+        slots
+            .iter()
+            .filter(|state| state.behavior == GraphRecurrentStateBehavior::Input)
+            .count(),
+        2
+    );
+    assert_eq!(
+        slots
+            .iter()
+            .filter(|state| state.behavior == GraphRecurrentStateBehavior::Output)
+            .count(),
+        2
+    );
+    assert!(
+        graph
+            .edges
+            .values()
+            .filter(|edge| edge.recurrent_state.is_some())
+            .all(|edge| edge.kv_cache.is_none())
+    );
+}
+
+#[test]
+fn recurrent_state_rejects_forgery_bad_shapes_and_duplicate_bindings() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("state-bad", context());
+    capability
+        .call(
+            "state-bad",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    for (slot, dims) in [
+        ("bad.slot", vec![2, 3]),
+        ("valid", vec![0, 3]),
+        ("valid", vec![100_000_000]),
+    ] {
+        assert!(
+            capability
+                .call(
+                    "state-bad",
+                    "recurrent-resource",
+                    &[
+                        ComponentValue::S64(0),
+                        ComponentValue::String(slot.into()),
+                        shape(dims),
+                    ]
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-input",
+                &[ComponentValue::String("forged".into())]
+            )
+            .is_err()
+    );
+    let result = capability
+        .call(
+            "state-bad",
+            "recurrent-resource",
+            &[
+                ComponentValue::S64(0),
+                ComponentValue::String("conv".into()),
+                shape(vec![2, 3]),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(id) = &result[0] else {
+        panic!("expected identity")
+    };
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-resource",
+                &[
+                    ComponentValue::S64(0),
+                    ComponentValue::String("conv".into()),
+                    shape(vec![3, 3]),
+                ]
+            )
+            .is_err()
+    );
+    let result = capability
+        .call(
+            "state-bad",
+            "recurrent-input",
+            &[ComponentValue::String(id.clone())],
+        )
+        .unwrap();
+    let ComponentValue::String(input) = &result[0] else {
+        panic!("expected input")
+    };
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-input",
+                &[ComponentValue::String(id.clone())]
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-output",
+                &[
+                    ComponentValue::String(id.clone()),
+                    ComponentValue::String(input.clone()),
+                ]
+            )
+            .is_err()
+    );
+    let result = capability
+        .call(
+            "state-bad",
+            "add-node",
+            &[
+                ComponentValue::String("update".into()),
+                ComponentValue::String("silu".into()),
+                ComponentValue::String("Activation".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                shape(vec![2, 3]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(output) = &result[0] else {
+        panic!("expected output")
+    };
+    capability
+        .call(
+            "state-bad",
+            "recurrent-output",
+            &[
+                ComponentValue::String(id.clone()),
+                ComponentValue::String(output.clone()),
+            ],
+        )
+        .unwrap();
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "recurrent-output",
+                &[
+                    ComponentValue::String(id.clone()),
+                    ComponentValue::String(output.clone()),
+                ]
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .call(
+                "state-bad",
+                "finish-graph",
+                &[ComponentValue::String(output.clone())]
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn multiple_output_nodes_preserve_each_edge_and_catalog_arity() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("multi", context());
+    capability
+        .call(
+            "multi",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(2),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    let result = capability
+        .call(
+            "multi",
+            "declare-input",
+            &[ComponentValue::String("x".into()), shape(vec![2, 4])],
+        )
+        .unwrap();
+    let ComponentValue::String(input) = &result[0] else {
+        panic!("expected input")
+    };
+    let result = capability
+        .call(
+            "multi",
+            "add-node-outputs",
+            &[
+                ComponentValue::String("split".into()),
+                ComponentValue::String("split".into()),
+                ComponentValue::String("Tensor".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                ComponentValue::List(vec![shape(vec![2, 2]), shape(vec![2, 2])]),
+            ],
+        )
+        .unwrap();
+    let [ComponentValue::List(outputs)] = result.as_slice() else {
+        panic!("expected output list")
+    };
+    assert_eq!(outputs.len(), 2);
+    assert_ne!(outputs[0], outputs[1]);
+    let result = capability
+        .call(
+            "multi",
+            "add-node",
+            &[
+                ComponentValue::String("merge".into()),
+                ComponentValue::String("add".into()),
+                ComponentValue::String("Tensor".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(outputs.clone()),
+                shape(vec![2, 2]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let [ComponentValue::String(output)] = result.as_slice() else {
+        panic!("expected output")
+    };
+    let result = capability
+        .call(
+            "multi",
+            "finish-graph",
+            &[ComponentValue::String(output.clone())],
+        )
+        .unwrap();
+    let [ComponentValue::String(handle)] = result.as_slice() else {
+        panic!("expected handle")
+    };
+    let graph = capability.take_graph("multi", handle).unwrap();
+    let split = &graph.nodes[&ExecutionNodeId::new("split")];
+    assert_eq!(split.outputs.len(), 2);
+    assert_ne!(split.outputs[0], split.outputs[1]);
+    assert_eq!(
+        graph.nodes[&ExecutionNodeId::new("merge")].inputs,
+        split.outputs
+    );
+    graph.validate(&initial_operator_catalog()).unwrap();
+}
+
+#[test]
+fn builder_accepts_mamba3_eighteen_inputs_and_five_outputs() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("mamba3", context());
+    capability
+        .call(
+            "mamba3",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    let input_shapes = [
+        vec![1, 1, 1, 2],
+        vec![1, 1, 1, 2],
+        vec![1, 1, 1],
+        vec![1, 1, 1],
+        vec![1, 1],
+        vec![1, 1],
+        vec![1, 1],
+        vec![1, 1, 1],
+        vec![1, 1],
+        vec![1, 1, 2],
+        vec![1, 1, 2],
+        vec![1, 1],
+        vec![1, 1, 2],
+        vec![1, 1, 2],
+        vec![1, 1, 1],
+        vec![1, 1, 1],
+        vec![1, 1, 1],
+        vec![1],
+    ];
+    let mut inputs = Vec::new();
+    for (index, dimensions) in input_shapes.into_iter().enumerate() {
+        let result = capability
+            .call(
+                "mamba3",
+                "declare-input",
+                &[
+                    ComponentValue::String(format!("arg{index}")),
+                    shape(dimensions),
+                ],
+            )
+            .unwrap();
+        inputs.push(result[0].clone());
+    }
+    let attributes = [
+        ("heads", 1),
+        ("groups", 1),
+        ("rank", 1),
+        ("head_dim", 1),
+        ("state_dim", 2),
+        ("angles", 1),
+    ]
+    .into_iter()
+    .map(|(name, value)| {
+        ComponentValue::Record(vec![
+            ("name".into(), ComponentValue::String(name.into())),
+            (
+                "value".into(),
+                ComponentValue::Variant(
+                    "integer".into(),
+                    Some(Box::new(ComponentValue::S64(value))),
+                ),
+            ),
+        ])
+    })
+    .collect();
+    let result = capability
+        .call(
+            "mamba3",
+            "add-node-outputs",
+            &[
+                ComponentValue::String("mimo".into()),
+                ComponentValue::String("mamba3-mimo".into()),
+                ComponentValue::String("LinearAlgebra".into()),
+                ComponentValue::List(attributes),
+                ComponentValue::List(inputs),
+                ComponentValue::List(vec![
+                    shape(vec![1, 1, 1]),
+                    shape(vec![1, 1]),
+                    shape(vec![1, 1, 2]),
+                    shape(vec![1, 1, 2]),
+                    shape(vec![1, 1]),
+                ]),
+            ],
+        )
+        .unwrap();
+    let [ComponentValue::List(outputs)] = result.as_slice() else {
+        panic!("expected five outputs")
+    };
+    assert_eq!(outputs.len(), 5);
+    let finished = capability
+        .call("mamba3", "finish-graph", &[outputs[0].clone()])
+        .unwrap();
+    let [ComponentValue::String(handle)] = finished.as_slice() else {
+        panic!("expected graph handle")
+    };
+    let graph = capability.take_graph("mamba3", handle).unwrap();
+    assert_eq!(graph.nodes[&ExecutionNodeId::new("mimo")].outputs.len(), 5);
+    graph.validate(&initial_operator_catalog()).unwrap();
+}
+
+#[test]
+fn multiple_output_builder_rejects_empty_excess_and_colliding_edges() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("multi-bad", context());
+    capability
+        .call(
+            "multi-bad",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    let result = capability
+        .call(
+            "multi-bad",
+            "declare-input",
+            &[ComponentValue::String("x".into()), shape(vec![1, 4])],
+        )
+        .unwrap();
+    let [ComponentValue::String(input)] = result.as_slice() else {
+        panic!("expected input")
+    };
+    let request = |name: &str, count: usize| {
+        vec![
+            ComponentValue::String(name.into()),
+            ComponentValue::String("split".into()),
+            ComponentValue::String("Tensor".into()),
+            ComponentValue::List(vec![]),
+            ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+            ComponentValue::List((0..count).map(|_| shape(vec![1, 2])).collect()),
+        ]
+    };
+    assert!(
+        capability
+            .call("multi-bad", "add-node-outputs", &request("zero", 0))
+            .is_err()
+    );
+    assert!(
+        capability
+            .call("multi-bad", "add-node-outputs", &request("many", 17))
+            .is_err()
+    );
+    capability
+        .call(
+            "multi-bad",
+            "add-node",
+            &[
+                ComponentValue::String("split.0".into()),
+                ComponentValue::String("silu".into()),
+                ComponentValue::String("Activation".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                shape(vec![1, 4]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    assert!(
+        capability
+            .call("multi-bad", "add-node-outputs", &request("split", 2))
+            .is_err()
+    );
+    let sessions = capability.sessions.lock().unwrap();
+    let graph = sessions["multi-bad"].graph.as_ref().unwrap();
+    assert!(!graph.nodes.contains_key(&ExecutionNodeId::new("split")));
+    assert!(!graph.edges.contains_key(&TensorEdgeId::new("edge.split.1")));
+}
+
+#[test]
+fn multiple_output_node_must_match_operator_catalog_arity() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("multi-arity", context());
+    capability
+        .call(
+            "multi-arity",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    let result = capability
+        .call(
+            "multi-arity",
+            "declare-input",
+            &[ComponentValue::String("x".into()), shape(vec![1, 4])],
+        )
+        .unwrap();
+    let [ComponentValue::String(input)] = result.as_slice() else {
+        panic!("expected input")
+    };
+    let result = capability
+        .call(
+            "multi-arity",
+            "add-node-outputs",
+            &[
+                ComponentValue::String("split".into()),
+                ComponentValue::String("split".into()),
+                ComponentValue::String("Tensor".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                ComponentValue::List(vec![shape(vec![1, 2])]),
+            ],
+        )
+        .unwrap();
+    let [ComponentValue::List(outputs)] = result.as_slice() else {
+        panic!("expected outputs")
+    };
+    assert!(
+        capability
+            .call("multi-arity", "finish-graph", &[outputs[0].clone()])
+            .is_err()
+    );
 }

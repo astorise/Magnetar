@@ -345,6 +345,9 @@ pub enum ModelDType {
     I64,
     F16,
     Bf16,
+    /// Finite-only E4M3 (PyTorch `float8_e4m3fn` / Safetensors
+    /// `F8_E4M3`), distinct from E5M2 and E4M3FNUZ.
+    F8E4M3Fn,
     F32,
     F64,
     /// GGUF `block_q2_K`: 256 values in 84 bytes (2-bit quants, sixteen
@@ -395,6 +398,7 @@ impl ModelDType {
             "i64" | "int64" | "sint64" => Some(Self::I64),
             "f16" | "fp16" | "float16" => Some(Self::F16),
             "bf16" | "bfloat16" => Some(Self::Bf16),
+            "f8_e4m3" | "float8_e4m3fn" | "f8_e4m3fn" => Some(Self::F8E4M3Fn),
             "f32" | "fp32" | "float32" => Some(Self::F32),
             "f64" | "fp64" | "float64" => Some(Self::F64),
             "q2_k" | "q2k" => Some(Self::Q2K),
@@ -415,7 +419,7 @@ impl ModelDType {
         }
     }
 
-    pub const fn descriptor(self) -> DTypeDescriptor {
+    pub fn descriptor(self) -> DTypeDescriptor {
         match self {
             Self::Bool => DTypeDescriptor::portable(ComputeDType::Boolean),
             Self::U8 => DTypeDescriptor::portable(ComputeDType::UInt8),
@@ -428,6 +432,10 @@ impl ModelDType {
             Self::I64 => DTypeDescriptor::portable(ComputeDType::SInt64),
             Self::F16 => DTypeDescriptor::portable(ComputeDType::Float16),
             Self::Bf16 => DTypeDescriptor::portable(ComputeDType::BrainFloat16),
+            Self::F8E4M3Fn => DTypeDescriptor::ProviderSpecific {
+                id: "fp8-e4m3fn".into(),
+                size_bytes: 1,
+            },
             Self::F32 => DTypeDescriptor::portable(ComputeDType::Float32),
             Self::F64 => DTypeDescriptor::portable(ComputeDType::Float64),
             Self::Q2K
@@ -726,6 +734,14 @@ pub struct ModelArchitectureConfig {
     /// Component through `model-config`'s `rope-scaling` (`1.4.0`). The
     /// Component, not the Runtime, turns it into `rope` node attributes.
     pub rope_frequency_scaling: Option<RopeFrequencyScaling>,
+    /// Per-layer RoPE selection. `true` rotates Q/K and `false` leaves
+    /// them position-independent; `None` leaves the choice to the model
+    /// component's documented baseline. Exposed by model-config 1.9.0.
+    pub rope_layers: Option<Vec<bool>>,
+    /// Checkpoint-declared MLP activation, normalized by ingestion. `None`
+    /// means unknown, not an implicit SiLU choice. Exposed by model-config
+    /// 1.8.0 so Components can reject unsupported activations.
+    pub hidden_activation: Option<String>,
     pub tie_word_embeddings: bool,
     /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term, a real
     /// Hugging Face Qwen2/2.5 architectural default (not `config.json`-
@@ -842,13 +858,16 @@ impl RopeFrequencyScaling {
 /// values followed by `qk_rope_head_dim` rotated ones, the rotated key part
 /// being one head shared by every head; each value head is `v_head_dim`
 /// wide.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LatentAttentionConfig {
     pub q_lora_rank: Option<u32>,
     pub kv_lora_rank: u32,
     pub qk_nope_head_dim: u64,
     pub qk_rope_head_dim: u64,
     pub v_head_dim: u64,
+    /// Epsilon for the query/KV latent bottleneck norms when it differs
+    /// from the decoder-wide norm. `None` retains the previous contract.
+    pub norm_eps: Option<f64>,
 }
 
 /// How router logits become expert scores (`expert-scoring`, `1.7.0`).
@@ -889,8 +908,20 @@ pub struct ExpertRoutingConfig {
     /// A per-expert bias added to the scores to choose the experts, not to
     /// weight them.
     pub selection_bias: bool,
+    /// Explicit selected-score normalization, including top-1 behavior.
+    /// `None` retains the older Component contract's behavior. A declared
+    /// value must be read through `expert-normalization` (model-config 1.10).
+    pub normalization: Option<ExpertNormalization>,
     /// Whether the shared expert's output passes through a sigmoid gate.
     pub shared_expert_gated: bool,
+}
+
+/// When the selected expert scores are renormalized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpertNormalization {
+    Never,
+    MultipleExperts,
+    Always,
 }
 
 impl ModelArchitectureConfig {
@@ -902,6 +933,24 @@ impl ModelArchitectureConfig {
     /// must not overflow `u64`. Qwen-specific semantics are validated
     /// separately by the Qwen Component itself.
     pub fn validate(&self) -> Result<(), ModelArtifactError> {
+        if let Some(layers) = &self.rope_layers
+            && layers.len() != self.num_hidden_layers as usize
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!(
+                    "RoPE layer selection has {} entries for {} layers",
+                    layers.len(),
+                    self.num_hidden_layers
+                ),
+            });
+        }
+        if let Some(activation) = self.hidden_activation.as_deref()
+            && !matches!(activation, "silu" | "gelu" | "gelu_pytorch_tanh" | "relu")
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!("unsupported checkpoint activation '{activation}'"),
+            });
+        }
         let non_zero = [
             ("hidden_size", self.hidden_size),
             ("intermediate_size", self.intermediate_size),
@@ -994,6 +1043,12 @@ impl ModelArchitectureConfig {
     /// scaling factor.
     fn validate_latent_attention_and_experts(&self) -> Result<(), String> {
         if let Some(mla) = &self.latent_attention {
+            if mla
+                .norm_eps
+                .is_some_and(|epsilon| !epsilon.is_finite() || epsilon <= 0.0)
+            {
+                return Err("latent norm epsilon must be finite and positive".into());
+            }
             if mla.kv_lora_rank == 0
                 || mla.q_lora_rank == Some(0)
                 || mla.qk_nope_head_dim == 0
@@ -1033,12 +1088,19 @@ impl ModelArchitectureConfig {
                     routing.routed_scaling_factor
                 ));
             }
+            if let Some(normalization) = routing.normalization
+                && (normalization != ExpertNormalization::Never) != moe.normalize_top_k
+            {
+                return Err("expert normalization conflicts with normalize_top_k".into());
+            }
             if let Some(groups) = &routing.groups {
                 let groups_ok = groups.count > 0
                     && moe.experts.is_multiple_of(groups.count)
                     && groups.per_token > 0
                     && groups.per_token <= groups.count
-                    && groups.per_token * (moe.experts / groups.count) >= moe.experts_per_token;
+                    && groups.per_token * (moe.experts / groups.count) >= moe.experts_per_token
+                    && (groups.score != ExpertGroupScore::TopTwoSum
+                        || moe.experts / groups.count >= 2);
                 if !groups_ok {
                     return Err(format!(
                         "{} experts cannot route {} per token from {} of {} groups",
@@ -1136,6 +1198,9 @@ impl ModelManifest {
             });
         }
         self.architecture.validate()?;
+        if let Some(config) = &self.architecture_config {
+            config.validate()?;
+        }
         if self.parts.values().any(|part| part.name.trim().is_empty()) {
             return Err(ModelArtifactError::InvalidManifest {
                 message: "artifact parts must have names".into(),

@@ -16,6 +16,10 @@ license = "MIT"
 publish = false
 
 [dev-dependencies]
+magnetar-component-laya = { path = "../../components/laya" }
+magnetar-component-modernbert = { path = "../../components/modernbert" }
+magnetar-component-nemotron = { path = "../../components/nemotron" }
+magnetar-component-olala = { path = "../../components/olala" }
 magnetar-runtime = { path = "../../magnetar-runtime", features = ["wasmtime-component-engine"] }
 magnetar-loader-huggingface = { path = "../../loaders/huggingface" }
 magnetar-loader-gguf = { path = "../../loaders/gguf" }

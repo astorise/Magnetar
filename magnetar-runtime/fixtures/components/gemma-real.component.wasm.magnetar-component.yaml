@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:aae4961d4cb18d9f7d3338025315522b95c93135b4b7b7404a1785e305111f51"
+    value: "sha256:16a97f5a417637494241ab83a11fdeeb107082db4beeff6d1b5ae2a89fd5646d"
 component:
   name: "magnetar.gemma.real"
   version: "0.1.0"
@@ -25,10 +25,10 @@ wit:
   imports:
     - package: "magnetar:model-component-graph"
       interface: "graph-builder"
-      version: "1.6.0"
+      version: "1.8.0"
     - package: "magnetar:model-component-graph"
       interface: "model-config"
-      version: "1.6.0"
+      version: "1.8.0"
   exports: []
 capabilities:
   requires: []

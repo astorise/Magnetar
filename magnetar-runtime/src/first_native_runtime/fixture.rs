@@ -73,6 +73,7 @@ pub fn e2e_fixture_config() -> FirstNativeModelConfig {
         architecture,
         FirstNativeRopeConfig::standard(E2E_FIXTURE_HEAD_DIM),
     );
+    config.hidden_activation = Some("silu".into());
     config.tied_embeddings = true;
     config
 }

@@ -29,11 +29,29 @@ mod tests_chunked_prefill;
 #[cfg(test)]
 mod tests_deepseek_v2_logits;
 #[cfg(test)]
+mod tests_fp8_logits;
+#[cfg(test)]
 mod tests_gemma4_logits;
 #[cfg(test)]
 mod tests_gguf_loading_e2e;
 #[cfg(test)]
 mod tests_gguf_real_checkpoint_smoke;
+#[cfg(test)]
+mod tests_glm_logits;
+#[cfg(test)]
+mod tests_kimi_logits;
+#[cfg(test)]
+mod tests_laya_reference;
+#[cfg(test)]
+mod tests_mistral_logits;
+#[cfg(test)]
+mod tests_nemotron_profile;
+#[cfg(test)]
+mod tests_olala_attention_checkpoint;
+#[cfg(test)]
+mod tests_olala_mamba3_profile;
+#[cfg(test)]
+mod tests_olmo3_logits;
 #[cfg(test)]
 mod tests_production_loading_cuda_e2e;
 #[cfg(test)]
@@ -46,5 +64,9 @@ mod tests_real_checkpoint_numerics;
 mod tests_real_checkpoint_qualification;
 #[cfg(test)]
 mod tests_real_checkpoint_smoke;
+#[cfg(test)]
+mod tests_smollm2_logits;
+#[cfg(test)]
+mod tests_smollm3_logits;
 #[cfg(test)]
 mod tests_turboquant_kv_gains;

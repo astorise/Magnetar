@@ -89,7 +89,7 @@ pub(crate) fn compare_on(
         variant,
         format,
         family,
-        |_| {},
+        (|_| {}, None),
     )
     .0
 }
@@ -113,7 +113,7 @@ pub(crate) fn compare_chunked_on(
         variant,
         format,
         family,
-        |model| model.set_prefill_chunk(chunk),
+        (|model| model.set_prefill_chunk(chunk), None),
     );
     (difference, model.prefill_chunk())
 }
@@ -127,10 +127,20 @@ fn compare_configured(
     variant: &str,
     format: Format,
     family: &str,
-    configure: impl FnOnce(&mut ProductionLoadedModel),
+    options: (
+        impl FnOnce(&mut ProductionLoadedModel),
+        Option<magnetar_runtime::ComponentDigest>,
+    ),
 ) -> (f32, ProductionLoadedModel) {
-    let (mut model, reference) =
-        load_checkpoint(provider, family_directory, variant, format, family);
+    let (configure, component) = options;
+    let (mut model, reference) = load_checkpoint(
+        provider,
+        family_directory,
+        variant,
+        format,
+        family,
+        component,
+    );
     configure(&mut model);
     let mut recorder = LogitRecorder::default();
     let outcome = model
@@ -167,6 +177,25 @@ fn compare_configured(
         comparison.failures
     );
     (comparison.max_abs_difference, model)
+}
+
+/// Compare on the Reference CPU using an explicitly registered Component.
+pub(crate) fn compare_with_component(
+    family_directory: &str,
+    variant: &str,
+    family: &str,
+    component: magnetar_runtime::ComponentDigest,
+) -> f32 {
+    compare_configured(
+        Arc::new(ReferenceCpuProvider::new()),
+        "magnetar-reference-cpu",
+        family_directory,
+        variant,
+        Format::HuggingFace,
+        family,
+        (|_| {}, Some(component)),
+    )
+    .0
 }
 
 /// The reference's prompt, greedy, for as many tokens as it holds.
@@ -248,7 +277,7 @@ pub(crate) fn generate_logits(
     precisions: KvPrecisions,
 ) -> (Vec<Vec<f32>>, Vec<u32>, KvPrecisionResolution) {
     let (mut model, reference) =
-        load_checkpoint(provider, family_directory, variant, format, family);
+        load_checkpoint(provider, family_directory, variant, format, family, None);
     model.request_kv_precisions(precisions);
     let mut steps: Vec<Vec<f32>> = Vec::new();
     let outcome = model
@@ -277,6 +306,7 @@ fn load_checkpoint(
     variant: &str,
     format: Format,
     family: &str,
+    component: Option<magnetar_runtime::ComponentDigest>,
 ) -> (ProductionLoadedModel, LogitReference) {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
@@ -319,9 +349,11 @@ fn load_checkpoint(
     };
     assert_eq!(ingested.manifest.architecture.family, family, "{variant}");
 
-    let component = crate::test_support::real_component_for_architecture_family(
-        &ingested.manifest.architecture.family,
-    );
+    let component = component.unwrap_or_else(|| {
+        crate::test_support::real_component_for_architecture_family(
+            &ingested.manifest.architecture.family,
+        )
+    });
     let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer.metadata().clone(),

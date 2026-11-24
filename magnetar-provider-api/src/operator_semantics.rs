@@ -9,6 +9,45 @@
 
 use crate::tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
 
+mod differential_attention;
+mod encoder_attention;
+mod encoder_ops;
+mod gated_delta_core;
+mod gated_delta_mixer;
+mod gated_delta_mixer_core;
+mod mamba2_mixer;
+mod mamba3_core;
+mod mamba3_mimo;
+mod mamba3_mixer;
+mod projected_differential_attention;
+mod sigmoid_routing;
+mod token_shift;
+pub use differential_attention::{
+    DifferentialAttention, differential_attention, differential_attention_from_attributes,
+};
+pub use encoder_attention::{
+    EncoderAttention, encoder_attention, encoder_attention_from_attributes,
+};
+pub use encoder_ops::{
+    affine_layernorm, affine_layernorm_epsilon, gelu_exact, slice_last, slice_last_attributes,
+};
+pub use gated_delta_mixer::{
+    GatedDeltaMixer, gated_delta_mixer, gated_delta_mixer_from_attributes,
+};
+pub use mamba2_mixer::{Mamba2Mixer, mamba2_mixer, mamba2_mixer_from_attributes};
+pub use mamba3_core::Geometry as Mamba3Mimo;
+pub use mamba3_mimo::{mamba3_mimo, mamba3_mimo_from_attributes};
+pub use mamba3_mixer::{Mamba3Mixer, mamba3_mixer, mamba3_mixer_from_attributes};
+pub use projected_differential_attention::{
+    ProjectedDifferentialAttention, projected_differential_attention,
+    projected_differential_attention_from_attributes,
+};
+pub use sigmoid_routing::{
+    ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
+    sigmoid_routing_from_attributes,
+};
+pub use token_shift::token_shift;
+
 /// The optimized CPU Provider (`execute-quantized-weights-on-cpu`): like
 /// Reference CPU it executes in host memory.
 pub const NATIVE_CPU_PROVIDER_NAME: &str = "magnetar:provider/cpu-native";
@@ -145,6 +184,8 @@ pub enum MoeExpertActivation {
     Silu,
     /// `gelu_tanh(gate) * up` (`activation = "gelu_tanh"`).
     GeluTanh,
+    /// Ungated `relu(gate)²` (`activation = "relu_squared"`).
+    ReluSquared,
 }
 
 impl MoeExpertActivation {
@@ -154,14 +195,16 @@ impl MoeExpertActivation {
         match name {
             "silu" => Some(Self::Silu),
             "gelu_tanh" => Some(Self::GeluTanh),
+            "relu_squared" => Some(Self::ReluSquared),
             _ => None,
         }
     }
 
-    fn apply(self, gate: f32) -> f32 {
+    fn combine(self, gate: f32, up: f32) -> f32 {
         match self {
-            Self::Silu => gate * (1.0 / (1.0 + (-gate).exp())),
-            Self::GeluTanh => gelu_tanh(gate),
+            Self::Silu => gate * (1.0 / (1.0 + (-gate).exp())) * up,
+            Self::GeluTanh => gelu_tanh(gate) * up,
+            Self::ReluSquared => gate.max(0.0).powi(2),
         }
     }
 }
@@ -180,11 +223,55 @@ pub struct MoeExpertOptions<'a> {
 pub fn moe_experts_local_with(
     h: &HostTensor,
     logits: &HostTensor,
+    weights: [&HostTensor; 3],
+    routing: MoeRouting,
+    first: u64,
+    count: u64,
+    options: MoeExpertOptions<'_>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    moe_experts_local_impl(h, logits, weights, routing, first, count, options, None)
+}
+
+/// The additional operands and options for selection-biased sigmoid routing.
+#[derive(Clone, Copy, Debug)]
+pub struct MoeSigmoidExpertOptions<'a> {
+    pub experts: MoeExpertOptions<'a>,
+    pub routing: SigmoidRouting,
+    pub selection_bias: &'a HostTensor,
+}
+
+/// [`moe_experts_local_with`] with selection-biased sigmoid routing.
+pub fn moe_experts_local_sigmoid_with(
+    h: &HostTensor,
+    logits: &HostTensor,
+    weights: [&HostTensor; 3],
+    routing: MoeRouting,
+    first: u64,
+    count: u64,
+    options: MoeSigmoidExpertOptions<'_>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    moe_experts_local_impl(
+        h,
+        logits,
+        weights,
+        routing,
+        first,
+        count,
+        options.experts,
+        Some((options.routing, options.selection_bias)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_experts_local_impl(
+    h: &HostTensor,
+    logits: &HostTensor,
     [gate, up, down]: [&HostTensor; 3],
     routing: MoeRouting,
     first: u64,
     count: u64,
     options: MoeExpertOptions<'_>,
+    sigmoid_routing: Option<(SigmoidRouting, &HostTensor)>,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let MoeRouting {
         experts,
@@ -234,6 +321,25 @@ pub fn moe_experts_local_with(
             scale.shape
         )));
     }
+    if let Some((sigmoid, bias)) = sigmoid_routing
+        && (sigmoid.top_k as u64 != top_k
+            || bias.shape != [experts]
+            || bias.data.len() as u64 != experts)
+    {
+        return Err(shape_error(format!(
+            "moe-experts expects a selection bias of [{experts}] and matching top-k, got {:?}",
+            bias.shape
+        )));
+    }
+    if options.activation == MoeExpertActivation::ReluSquared
+        && h.data
+            .iter()
+            .chain(gate.data.iter())
+            .chain(down.data.iter())
+            .any(|value| !value.is_finite())
+    {
+        return Err(shape_error("non-finite relu_squared expert input".into()));
+    }
     let (first, count) = (first as usize, count as usize);
     let (hidden, intermediate) = (hidden as usize, intermediate as usize);
     let (gate_cols, down_cols) = (gate_cols as usize, down_cols as usize);
@@ -242,7 +348,11 @@ pub fn moe_experts_local_with(
     for token in 0..tokens as usize {
         let x = &h.data[token * hidden..(token + 1) * hidden];
         let row_logits = &logits.data[token * experts as usize..(token + 1) * experts as usize];
-        for (expert, weight) in moe_route(row_logits, top_k as usize, normalize) {
+        let selected = match sigmoid_routing {
+            Some((sigmoid, bias)) => sigmoid_moe_route(row_logits, &bias.data, sigmoid)?,
+            None => moe_route(row_logits, top_k as usize, normalize),
+        };
+        for (expert, weight) in selected {
             let weight = weight
                 * options
                     .per_expert_scale
@@ -255,9 +365,21 @@ pub fn moe_experts_local_with(
                 let (mut g, mut u) = (0.0_f32, 0.0_f32);
                 for (k, &xk) in x.iter().enumerate() {
                     g += xk * gate.data[k * gate_cols + column];
-                    u += xk * up.data[k * gate_cols + column];
+                    if options.activation != MoeExpertActivation::ReluSquared {
+                        u += xk * up.data[k * gate_cols + column];
+                    }
                 }
-                *value = options.activation.apply(g) * u;
+                if options.activation == MoeExpertActivation::ReluSquared && !g.is_finite() {
+                    return Err(shape_error(
+                        "non-finite relu_squared expert projection".into(),
+                    ));
+                }
+                *value = options.activation.combine(g, u);
+                if options.activation == MoeExpertActivation::ReluSquared && !value.is_finite() {
+                    return Err(shape_error(
+                        "non-finite relu_squared expert activation".into(),
+                    ));
+                }
             }
             let row = &mut out[token * hidden..(token + 1) * hidden];
             for (c, slot) in row.iter_mut().enumerate() {
@@ -267,6 +389,9 @@ pub fn moe_experts_local_with(
                     sum += a * down.data[j * down_cols + column];
                 }
                 *slot += weight * sum;
+                if options.activation == MoeExpertActivation::ReluSquared && !slot.is_finite() {
+                    return Err(shape_error("non-finite relu_squared expert output".into()));
+                }
             }
         }
     }
@@ -307,8 +432,123 @@ pub fn gelu_tanh(x: f32) -> f32 {
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh())
 }
 
+/// Elementwise squared ReLU; non-finite inputs or outputs are rejected.
+pub fn relu_squared(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    let mut data = Vec::with_capacity(input.data.len());
+    for &x in &input.data {
+        let value = x.max(0.0).powi(2);
+        if !x.is_finite() || !value.is_finite() {
+            return Err(invalid("non-finite relu_squared input or output"));
+        }
+        data.push(value);
+    }
+    Ok(HostTensor {
+        shape: input.shape.clone(),
+        data,
+    })
+}
+
 fn invalid(reason: impl Into<String>) -> ReferenceCpuError {
     ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason)
+}
+
+/// `geodesic-residual@1`: apply a learned spherical residual update to each
+/// row along the final dimension. Inputs and output are f32, with f32
+/// accumulation; scale and bias are scalar tensors. `layer_index` is the
+/// original zero-based model layer, including when a graph is segmented.
+///
+/// For residual `x` and branch `g`, form `t = g - x * dot(x,g) /
+/// max(dot(x,x), 1e-12)`, `r = max(norm(x), 1e-6)`, and
+/// `n = max(norm(t), 1e-8)`. Set `a = min(n/r, pi/4)` then
+/// `theta = min((a*scale+bias)/(layer_index+1), pi/4)`. The result is
+/// `x*cos(theta) + (t/n)*r*sin(theta)`. The angle has no lower clamp.
+pub fn geodesic_residual(
+    residual: &HostTensor,
+    branch: &HostTensor,
+    scale: &HostTensor,
+    bias: &HostTensor,
+    layer_index: u32,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let shape = &residual.shape;
+    let width = shape.last().and_then(|width| usize::try_from(*width).ok());
+    let elements = shape.iter().try_fold(1usize, |count, dimension| {
+        usize::try_from(*dimension)
+            .ok()
+            .and_then(|d| count.checked_mul(d))
+    });
+    let scalar = |tensor: &HostTensor| {
+        (tensor.shape.is_empty() || tensor.shape == [1]) && tensor.data.len() == 1
+    };
+    if shape.is_empty()
+        || shape.contains(&0)
+        || residual.shape != branch.shape
+        || elements != Some(residual.data.len())
+        || residual.data.len() != branch.data.len()
+        || !scalar(scale)
+        || !scalar(bias)
+        || layer_index == u32::MAX
+    {
+        return Err(invalid(
+            "geodesic-residual has invalid tensor shapes or layer index",
+        ));
+    }
+    let width = width.ok_or_else(|| invalid("geodesic-residual row width is too large"))?;
+    let mut result = Vec::with_capacity(residual.data.len());
+    if residual
+        .data
+        .iter()
+        .chain(&branch.data)
+        .chain(&scale.data)
+        .chain(&bias.data)
+        .any(|x| !x.is_finite())
+    {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ExecutionFailed,
+            "non-finite geodesic-residual input",
+        ));
+    }
+    for (x, g) in residual
+        .data
+        .chunks_exact(width)
+        .zip(branch.data.chunks_exact(width))
+    {
+        let norm_squared: f32 = x.iter().map(|v| v * v).sum();
+        let dot: f32 = x.iter().zip(g).map(|(a, b)| a * b).sum();
+        let coefficient = dot / norm_squared.max(1e-12);
+        let tangent: Vec<f32> = x.iter().zip(g).map(|(a, b)| b - coefficient * a).collect();
+        let tangent_norm = tangent.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let safe_norm = tangent_norm.max(1e-8);
+        let radius = norm_squared.sqrt().max(1e-6);
+        let angle = (safe_norm / radius).min(std::f32::consts::FRAC_PI_4);
+        let theta = ((angle * scale.data[0] + bias.data[0]) / (layer_index + 1) as f32)
+            .min(std::f32::consts::FRAC_PI_4);
+        if !norm_squared.is_finite()
+            || !dot.is_finite()
+            || !coefficient.is_finite()
+            || !tangent_norm.is_finite()
+            || !theta.is_finite()
+        {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ExecutionFailed,
+                "non-finite geodesic-residual intermediate",
+            ));
+        }
+        let (sin, cos) = theta.sin_cos();
+        for (value, tangent) in x.iter().zip(tangent) {
+            let output = value * cos + (tangent / safe_norm) * radius * sin;
+            if !output.is_finite() {
+                return Err(ReferenceCpuError::new(
+                    ReferenceCpuErrorCode::ExecutionFailed,
+                    "non-finite geodesic-residual output",
+                ));
+            }
+            result.push(output);
+        }
+    }
+    Ok(HostTensor {
+        shape: shape.clone(),
+        data: result,
+    })
 }
 
 /// `activation` with `kind = "softcap"`: `cap * tanh(x / cap)`, `cap`

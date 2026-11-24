@@ -47,15 +47,16 @@ pub(super) fn qwen_real_component_runtime()
     // `model-config` shape, itself additive over `1.0.0`'s
     // `graph-builder`-only world. `1.5.0` (`execute-and-cache-moe-experts`)
     // adds `model-config.mixture-of-experts`, and the Component also checks
-    // `rope-scaling` (`1.4.0`).
+    // `rope-scaling` (`1.4.0`). The current Component also verifies the
+    // checkpoint activation exposed by `1.8.0`.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.5.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.8.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.5.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.8.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -295,7 +296,10 @@ pub fn register_inference_component_artifact(
     // version keep linking.
     // `1.7.0` (`express-latent-attention-forms`) adds latent attention,
     // mixed expert layers, expert routing and the YaRN RoPE case.
-    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"] {
+    for version in [
+        "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
+        "1.12.0",
+    ] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,
@@ -395,11 +399,9 @@ pub fn build_first_native_graphs_from_named_component(
 }
 
 /// [`build_first_native_graphs_from_named_component`] for a loaded Model
-/// Artifact: the graph-builder also offers the artifact's tensors that the
-/// architecture configuration does not derive, with the shapes the
-/// artifact's inventory declares (`weight_shapes_for_artifact`), so a
-/// Component may request every weight the artifact carries and weight
-/// materialization binds.
+/// Artifact: the graph-builder offers the actual tensor inventory and its
+/// declared shapes (`weight_shapes_for_artifact`), so missing or mismatched
+/// weights cannot be hidden by inferred baseline-decoder shapes.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn build_first_native_graphs_from_named_component_for_artifact(
     digest: &ComponentDigest,
@@ -426,6 +428,202 @@ pub fn build_first_native_graphs_from_named_component_for_artifact(
         identity,
         prompt_token_count,
     )
+}
+
+/// Inputs needed to request a single-sequence encoder graph from a registered
+/// Component. Weight shapes are the caller's actual, normalized graph-facing
+/// tensor inventory; this API does not load checkpoint weights.
+#[derive(Clone, Debug)]
+pub struct FirstNativeEncoderGraphRequest {
+    pub architecture: ModelArchitectureConfig,
+    pub encoder: crate::model_config_capability::EncoderGraphConfig,
+    pub weight_shapes: BTreeMap<String, Vec<u64>>,
+    pub identity: ModelComponentIdentity,
+    pub sequence_length: u64,
+}
+
+/// Builds an encoder graph using a trusted, registered Component. The graph
+/// takes f32 `input.token_ids` and `input.attention_mask` tensors of length T
+/// and produces f32 `hidden_states` of shape `[T, hidden_size]`. This only
+/// constructs and validates a graph; it does not load weights or execute it.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn build_first_native_encoder_graph_from_named_component(
+    digest: &ComponentDigest,
+    request: &FirstNativeEncoderGraphRequest,
+) -> Result<ExecutionGraph, E2eConformanceError> {
+    request
+        .architecture
+        .validate()
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: format!("invalid model architecture configuration: {error}"),
+        })?;
+    if request.sequence_length == 0 || request.sequence_length > request.encoder.max_positions {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "encoder sequence length is outside the declared position limit".into(),
+        });
+    }
+    let runtime = named_component_runtime(digest)?;
+    let mut manager = runtime.manager.lock().unwrap();
+    let instance = manager
+        .instantiate_prepared_component(runtime.definition)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let Some(key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
+    let result = (|| {
+        runtime
+            .model_config_capability
+            .bind_config(&key, request.architecture.clone());
+        runtime
+            .model_config_capability
+            .bind_encoder_config(&key, request.encoder.clone())
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            })?;
+        runtime.capability.prepare_session(
+            &key,
+            SessionContext {
+                component_id: request.identity.id.as_str().to_string(),
+                compatibility_key: format!(
+                    "encoder.{}.{}",
+                    request.identity.id, request.identity.version.0
+                ),
+                kv_namespace: "encoder".into(),
+                weight_shapes: request.weight_shapes.clone(),
+                output_edge_name: "hidden_states".into(),
+            },
+        );
+        let invocation = ComponentInvocation::new(
+            instance,
+            WitInterface::new(
+                "magnetar:model-component-graph/encoder-component-graph-producer",
+                "1.12.0",
+            ),
+            "build-encoder-graph",
+        )
+        .with_arguments(vec![ComponentValue::S64(request.sequence_length as i64)]);
+        let result = manager.invoke(invocation).map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let handle = expect_single_string_invocation_result(&result, "build-encoder-graph")?;
+        let graph = runtime
+            .capability
+            .take_graph(&key, &handle)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "build-encoder-graph handle did not resolve to a finished graph".into(),
+            })?;
+        require_declared_features_read(
+            &runtime.model_config_capability,
+            &key,
+            "build-encoder-graph",
+        )?;
+        validate_first_scope_graph(&graph)?;
+        validate_encoder_graph_boundary(&graph, request)?;
+        Ok(graph)
+    })();
+    // Host capability state must be retired on traps and validation failures
+    // as well as on success; a trapped Wasm instance is never reused.
+    runtime.capability.clear_session(&key);
+    runtime.model_config_capability.clear_config(&key);
+    let destroyed = manager.destroy_instance(instance).map_err(|error| {
+        E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        }
+    });
+    match result {
+        Ok(graph) => {
+            destroyed?;
+            Ok(graph)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_encoder_graph_boundary(
+    graph: &ExecutionGraph,
+    request: &FirstNativeEncoderGraphRequest,
+) -> Result<(), E2eConformanceError> {
+    let invalid = || E2eConformanceError::ModelComponentFailed {
+        reason: "encoder Component produced an incompatible graph boundary".into(),
+    };
+    if graph.phase != ExecutionGraphPhase::Encode {
+        return Err(invalid());
+    }
+    for (name, shape) in [
+        ("input.token_ids", vec![request.sequence_length]),
+        ("input.attention_mask", vec![request.sequence_length]),
+        (
+            "hidden_states",
+            vec![request.sequence_length, request.architecture.hidden_size],
+        ),
+    ] {
+        let id = TensorEdgeId::new(name);
+        let edge = graph.edges.get(&id).ok_or_else(invalid)?;
+        if edge.descriptor != f32_tensor_descriptor_from_shape(&shape) {
+            return Err(invalid());
+        }
+        let used = if name == "hidden_states" {
+            graph.nodes.values().any(|node| node.outputs.contains(&id))
+        } else {
+            graph.nodes.values().any(|node| node.inputs.contains(&id))
+        };
+        if !used {
+            return Err(invalid());
+        }
+    }
+    if graph.edges.keys().any(|id| {
+        id.as_str().starts_with("input.")
+            && !matches!(id.as_str(), "input.token_ids" | "input.attention_mask")
+    }) {
+        return Err(invalid());
+    }
+    // Merely consuming an input in some node is insufficient: a Component
+    // could use token IDs or the mask only in a disconnected branch while
+    // producing hidden states independently. Walk backwards from the
+    // declared output through authoritative node inputs and outputs.
+    let producers: BTreeMap<_, _> = graph
+        .nodes
+        .values()
+        .flat_map(|node| node.outputs.iter().map(move |edge| (edge, node)))
+        .collect();
+    let output = TensorEdgeId::new("hidden_states");
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![&output];
+    while let Some(edge) = pending.pop() {
+        if !reachable.insert(edge) {
+            continue;
+        }
+        if let Some(node) = producers.get(edge) {
+            pending.extend(node.inputs.iter());
+        }
+    }
+    if ["input.token_ids", "input.attention_mask"]
+        .iter()
+        .any(|required| !reachable.iter().any(|edge| edge.as_str() == *required))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Encoder graph construction fails closed when no Component engine is
+/// available; no unattested native fallback graph is synthesized.
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
+pub fn build_first_native_encoder_graph_from_named_component(
+    _digest: &ComponentDigest,
+    _request: &FirstNativeEncoderGraphRequest,
+) -> Result<ExecutionGraph, E2eConformanceError> {
+    Err(E2eConformanceError::ModelComponentFailed {
+        reason: "no Component engine is available on this build target".into(),
+    })
 }
 
 /// No Component Engine exists on this build target/feature combination
@@ -580,6 +778,11 @@ pub(super) fn build_first_native_graphs_with_runtime(
     ),
     E2eConformanceError,
 > {
+    config
+        .validate()
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: format!("invalid model architecture configuration: {error}"),
+        })?;
     let mut manager = manager.lock().unwrap();
 
     let instance = manager
@@ -587,14 +790,13 @@ pub(super) fn build_first_native_graphs_with_runtime(
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
+    let Some(engine_key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
     let result = (|| {
-        let engine_key = manager
-            .engine_instance_key(instance)
-            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
-                reason: "component instance has no engine key".into(),
-            })?
-            .to_string();
-
         let export_interface = WitInterface::new(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
@@ -653,10 +855,9 @@ pub(super) fn build_first_native_graphs_with_runtime(
 
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;
+        validate_recurrent_graph_pair(&prefill, &decode, config.num_hidden_layers)?;
         validate_rope_frequency_scaling(&prefill, config)?;
         validate_rope_frequency_scaling(&decode, config)?;
-        capability.clear_session(&engine_key);
-        model_config_capability.clear_config(&engine_key);
         Ok(FirstNativeComponentGraphs {
             prefill_node_count: prefill.nodes.len(),
             decode_node_count: decode.nodes.len(),
@@ -664,8 +865,85 @@ pub(super) fn build_first_native_graphs_with_runtime(
             decode,
         })
     })();
+    capability.clear_session(&engine_key);
+    model_config_capability.clear_config(&engine_key);
     let _ = manager.destroy_instance(instance);
     result.map(|graphs| (graphs, definition, instance))
+}
+
+/// Both phases must describe the same fixed-size slots before they can ever
+/// share a session. Graph-local edge names need not match between phases.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_recurrent_graph_pair(
+    prefill: &ExecutionGraph,
+    decode: &ExecutionGraph,
+    layer_count: u32,
+) -> Result<(), E2eConformanceError> {
+    let incompatible = || E2eConformanceError::ModelComponentFailed {
+        reason: "prefill and decode graphs have incompatible recurrent state schemas or phases"
+            .into(),
+    };
+    let prefill_states = prefill
+        .recurrent_state_bindings()
+        .map_err(|_| incompatible())?;
+    let decode_states = decode
+        .recurrent_state_bindings()
+        .map_err(|_| incompatible())?;
+    if prefill.phase != ExecutionGraphPhase::Prefill
+        || decode.phase != ExecutionGraphPhase::Decode
+        || !prefill_states
+            .iter()
+            .map(|binding| &binding.layout)
+            .eq(decode_states.iter().map(|binding| &binding.layout))
+        || prefill_states
+            .iter()
+            .any(|binding| binding.layout.layer >= layer_count)
+    {
+        return Err(incompatible());
+    }
+    Ok(())
+}
+
+/// A segment may only read or produce state belonging to its own layers.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_segment_recurrent_scope(
+    graph: &ExecutionGraph,
+    phase: ExecutionGraphPhase,
+    start: u32,
+    end: u32,
+) -> Result<(), E2eConformanceError> {
+    if graph.phase != phase
+        || graph.edges.values().any(|edge| {
+            edge.recurrent_state
+                .as_ref()
+                .is_some_and(|state| state.layer < start || state.layer >= end)
+        })
+    {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason:
+                "segment graph has an incompatible phase or recurrent state outside its layer range"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the WIT segment precondition before invoking a Component.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub(super) fn validate_segment_bounds(
+    config: &FirstNativeModelConfig,
+    start: u32,
+    end: u32,
+) -> Result<(), E2eConformanceError> {
+    if start > end || u64::from(end) > config.architecture.layer_count {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: format!(
+                "invalid decoder segment {start}..{end} for {} layers",
+                config.architecture.layer_count
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// [`build_first_native_graphs_with_runtime`]'s per-Device pipeline-
@@ -697,6 +975,7 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
     start_layer: u32,
     end_layer: u32,
 ) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    validate_segment_bounds(config, start_layer, end_layer)?;
     let mut manager = manager.lock().unwrap();
 
     let instance = manager
@@ -704,19 +983,23 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
+    let Some(engine_key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
     let result = (|| {
-        let engine_key = manager
-            .engine_instance_key(instance)
-            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
-                reason: "component instance has no engine key".into(),
-            })?
-            .to_string();
-
         let export_interface = WitInterface::new(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
         let architecture_config = architecture_config_from_first_native_model_config(config);
+        architecture_config.validate().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: format!("invalid model architecture configuration: {error}"),
+            }
+        })?;
         let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
@@ -757,11 +1040,17 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
         )?;
 
         validate_first_scope_graph(&segment)?;
+        validate_segment_recurrent_scope(
+            &segment,
+            ExecutionGraphPhase::Prefill,
+            start_layer,
+            end_layer,
+        )?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
-        capability.clear_session(&engine_key);
-        model_config_capability.clear_config(&engine_key);
         Ok(segment)
     })();
+    capability.clear_session(&engine_key);
+    model_config_capability.clear_config(&engine_key);
     let _ = manager.destroy_instance(instance);
     result.map(|graph| (graph, definition, instance))
 }
@@ -814,6 +1103,7 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
     start_layer: u32,
     end_layer: u32,
 ) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    validate_segment_bounds(config, start_layer, end_layer)?;
     let mut manager = manager.lock().unwrap();
 
     let instance = manager
@@ -821,19 +1111,23 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
+    let Some(engine_key) = manager.engine_instance_key(instance).map(str::to_string) else {
+        let _ = manager.destroy_instance(instance);
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "component instance has no engine key".into(),
+        });
+    };
     let result = (|| {
-        let engine_key = manager
-            .engine_instance_key(instance)
-            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
-                reason: "component instance has no engine key".into(),
-            })?
-            .to_string();
-
         let export_interface = WitInterface::new(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
         let architecture_config = architecture_config_from_first_native_model_config(config);
+        architecture_config.validate().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: format!("invalid model architecture configuration: {error}"),
+            }
+        })?;
         let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
@@ -874,11 +1168,17 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
         )?;
 
         validate_first_scope_graph(&segment)?;
+        validate_segment_recurrent_scope(
+            &segment,
+            ExecutionGraphPhase::Decode,
+            start_layer,
+            end_layer,
+        )?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
-        capability.clear_session(&engine_key);
-        model_config_capability.clear_config(&engine_key);
         Ok(segment)
     })();
+    capability.clear_session(&engine_key);
+    model_config_capability.clear_config(&engine_key);
     let _ = manager.destroy_instance(instance);
     result.map(|graph| (graph, definition, instance))
 }
@@ -1021,8 +1321,8 @@ pub(super) fn inference_component_runtime_limits() -> ComponentResourceLimits {
     }
 }
 
-/// Refuses a graph built while the bound configuration declares a `1.7.0`
-/// feature (latent attention, mixed expert layers, expert routing) that the
+/// Refuses a graph built while the bound configuration declares a
+/// per-layer layout, architecture option, or other feature that the
 /// Model Component never read (`express-latent-attention-forms`): a
 /// Component compiled against an earlier version cannot know of it, and a
 /// graph that ignores it computes another model.
@@ -1038,8 +1338,8 @@ fn require_declared_features_read(
     }
     Err(E2eConformanceError::ModelComponentFailed {
         reason: format!(
-            "{export}: the checkpoint declares {}, which the Model Component never read from \
-             model-config; it does not implement this model",
+            "{export}: the Model Component never read required model-config values {}; \
+             it cannot safely implement this model",
             unread.join(", ")
         ),
     })

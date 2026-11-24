@@ -18,6 +18,8 @@ fn sample_config() -> ModelArchitectureConfig {
         rope_theta: 1_000_000.0,
         rope_scaling_factor: None,
         rope_frequency_scaling: None,
+        rope_layers: None,
+        hidden_activation: None,
         tie_word_embeddings: true,
         attention_bias: true,
         mixture_of_experts: None,
@@ -30,6 +32,195 @@ fn sample_config() -> ModelArchitectureConfig {
         bos_token_id: None,
         eos_token_id: Some(151643),
     }
+}
+
+#[test]
+fn encoder_configuration_is_validated_bound_per_instance_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    let mut architecture = sample_config();
+    architecture.hidden_size = 8;
+    architecture.intermediate_size = 12;
+    architecture.num_hidden_layers = 2;
+    architecture.num_attention_heads = 2;
+    architecture.num_key_value_heads = 2;
+    architecture.head_dim = 4;
+    architecture.vocab_size = 24;
+    architecture.attention_bias = false;
+    architecture.hidden_activation = Some("gelu".into());
+    let encoder = EncoderGraphConfig {
+        norm_epsilon: 1e-5,
+        max_positions: 64,
+        norm_bias: false,
+        attention_bias: false,
+        mlp_bias: true,
+        layers: vec![
+            EncoderLayerConfig {
+                local_radius: None,
+                rope_theta: 160_000.0,
+                attention_normalization: false,
+            },
+            EncoderLayerConfig {
+                local_radius: Some(2),
+                rope_theta: 10_000.0,
+                attention_normalization: true,
+            },
+        ],
+    };
+    assert!(
+        capability
+            .bind_encoder_config("missing", encoder.clone())
+            .is_err()
+    );
+    capability.bind_config("first", architecture.clone());
+    capability.bind_config("second", architecture.clone());
+    capability
+        .bind_encoder_config("first", encoder.clone())
+        .unwrap();
+    capability.call("first", "hidden-activation", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["encoder-config"]
+    );
+    assert_eq!(
+        capability.call("second", "encoder-config", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    let values = capability.call("first", "encoder-config", &[]).unwrap();
+    let [ComponentValue::Option(Some(value))] = values.as_slice() else {
+        panic!("missing encoder configuration")
+    };
+    let ComponentValue::Record(fields) = value.as_ref() else {
+        panic!("invalid encoder configuration record")
+    };
+    assert_eq!(
+        fields[0],
+        ("norm-epsilon".into(), ComponentValue::F64(1e-5))
+    );
+    assert_eq!(fields[1], ("max-positions".into(), ComponentValue::S64(64)));
+    assert_eq!(fields[4], ("mlp-bias".into(), ComponentValue::Bool(true)));
+    let ComponentValue::List(layers) = &fields[5].1 else {
+        panic!("missing encoder layers")
+    };
+    assert_eq!(layers.len(), 2);
+    let ComponentValue::Record(local) = &layers[1] else {
+        panic!("invalid encoder layer")
+    };
+    assert_eq!(
+        local[0],
+        (
+            "local-radius".into(),
+            ComponentValue::Option(Some(Box::new(ComponentValue::U32(2))))
+        )
+    );
+    assert_eq!(
+        local[1],
+        ("rope-theta".into(), ComponentValue::F64(10_000.0))
+    );
+    assert!(capability.unread_declared_features("first").is_empty());
+    capability
+        .bind_encoder_config("first", encoder.clone())
+        .unwrap();
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["encoder-config"]
+    );
+    capability.bind_config("first", architecture.clone());
+    assert_eq!(
+        capability.call("first", "encoder-config", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    let mut invalid = encoder;
+    invalid.layers[1].local_radius = Some(0);
+    assert!(capability.bind_encoder_config("first", invalid).is_err());
+    assert!(capability.call("first", "model-config", &[]).is_err());
+    assert!(capability.call("second", "model-config", &[]).is_ok());
+}
+
+#[test]
+fn per_layer_rope_is_exposed_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.rope_layers = Some((0..24).map(|layer| layer % 4 != 3).collect());
+    capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec!["rope-layers"]
+    );
+    let result = capability.call("a", "rope-layers", &[]).unwrap();
+    let [ComponentValue::Option(Some(value))] = result.as_slice() else {
+        panic!("missing RoPE selection")
+    };
+    let ComponentValue::List(layers) = value.as_ref() else {
+        panic!("wrong RoPE selection type")
+    };
+    assert_eq!(layers.len(), 24);
+    assert_eq!(layers[3], ComponentValue::Bool(false));
+    assert!(capability.unread_declared_features("a").is_empty());
+}
+
+#[test]
+fn expert_normalization_distinguishes_top_one_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    for (normalization, expected) in [
+        (ExpertNormalization::Never, "never"),
+        (ExpertNormalization::MultipleExperts, "multiple-experts"),
+        (ExpertNormalization::Always, "always"),
+    ] {
+        let mut config = sample_config();
+        config.expert_routing = Some(ExpertRoutingConfig {
+            scoring: ExpertScoring::Sigmoid,
+            groups: None,
+            routed_scaling_factor: 2.45,
+            selection_bias: true,
+            normalization: Some(normalization),
+            shared_expert_gated: false,
+        });
+        capability.bind_config("a", config);
+        capability.call("a", "hidden-activation", &[]).unwrap();
+        capability.call("a", "expert-routing", &[]).unwrap();
+        assert_eq!(
+            capability.unread_declared_features("a"),
+            vec!["expert-normalization"]
+        );
+        assert_eq!(
+            capability.call("a", "expert-normalization", &[]).unwrap(),
+            vec![ComponentValue::Option(Some(Box::new(
+                ComponentValue::Enum(expected.into())
+            )))]
+        );
+        assert!(capability.unread_declared_features("a").is_empty());
+    }
+}
+
+#[test]
+fn latent_norm_epsilon_must_be_read_when_declared() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.latent_attention = Some(LatentAttentionConfig {
+        q_lora_rank: Some(16),
+        kv_lora_rank: 16,
+        qk_nope_head_dim: 4,
+        qk_rope_head_dim: 4,
+        v_head_dim: 8,
+        norm_eps: Some(1e-6),
+    });
+    capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
+    capability
+        .call("a", "multi-head-latent-attention", &[])
+        .unwrap();
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec!["latent-norm-epsilon"]
+    );
+    assert_eq!(
+        capability.call("a", "latent-norm-epsilon", &[]).unwrap(),
+        vec![ComponentValue::Option(Some(Box::new(ComponentValue::F64(
+            1e-6
+        ))))]
+    );
+    assert!(capability.unread_declared_features("a").is_empty());
 }
 
 #[test]
@@ -197,6 +388,75 @@ fn layer_layout_and_options_are_none_for_a_uniform_model() {
 }
 
 #[test]
+fn declared_layer_layout_and_options_must_be_read_per_instance() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.layer_layout = Some(vec![
+        sample_layer(Some(32), None);
+        config.num_hidden_layers as usize
+    ]);
+    config.final_logit_softcapping = Some(30.0);
+    capability.bind_config("first", config.clone());
+    capability.bind_config("second", config);
+    capability.call("first", "hidden-activation", &[]).unwrap();
+    capability.call("second", "hidden-activation", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["layer-layout", "options"]
+    );
+    capability.call("first", "layer-layout", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("first"),
+        vec!["options"]
+    );
+    assert_eq!(
+        capability.unread_declared_features("second"),
+        vec!["layer-layout", "options"]
+    );
+    capability.call("first", "options", &[]).unwrap();
+    assert!(capability.unread_declared_features("first").is_empty());
+}
+
+#[test]
+fn activation_requires_a_read_even_when_unknown() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    capability.bind_config("unknown", config.clone());
+    assert_eq!(
+        capability.unread_declared_features("unknown"),
+        vec!["hidden-activation"]
+    );
+    assert_eq!(
+        capability
+            .call("unknown", "hidden-activation", &[])
+            .unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    assert!(capability.unread_declared_features("unknown").is_empty());
+    config.hidden_activation = Some("silu".into());
+    capability.bind_config("legacy", config.clone());
+    assert_eq!(
+        capability.unread_declared_features("legacy"),
+        vec!["hidden-activation"]
+    );
+    config.hidden_activation = Some("gelu".into());
+    capability.bind_config("configured", config);
+    assert_eq!(
+        capability.unread_declared_features("configured"),
+        vec!["hidden-activation"]
+    );
+    assert_eq!(
+        capability
+            .call("configured", "hidden-activation", &[])
+            .unwrap(),
+        vec![ComponentValue::Option(Some(Box::new(
+            ComponentValue::String("gelu".into())
+        )))]
+    );
+    assert!(capability.unread_declared_features("configured").is_empty());
+}
+
+#[test]
 fn layer_layout_encodes_one_record_per_layer_and_options_their_values() {
     let capability = ModelConfigCapability::new();
     let mut config = sample_config();
@@ -327,6 +587,7 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
     let mut config = sample_config();
     assert!(capability.unread_declared_features("a").is_empty());
     capability.bind_config("a", config.clone());
+    capability.call("a", "hidden-activation", &[]).unwrap();
     assert!(capability.unread_declared_features("a").is_empty());
 
     config.mixture_of_experts = Some(MixtureOfExpertsConfig {
@@ -343,8 +604,10 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
         qk_nope_head_dim: 48,
         qk_rope_head_dim: 16,
         v_head_dim: 48,
+        norm_eps: None,
     });
     capability.bind_config("a", config.clone());
+    capability.call("a", "hidden-activation", &[]).unwrap();
     assert_eq!(
         capability.unread_declared_features("a"),
         vec!["multi-head-latent-attention", "mixture-of-experts-layers"]
@@ -363,8 +626,10 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
     assert!(capability.unread_declared_features("a").is_empty());
     // Another instance, and a fresh binding of the same one, start over.
     capability.bind_config("b", config.clone());
+    capability.call("b", "hidden-activation", &[]).unwrap();
     assert_eq!(capability.unread_declared_features("b").len(), 2);
     capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
     assert_eq!(capability.unread_declared_features("a").len(), 2);
     capability.clear_config("a");
     assert!(capability.unread_declared_features("a").is_empty());

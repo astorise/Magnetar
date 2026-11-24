@@ -954,6 +954,36 @@ fn semantic_graph_fingerprint_includes_topology_and_tensor_descriptors() {
     );
 }
 
+#[test]
+fn semantic_graph_fingerprint_includes_recurrent_state_identity() {
+    use crate::execution_graph::{GraphRecurrentStateBehavior, GraphRecurrentStateMetadata};
+    let graph = test_graph(1);
+    let mut stateful = graph.clone();
+    let edge = stateful.edges.values_mut().next().unwrap();
+    edge.recurrent_state = Some(GraphRecurrentStateMetadata {
+        resource_id: "model.state.layer0.conv".into(),
+        layer: 0,
+        slot: "conv".into(),
+        behavior: GraphRecurrentStateBehavior::Input,
+        compatibility_key: "model-v1".into(),
+    });
+    assert_ne!(
+        semantic_graph_fingerprint(&graph),
+        semantic_graph_fingerprint(&stateful)
+    );
+    let original = semantic_graph_fingerprint(&stateful);
+    stateful
+        .edges
+        .values_mut()
+        .next()
+        .unwrap()
+        .recurrent_state
+        .as_mut()
+        .unwrap()
+        .slot = "ssm".into();
+    assert_ne!(original, semantic_graph_fingerprint(&stateful));
+}
+
 fn test_plan() -> PreparedExecutionPlan {
     PreparedExecutionPlan::new(
         PreparedExecutionPlanId::new("decode-plan").unwrap(),

@@ -7,6 +7,283 @@ use super::*;
 use crate::{ShapeDescriptor, TensorDescriptor};
 
 use crate::compute_types::LayoutDescriptor;
+
+#[test]
+fn mamba3_operators_validate_four_state_tensors_and_geometry() {
+    let catalog = initial_operator_catalog();
+    let tensor = |shape: &[u64]| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(shape.to_vec()),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        )
+    };
+    let geometry = BTreeMap::from([
+        ("heads".into(), OperatorAttributeValue::Integer(2)),
+        ("groups".into(), OperatorAttributeValue::Integer(1)),
+        ("rank".into(), OperatorAttributeValue::Integer(2)),
+        ("head_dim".into(), OperatorAttributeValue::Integer(2)),
+        ("state_dim".into(), OperatorAttributeValue::Integer(4)),
+        ("angles".into(), OperatorAttributeValue::Integer(1)),
+    ]);
+    let mimo_inputs = vec![
+        tensor(&[2, 2, 1, 4]),
+        tensor(&[2, 2, 1, 4]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2, 1]),
+        tensor(&[2, 1]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2]),
+    ];
+    let states = [
+        tensor(&[2, 1]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2]),
+    ];
+    let mut mimo_outputs = vec![tensor(&[2, 2, 2])];
+    mimo_outputs.extend(states.clone());
+    let mimo = catalog
+        .get(&OperatorId::magnetar(
+            "mamba3-mimo",
+            1,
+            OperatorFamily::LinearAlgebra,
+        ))
+        .unwrap();
+    mimo.validate_invocation(&mimo_inputs, &mimo_outputs, &geometry)
+        .unwrap();
+    for index in 8..12 {
+        let mut invalid = mimo_inputs.clone();
+        invalid[index] = tensor(&[1]);
+        assert!(
+            mimo.validate_invocation(&invalid, &mimo_outputs, &geometry)
+                .is_err()
+        );
+    }
+    let mixer_inputs = vec![
+        tensor(&[2, 2]),
+        states[0].clone(),
+        states[1].clone(),
+        states[2].clone(),
+        states[3].clone(),
+        tensor(&[2, 14]),
+        tensor(&[2, 17]),
+        tensor(&[2]),
+        tensor(&[4]),
+        tensor(&[4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 4]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2, 2, 2]),
+        tensor(&[2]),
+    ];
+    let mut mixer_outputs = vec![tensor(&[2, 4])];
+    mixer_outputs.extend(states);
+    let mut mixer_attrs = geometry.clone();
+    mixer_attrs.insert("epsilon".into(), OperatorAttributeValue::Float(1e-5));
+    mixer_attrs.insert("decay_floor".into(), OperatorAttributeValue::Float(1e-4));
+    mixer_attrs.insert(
+        "zero_centered_norm".into(),
+        OperatorAttributeValue::Boolean(false),
+    );
+    let mixer = catalog
+        .get(&OperatorId::magnetar(
+            "mamba3-mixer",
+            1,
+            OperatorFamily::LinearAlgebra,
+        ))
+        .unwrap();
+    mixer
+        .validate_invocation(&mixer_inputs, &mixer_outputs, &mixer_attrs)
+        .unwrap();
+    for index in 1..5 {
+        let mut invalid = mixer_outputs.clone();
+        invalid[index] = tensor(&[1]);
+        assert!(
+            mixer
+                .validate_invocation(&mixer_inputs, &invalid, &mixer_attrs)
+                .is_err()
+        );
+    }
+    for (key, value) in [
+        ("angles", OperatorAttributeValue::Integer(2)),
+        ("groups", OperatorAttributeValue::Integer(2)),
+        ("head_dim", OperatorAttributeValue::Integer(i64::MAX)),
+        ("epsilon", OperatorAttributeValue::Float(0.0)),
+        ("decay_floor", OperatorAttributeValue::Float(-1.0)),
+    ] {
+        let mut invalid = mixer_attrs.clone();
+        invalid.insert(key.into(), value);
+        assert!(
+            mixer
+                .validate_invocation(&mixer_inputs, &mixer_outputs, &invalid)
+                .is_err(),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn mamba2_mixer_validates_state_shapes_biases_and_numerics_before_dispatch() {
+    let catalog = initial_operator_catalog();
+    let spec = catalog
+        .get(&OperatorId::magnetar(
+            "mamba2-mixer",
+            1,
+            OperatorFamily::LinearAlgebra,
+        ))
+        .unwrap();
+    let tensor = |shape: &[u64]| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(shape.to_vec()),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        )
+    };
+    for conv_bias in [false, true] {
+        for linear_bias in [false, true] {
+            let mut inputs = vec![
+                tensor(&[3, 6]),
+                tensor(&[10, 2]),
+                tensor(&[2, 2, 3]),
+                tensor(&[6, 16]),
+                tensor(&[10, 2]),
+                tensor(&[2]),
+                tensor(&[2]),
+                tensor(&[2]),
+                tensor(&[4]),
+                tensor(&[4, 6]),
+            ];
+            if conv_bias {
+                inputs.push(tensor(&[10]));
+            }
+            if linear_bias {
+                inputs.extend([tensor(&[16]), tensor(&[6])]);
+            }
+            let outputs = vec![tensor(&[3, 6]), tensor(&[10, 2]), tensor(&[2, 2, 3])];
+            let mut attrs = BTreeMap::from([
+                ("heads".into(), OperatorAttributeValue::Integer(2)),
+                ("head_dim".into(), OperatorAttributeValue::Integer(2)),
+                ("groups".into(), OperatorAttributeValue::Integer(1)),
+                ("state_dim".into(), OperatorAttributeValue::Integer(3)),
+                ("conv_kernel".into(), OperatorAttributeValue::Integer(2)),
+                ("epsilon".into(), OperatorAttributeValue::Float(1e-5)),
+                ("dt_min".into(), OperatorAttributeValue::Float(0.0)),
+                (
+                    "conv_bias".into(),
+                    OperatorAttributeValue::Boolean(conv_bias),
+                ),
+                (
+                    "linear_bias".into(),
+                    OperatorAttributeValue::Boolean(linear_bias),
+                ),
+            ]);
+            spec.validate_invocation(&inputs, &outputs, &attrs).unwrap();
+            for index in [1, 2, 3, 4, 9] {
+                let mut bad = inputs.clone();
+                bad[index] = tensor(&[1]);
+                assert!(spec.validate_invocation(&bad, &outputs, &attrs).is_err());
+            }
+            let mut bad_outputs = outputs.clone();
+            bad_outputs[2] = tensor(&[2, 2, 4]);
+            assert!(
+                spec.validate_invocation(&inputs, &bad_outputs, &attrs)
+                    .is_err()
+            );
+            let mut missing = inputs.clone();
+            missing.pop();
+            assert!(
+                spec.validate_invocation(&missing, &outputs, &attrs)
+                    .is_err()
+            );
+            for (key, invalid) in [
+                ("groups", OperatorAttributeValue::Integer(3)),
+                ("state_dim", OperatorAttributeValue::Integer(i64::MAX)),
+                ("epsilon", OperatorAttributeValue::Float(0.0)),
+                ("dt_min", OperatorAttributeValue::Float(-0.1)),
+                ("dt_max", OperatorAttributeValue::Float(-0.1)),
+            ] {
+                let previous = attrs.insert(key.into(), invalid);
+                assert!(
+                    spec.validate_invocation(&inputs, &outputs, &attrs).is_err(),
+                    "{key}"
+                );
+                if let Some(previous) = previous {
+                    attrs.insert(key.into(), previous);
+                } else {
+                    attrs.remove(key);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn geodesic_residual_requires_matching_tensors_scalar_parameters_and_layer_index() {
+    let catalog = initial_operator_catalog();
+    let spec = catalog
+        .get(&OperatorId::magnetar(
+            "geodesic-residual",
+            1,
+            OperatorFamily::Tensor,
+        ))
+        .unwrap();
+    let tensor = |shape: &[u64], dtype| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(shape.to_vec()),
+            DTypeDescriptor::portable(dtype),
+        )
+    };
+    let x = tensor(&[2, 4], ComputeDType::Float32);
+    let scale = tensor(&[1], ComputeDType::Float32);
+    let bias = tensor(&[], ComputeDType::Float32);
+    let inputs = vec![x.clone(), x.clone(), scale, bias];
+    let attributes = BTreeMap::from([("layer_index".into(), OperatorAttributeValue::Integer(7))]);
+    assert!(
+        spec.validate_invocation(&inputs, std::slice::from_ref(&x), &attributes)
+            .is_ok()
+    );
+    let mut bad = inputs.clone();
+    bad[1] = tensor(&[1, 4], ComputeDType::Float32);
+    assert!(
+        spec.validate_invocation(&bad, std::slice::from_ref(&x), &attributes)
+            .is_err()
+    );
+    bad = inputs.clone();
+    bad[2] = tensor(&[2], ComputeDType::Float32);
+    assert!(
+        spec.validate_invocation(&bad, std::slice::from_ref(&x), &attributes)
+            .is_err()
+    );
+    bad = inputs.clone();
+    bad[2] = tensor(&[1], ComputeDType::Float16);
+    assert!(
+        spec.validate_invocation(&bad, std::slice::from_ref(&x), &attributes)
+            .is_err()
+    );
+    for index in [-1, u32::MAX as i64] {
+        let attributes =
+            BTreeMap::from([("layer_index".into(), OperatorAttributeValue::Integer(index))]);
+        assert!(
+            spec.validate_invocation(&inputs, std::slice::from_ref(&x), &attributes)
+                .is_err()
+        );
+    }
+    assert!(
+        spec.validate_invocation(&inputs, std::slice::from_ref(&x), &BTreeMap::new())
+            .is_err()
+    );
+}
 #[test]
 fn operator_catalog_contains_required_families_and_initial_operators() {
     let families = OperatorFamily::ALL
@@ -354,7 +631,7 @@ fn optional_inputs_scalar_mul_and_the_layered_model_attributes_validate() {
             OperatorFamily::LinearAlgebra,
         ))
         .unwrap();
-    assert_eq!((moe.min_inputs, moe.inputs), (5, 6));
+    assert_eq!((moe.min_inputs, moe.inputs), (5, 7));
 
     for (operator, family, name, value) in [
         (
@@ -492,6 +769,71 @@ fn required_kernel_features_name_only_non_baseline_forms() {
         ),
         vec![MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE]
     );
+    let sigmoid = attributes(&[(
+        "routing_scoring",
+        OperatorAttributeValue::String("sigmoid".into()),
+    )]);
+    assert_eq!(
+        required_kernel_features("moe-experts", &sigmoid, 6),
+        vec![MOE_SIGMOID_ROUTING_FEATURE]
+    );
+    assert_eq!(
+        required_kernel_features("moe-experts", &sigmoid, 7),
+        vec![MOE_SIGMOID_ROUTING_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE]
+    );
+    let relu_squared = attributes(&[
+        (
+            "activation",
+            OperatorAttributeValue::String("relu_squared".into()),
+        ),
+        (
+            "routing_scoring",
+            OperatorAttributeValue::String("sigmoid".into()),
+        ),
+    ]);
+    assert_eq!(
+        required_kernel_features("moe-experts", &relu_squared, 5),
+        vec![
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_RELU_SQUARED_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+        ]
+    );
+    assert_eq!(
+        required_kernel_features("moe-experts", &relu_squared, 6),
+        vec![
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_RELU_SQUARED_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+            MOE_PER_EXPERT_SCALE_FEATURE,
+        ]
+    );
+    assert_eq!(
+        required_kernel_features(
+            "activation",
+            &attributes(&[(
+                "kind",
+                OperatorAttributeValue::String("relu_squared".into())
+            )]),
+            1
+        ),
+        vec![ACTIVATION_RELU_SQUARED_FEATURE]
+    );
+    for name in [
+        "routing_scale",
+        "routing_group_count",
+        "routing_group_selected",
+        "routing_normalization",
+    ] {
+        assert_eq!(
+            required_kernel_features(
+                "moe-experts",
+                &attributes(&[(name, OperatorAttributeValue::Boolean(false))]),
+                5
+            ),
+            vec![MOE_SIGMOID_ROUTING_FEATURE]
+        );
+    }
 }
 
 /// `express-latent-attention-forms`: the value width, head-wise `concat`

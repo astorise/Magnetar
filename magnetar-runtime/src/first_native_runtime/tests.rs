@@ -989,8 +989,8 @@ fn first_native_dispatch_source_contains_no_provider_downcast() {
 /// `FirstNativeChatSession::turn`, and -- since
 /// `wire-inference-component-to-generic-registry` --
 /// `build_first_native_graphs_from_named_component`'s own no-engine
-/// fallback, the same fail-closed guarantee extended to a caller-registered
-/// Component instead of only the CLI's hardcoded singleton).
+/// fallback, plus the corresponding encoder graph entry point. These extend
+/// the same fail-closed guarantee to caller-registered Components.
 #[test]
 fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
     let source = FIRST_NATIVE_SOURCE;
@@ -1004,10 +1004,11 @@ fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
         .matches("no Component engine is available on this build target")
         .count();
     assert_eq!(
-        fail_closed_occurrences, 4,
-        "expected exactly the four documented production fail-closed stubs \
+        fail_closed_occurrences, 5,
+        "expected exactly the five documented production fail-closed stubs \
          (first_native_component_graphs_for_prompt, run_success_path_with_prompt, \
-         FirstNativeChatSession::turn, build_first_native_graphs_from_named_component) to share \
+         FirstNativeChatSession::turn, build_first_native_graphs_from_named_component, \
+         build_first_native_encoder_graph_from_named_component) to share \
          this exact structured error message when no strict Component engine is available; \
          found {fail_closed_occurrences}. If a call site was added or removed, update this count."
     );
@@ -4180,6 +4181,7 @@ pub(super) fn forward_segment_logits_with_weights(
 pub(super) fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
     let architecture = first_native_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
     let mut config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    config.hidden_activation = Some("silu".into());
     config.tied_embeddings = true;
     let identity = first_native_component_identity(
         ModelComponentId::new("segment-split-fixture").expect("static id is valid"),
@@ -4837,6 +4839,9 @@ pub(super) fn check_incremental_decode_matches_full_sequence_oracle(
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
+        session: None,
+        tokenizer: generation_tokenizer_reference(fixture),
+        generated: FirstNativeCommittedTokens::default(),
         // The hand-rolled decode oracle's own return is a plain, densely
         // 0-indexed `Vec` (it processes every layer unconditionally, never
         // a segment), so its Vec index already equals the real layer
@@ -5682,6 +5687,9 @@ pub(super) fn check_incremental_decode_rejects_missing_layer_kv(
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
+        session: None,
+        tokenizer: generation_tokenizer_reference(fixture),
+        generated: FirstNativeCommittedTokens::default(),
         layer_kv: LayerKvMap::new(),
         provider: None,
     };
@@ -6139,6 +6147,18 @@ pub(super) fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
     .map_err(E2eConformanceError::from)?;
     let _ = provider.release_tensor(&pending_v);
 
+    let active_owned_by_cache = |runtime: &Runtime| {
+        runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| {
+                allocation.state == MemoryAllocationState::Active
+                    && allocation.request.owner == MemoryAllocationOwner::Session(cache.to_string())
+            })
+            .count()
+    };
+    let allocations_before_failed_commit = active_owned_by_cache(&runtime);
+
     match engine.commit_generation_step(&mut runtime, &request, &generated, 2, &decode_step) {
         Err(InferenceApiError::KvCacheUnavailable { .. }) => {}
         Err(error) => {
@@ -6151,6 +6171,15 @@ pub(super) fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
                 reason: "commit succeeded despite a missing pending resource for one layer".into(),
             });
         }
+    }
+
+    let allocations_after_failed_commit = active_owned_by_cache(&runtime);
+    if allocations_after_failed_commit != allocations_before_failed_commit {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "a failed KV commit leaked an active allocation: before {allocations_before_failed_commit}, after {allocations_after_failed_commit}"
+            ),
+        });
     }
 
     let committed_after_failed_commit = runtime.kv_cache(&cache)?.layer_resources.clone();
@@ -6323,6 +6352,12 @@ pub(super) fn check_kv_stale_pending_state_does_not_survive_a_failed_retry(
     {
         return Err(E2eConformanceError::GenerationFailed {
             reason: "retry with an unregistered provider unexpectedly succeeded".into(),
+        });
+    }
+
+    if runtime.kv_caches().caches().next().is_some() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "failed prefill retry left an abandoned KV cache".into(),
         });
     }
 

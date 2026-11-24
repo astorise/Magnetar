@@ -97,6 +97,9 @@ impl TensorParallelPlan {
                     _ => continue,
                 };
                 let weight_inputs: &[usize] = match (node.operator.name(), shard) {
+                    ("moe-experts", WeightShard::Experts { .. }) if matches!(node.attributes.get("activation"), Some(OperatorAttributeValue::String(name)) if name == "relu_squared") => {
+                        &[2, 3]
+                    }
                     ("moe-experts", WeightShard::Experts { .. }) => &[2, 3, 4],
                     (_, WeightShard::Experts { .. }) => continue,
                     ("matmul" | "matmul-residual", _) => &[1],
