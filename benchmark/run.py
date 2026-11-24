@@ -25,6 +25,7 @@ def main(argv=None):
     parser.add_argument("--binary", help="Path to the Candle example or llama-completion executable")
     parser.add_argument("--url", help="Base URL of the running Ollama or Strata server")
     parser.add_argument("--model", help="Model name exposed by the server")
+    parser.add_argument("--server-log", help="The Ollama server's log, for the compute it discovered")
     parser.add_argument("--revision", help="Engine version or Git revision, recorded as supplied")
     parser.add_argument("--notes", help="Hardware, driver, model conversion or placement details")
     parser.add_argument("--tokens", type=positive, default=16)

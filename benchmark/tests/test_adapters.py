@@ -71,6 +71,28 @@ class AdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "placement"):
                     ollama.run(args(device="gpu"), Path(tmp) / "gpu")
 
+    def test_ollama_accepts_cpu_repack_buffers_only_without_other_compute(self):
+        # On AMX CPUs, Ollama counts the CPU backend's repacked weights as
+        # size_vram: accepted only when the server discovered the CPU alone.
+        line = ('time=t level=INFO source=types.go:50 msg="inference compute" id={0} '
+                'library={0} compute="" name={0} total="15.6 GiB"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake(url, body=None, **kwargs):
+                if url.endswith("/api/ps"):
+                    return {"models": [{"name": "test:latest", "size_vram": 987926364}]}
+                return {"done": True, "model": "test", "eval_count": 4, "eval_duration": 2_000_000_000}
+            cpu_log = Path(tmp) / "cpu.log"
+            cpu_log.write_text(line.format("cpu"), encoding="utf-8")
+            gpu_log = Path(tmp) / "gpu.log"
+            gpu_log.write_text(line.format("cpu") + line.format("cuda"), encoding="utf-8")
+            with patch.object(ollama, "http_json", side_effect=fake):
+                result = ollama.run(args(server_log=str(cpu_log)), Path(tmp) / "cpu-only")
+                self.assertEqual(result["device_evidence"]["discovered_compute"], ["cpu"])
+                with self.assertRaisesRegex(RuntimeError, "placement"):
+                    ollama.run(args(server_log=str(gpu_log)), Path(tmp) / "with-gpu")
+                with self.assertRaisesRegex(RuntimeError, "placement"):
+                    ollama.run(args(), Path(tmp) / "no-log")
+
     def test_strata_uses_chat_api_and_requires_usage(self):
         with tempfile.TemporaryDirectory() as tmp:
             response = {"choices": [{"finish_reason": "stop"}], "usage": {"completion_tokens": 3}}

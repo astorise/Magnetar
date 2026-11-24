@@ -49,6 +49,10 @@ moteurs :
 * Le placement CUDA est exigé pour Magnetar et AirLLM ; llama.cpp doit
   confirmer des couches déchargées et Ollama une occupation VRAM positive.
   Une valeur VRAM positive ne prouve pas que tout le modèle est sur GPU.
+  Sur un CPU avec AMX, le backend CPU d'Ollama range les poids dans un
+  tampon réarrangé que `/api/ps` compte dans `size_vram` : la cellule CPU
+  l'accepte seulement si le journal du serveur ne signale que le CPU comme
+  calcul découvert (`library=cpu`).
   Sur CPU, Magnetar utilise son Provider CPU optimisé (`cpu-native`), pas le Provider de référence.
 
 Le scénario est court et mono-requête ; il ne permet pas de conclure sur des

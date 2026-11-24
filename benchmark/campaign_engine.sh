@@ -54,7 +54,8 @@ case "$BENCH_ENGINE" in
     if [[ "$ready" != true ]]; then echo 'Ollama did not start' >&2; exit 1; fi
     printf 'FROM %s\n' "$gguf" > "$work/Modelfile"
     "$work/ollama/bin/ollama" create magnetar-bench -f "$work/Modelfile"
-    export BENCH_URL="http://$OLLAMA_HOST" BENCH_MODEL=magnetar-bench BENCH_ENGINE_REF="$version"
+    export BENCH_URL="http://$OLLAMA_HOST" BENCH_MODEL=magnetar-bench BENCH_ENGINE_REF="$version" \
+      BENCH_SERVER_LOG="$RUNNER_TEMP/benchmark-results/ollama-server.log"
     bash benchmark/ci.sh
     ;;
   *) echo "Unexpected campaign engine: $BENCH_ENGINE" >&2; exit 1 ;;

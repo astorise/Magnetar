@@ -1,7 +1,23 @@
 """Benchmark a running Ollama server using its native generation API."""
 import json
+import re
 import time
+from pathlib import Path
 from common import PROMPT, http_json
+
+
+def discovered_compute(server_log):
+    """The compute libraries the Ollama server reported discovering at
+    startup (`msg="inference compute" ... library=...`), or None when the
+    log is not given, unreadable or reports none."""
+    if not server_log:
+        return None
+    try:
+        text = Path(server_log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    libraries = set(re.findall(r'msg="inference compute".*?\blibrary=([^\s"]+)', text))
+    return libraries or None
 
 
 def canonical_name(name):
@@ -23,6 +39,7 @@ def run(args, raw_dir):
     raw_dir.mkdir(parents=True, exist_ok=False)
     samples = []
     placement = None
+    compute = discovered_compute(getattr(args, "server_log", None))
     for index in range(args.runs + 1):
         started = time.perf_counter()
         result = http_json(base + "/api/generate", body)
@@ -39,8 +56,14 @@ def run(args, raw_dir):
         if placement is None or not isinstance(placement.get("size_vram"), int):
             raise RuntimeError("Cannot verify Ollama model placement via /api/ps")
         vram = placement["size_vram"]
-        if (args.device == "cpu" and vram != 0) or (args.device == "gpu" and vram <= 0):
-            raise RuntimeError(f"Ollama placement does not match {args.device}: size_vram={vram}")
+        # On a CPU with AMX, Ollama's CPU backend keeps the weights in a
+        # repacked buffer that /api/ps counts as size_vram, though no GPU
+        # exists. A positive size_vram is accepted on the CPU cell only when
+        # the server discovered the CPU and nothing else.
+        cpu_only = compute == {"cpu"}
+        if (args.device == "cpu" and vram != 0 and not cpu_only) or (args.device == "gpu" and vram <= 0):
+            raise RuntimeError(f"Ollama placement does not match {args.device}: size_vram={vram}"
+                               f", discovered compute={sorted(compute) if compute else 'unknown'}")
         if index:
             sample = {"generated_tokens": result["eval_count"], "prompt_tokens": result.get("prompt_eval_count"),
                       "request_seconds": elapsed, "load_seconds": result.get("load_duration", 0) / 1e9,
@@ -51,5 +74,5 @@ def run(args, raw_dir):
                 sample["decode_tokens_per_second"] = result["eval_count"] * 1e9 / result["eval_duration"]
             samples.append(sample)
     return {"protocol": "one warmup then measured non-streaming HTTP requests; model kept resident",
-            "device_evidence": placement, "model": {"name": args.model, "digest": placement.get("digest")},
+            "device_evidence": {**placement, "discovered_compute": sorted(compute) if compute else None}, "model": {"name": args.model, "digest": placement.get("digest")},
             "dtype": placement.get("details", {}).get("quantization_level"), "samples": samples}

@@ -85,6 +85,7 @@ case "$BENCH_ENGINE" in
       exit 1
     fi
     args+=(--url "$BENCH_URL" --model "$BENCH_MODEL")
+    if [[ -n "${BENCH_SERVER_LOG:-}" ]]; then args+=(--server-log "$BENCH_SERVER_LOG"); fi
     if [[ -n "${BENCH_ENGINE_REF:-}" ]]; then args+=(--revision "$BENCH_ENGINE_REF"); fi
     ;;
 esac
