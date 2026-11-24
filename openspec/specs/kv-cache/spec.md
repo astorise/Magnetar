@@ -1007,3 +1007,42 @@ KV cache updates SHALL commit only after the corresponding generation step succe
 - **WHEN** a generation step is successfully sampled and token-committed
 - **THEN** its KV update is committed exactly once.
 
+### Requirement: In-place KV history append
+
+When the executing Provider supports in-place KV writes and bounded attention, first-native generation SHALL keep each layer and role's KV history in one store sized for the request, SHALL write only each step's new rows beyond the committed length, and SHALL let attention read only the committed rows plus the step's new rows.
+
+#### Scenario: Decode step on a Provider with in-place KV support
+
+- **WHEN** a decode step runs on a Provider that advertises `kv-write` and `key-count` attention
+- **THEN** the step writes one row per layer and role into its store and attention reads only the committed rows plus that row
+
+#### Scenario: Provider without in-place support
+
+- **WHEN** the executing Provider does not advertise `kv-write` or `key-count` attention
+- **THEN** the history is appended with the copy-based path, with identical results
+
+### Requirement: Copy-free KV commit and rollback
+
+Committing an in-place step SHALL advance the committed length without copying history. A step that is discarded or fails SHALL leave the committed length and every committed row unchanged.
+
+#### Scenario: Commit
+
+- **WHEN** a step that wrote its rows in place commits
+- **THEN** the committed length grows by the step's rows and no KV history is copied
+
+#### Scenario: Failed step
+
+- **WHEN** a step fails or is discarded after writing its rows
+- **THEN** the committed length and every committed row are unchanged, and the next step overwrites the uncommitted rows
+
+### Requirement: KV geometry per decoder layer
+
+The Runtime SHALL size and keep each decoder layer's K/V at that layer's own row width (`kv_head_count * head_dimension` of the layer). A layer that attends over an earlier layer's K/V SHALL keep no K/V of its own and SHALL read the producing layer's full history.
+
+#### Scenario: Layers of different widths
+- **WHEN** a model's layers declare different KV head counts or head widths
+- **THEN** each layer's KV store has its layer's row width, and the KV cache estimate and pooled store bytes sum the widths of the layers that keep K/V
+
+#### Scenario: Shared KV layer during decode
+- **WHEN** a layer reuses an earlier layer's K/V and a decode step runs over a prompt's history
+- **THEN** its attention reads the producer's history including the step's new row, and the step's logits match a full-sequence computation

@@ -464,3 +464,46 @@ The CUDA Provider SHALL support copying a Tensor Resource's current device alloc
 - **THEN** the tensor's bytes are readable back from the second Device
 - **AND** they are bit-identical to the source
 
+### Requirement: CUDA Kernels honour the layered models' optional forms
+
+The CUDA Provider SHALL implement these optional forms, and SHALL declare each one's Kernel feature on the Kernels that honour it:
+- the attention score scale;
+- the scaled embedding;
+- per-head and weightless RMSNorm;
+- partial RoPE;
+- GELU-gated routed experts;
+- per-expert output scales.
+
+An attention Kernel given no scale SHALL compute with `1/sqrt(head_dimension)`, as before.
+
+#### Scenario: Scaled attention on CUDA
+- **WHEN** an `attention` node sets `scale = 1.0` and runs on the CUDA Provider
+- **THEN** the scores use that factor, and the output matches the Reference CPU's
+
+### Requirement: CUDA Provider Runs Packed Q4_0 Weights
+
+The CUDA Provider SHALL accept packed `Q4_0` weights. Downloading or expanding one SHALL give back the Runtime's dequantization exactly, and its matmuls SHALL match the Reference CPU's.
+
+#### Scenario: Q4_0 decode matmul
+- **WHEN** a decode matmul reads a packed `Q4_0` weight with int8 activations
+- **THEN** its result matches the Reference CPU's on the rounded activations and the dequantized weight
+
+### Requirement: CUDA Provider Reads Only The Looked-Up Rows Of A Packed Table
+
+An embedding lookup from a packed table stored untransposed SHALL dequantize only the rows its ids name, in every packed format the CUDA Provider stores, and SHALL give the same values as those rows of the dequantized table. An id that is negative, not an integer or not below the table's row count SHALL fail the lookup.
+
+#### Scenario: A Q6_K per-layer table
+- **WHEN** a decode step looks up one token in a packed `Q6_K` `[262144, 256]` table
+- **THEN** the lookup writes one 256-value row, not the dequantized table
+
+#### Scenario: Every packed format
+- **WHEN** a lookup reads rows of an untransposed packed table in any stored format
+- **THEN** each row equals the same row of the table's dequantization, and an invalid id fails the lookup
+
+### Requirement: CUDA TurboQuant KV Stores
+
+The CUDA Provider SHALL store a TurboQuant KV store as codes, norms and offsets, SHALL set the offsets and quantize rows in `kv-write` within step capture, and SHALL compute decode attention on the codes with a rotated query and an inverse rotation of the accumulated values, matching the Reference CPU on the same history within the f32 conformance tolerance.
+
+#### Scenario: Decode on codes
+- **WHEN** a decode step attends over a `tq4` history
+- **THEN** its output matches the Reference CPU's over the dequantized history within tolerance, with no stored row dequantized

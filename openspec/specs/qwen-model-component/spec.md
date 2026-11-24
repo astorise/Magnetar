@@ -64,17 +64,15 @@ Then Runtime rejects the path or requires a non-flash graph alternative.
 
 ### Requirement: Qwen Architecture Metadata Validation
 
-Qwen Model Component SHALL validate decoder-only architecture metadata.
+Qwen Model Component SHALL validate decoder-only architecture metadata: every dimension non-zero, and a KV head count that divides the attention head count. The hidden size SHALL NOT be required to equal the attention head count times the head dimension, since a checkpoint may declare a head width apart from it; the query and output projections' expected shapes carry both widths.
 
 #### Scenario: Invalid head configuration
+- **WHEN** Qwen config validation runs on a zero head dimension, or a KV head count that does not divide the attention head count
+- **THEN** Runtime returns qwen-config-invalid or qwen-architecture-unsupported
 
-Given hidden size does not match head count and head dimension where required
-
-When Qwen config validation runs
-
-Then Runtime returns qwen-config-invalid or qwen-architecture-unsupported.
-
----
+#### Scenario: A declared head width apart from the hidden size
+- **WHEN** Qwen config validation runs on a hidden size that is not the attention head count times the head dimension
+- **THEN** the configuration is accepted
 
 ### Requirement: Qwen Config Path Access Denied
 
@@ -636,3 +634,19 @@ Making the Qwen Component configurable SHALL NOT grant it model-source, filesyst
 - **WHEN** Runtime selects a CUDA Provider for a loaded Qwen Model Instance
 - **THEN** the Qwen Component produces the same portable architecture graph semantics without receiving CUDA or Device identity.
 
+### Requirement: Layered artifacts are validated per layer
+
+When the architecture configuration declares a layer layout, tensor inventory and shape validation SHALL use each layer's own geometry:
+- a layer reusing an earlier layer's K/V SHALL NOT require K or V projections;
+- a layer deriving V from K SHALL NOT require a V projection;
+- each layer's projections and MLP SHALL be sized with that layer's head width, KV head count and feed-forward width.
+
+A layer computing its own K/V SHALL still require both projections.
+
+#### Scenario: Shared-KV layer without K/V projections
+- **WHEN** a layer's layout entry names a K/V source layer and the artifact has no K or V projection for it
+- **THEN** inventory validation accepts the artifact
+
+#### Scenario: Wider full-attention heads
+- **WHEN** a layer's layout entry declares a wider head than the architecture-wide one
+- **THEN** that layer's `q_proj` is expected with the wider width, and the architecture-wide width is refused
