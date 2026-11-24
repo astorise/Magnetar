@@ -974,6 +974,18 @@ impl Runtime {
             .values()
             .flat_map(|binding| [binding.k_allocation, binding.v_allocation])
             .collect();
+        // And every recurrent state slot's, committed or pending.
+        let cache_entry = self.kv_cache(cache)?;
+        let layer_allocations: Vec<MemoryAllocationId> = layer_allocations
+            .into_iter()
+            .chain(
+                cache_entry
+                    .recurrent_resources
+                    .values()
+                    .chain(cache_entry.pending_recurrent_resources.values())
+                    .map(|binding| binding.allocation),
+            )
+            .collect();
         for allocation in layer_allocations {
             let _ = self.memory.release(allocation);
         }

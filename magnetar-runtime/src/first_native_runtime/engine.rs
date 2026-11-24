@@ -714,6 +714,10 @@ pub(crate) struct CachedGraphs {
     /// Whether the prefill graph is the chunk's (`chunk-long-prefills`): its
     /// plan serves every longer prompt, which runs in passes of it.
     pub(crate) serves_longer_prompts: bool,
+    /// Whether the graphs carry recurrent state (`support-qwen38-flash-next`):
+    /// their steps are neither captured nor replayed, and their prefills
+    /// are never padded.
+    pub(crate) recurrent: bool,
     pub(crate) prefill_memo: GraphExecutionMemo,
     pub(crate) decode_memo: GraphExecutionMemo,
     /// The Prepared Execution Plans last prepared for these graphs, with
@@ -737,10 +741,13 @@ pub(crate) struct FirstNativePlanCacheKey {
 
 impl CachedGraphs {
     pub(crate) fn new(graphs: FirstNativeComponentGraphs) -> Self {
+        let recurrent = super::recurrent_state::has_recurrent_state(&graphs.prefill)
+            || super::recurrent_state::has_recurrent_state(&graphs.decode);
         Self {
             graphs,
             logits_row: false,
             serves_longer_prompts: false,
+            recurrent,
             prefill_memo: GraphExecutionMemo::default(),
             decode_memo: GraphExecutionMemo::default(),
             plans: std::sync::Mutex::new(None),
@@ -1297,6 +1304,9 @@ impl E2eRuntimeModelExecutionEngine {
                 release_pending_kv_resource(runtime, &provider, &layer.k);
                 release_pending_kv_resource(runtime, &provider, &layer.v);
             }
+            // The attempt's recurrent state goes with its KV; the committed
+            // state stays (`support-qwen38-flash-next`).
+            super::recurrent_state::discard_recurrent_state(runtime, &provider, &discarded.cache);
         }
         // A discarded prefill never made its cache visible as committed
         // state. Retire that empty cache too; a decode must keep its cache.
@@ -1579,6 +1589,12 @@ impl E2eRuntimeModelExecutionEngine {
             return Ok(None);
         };
         if !bucketed || !graphs.logits_row || !self.step_replay.prefill_enabled() {
+            return Ok(None);
+        }
+        // A replay would bypass the executor that binds and stages the
+        // recurrent state.
+        if graphs.recurrent {
+            trace_step_capture("not captured", "prefill with recurrent state");
             return Ok(None);
         }
         let Some(provider) = execution_plan
@@ -2521,6 +2537,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         let Ok(provider) = resolve_kernel_execution_provider(runtime, &provider_binding) else {
             return Ok(());
         };
+        super::recurrent_state::release_recurrent_state(runtime, &provider, &committed.cache);
         // The committed bindings, plus each layer's `.pending` staging
         // resource that every commit copies from and leaves behind
         // (`execute_first_native_graph_nodes`'s KV pending writes).

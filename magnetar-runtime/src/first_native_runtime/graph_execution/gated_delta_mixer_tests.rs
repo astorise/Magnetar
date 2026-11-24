@@ -240,6 +240,139 @@ fn gated_delta_graph_matches_pytorch_for_prefill_chunks_decode_and_reset() {
     }
 }
 
+/// The mixer graph with its two states declared recurrent, as a Component
+/// emits it: the Runtime binds and keeps them.
+fn recurrent_graph(
+    case: &Case,
+    tensors: &[HostTensor],
+) -> (ExecutionGraph, BTreeMap<TensorEdgeId, HostTensor>) {
+    let (mut graph, mut bindings) = graph(case, tensors);
+    for (slot, input, output) in [
+        ("conv", "input.1", "output.convolution"),
+        ("delta", "input.2", "output.recurrent"),
+    ] {
+        for (edge, behavior) in [
+            (input, GraphRecurrentStateBehavior::Input),
+            (output, GraphRecurrentStateBehavior::Output),
+        ] {
+            graph
+                .edges
+                .get_mut(&TensorEdgeId::new(edge))
+                .unwrap()
+                .recurrent_state = Some(GraphRecurrentStateMetadata {
+                resource_id: format!("mixer.layer0.{slot}"),
+                layer: 0,
+                slot: slot.into(),
+                behavior,
+                compatibility_key: "model-v1".into(),
+            });
+        }
+        bindings.remove(&TensorEdgeId::new(input));
+    }
+    (graph, bindings)
+}
+
+#[test]
+fn gated_delta_state_lives_in_the_runtime_across_steps() {
+    for case in cases() {
+        let fixture = e2e_fixture().unwrap();
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+        let executor = resolve_kernel_execution_provider(&runtime, &provider).unwrap();
+        let cache = runtime
+            .create_kv_cache(KvCache::new(
+                KvCacheId::new("gated-delta-session").unwrap(),
+                KvCacheScope::Session,
+                KvCacheCompatibility::new(
+                    GenerationModelReference::ModelInstance(instance.clone()),
+                    TokenizerId::new("tokenizer").unwrap(),
+                ),
+                KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float32),
+            ))
+            .unwrap();
+        // Runs `count` tokens from `start`, reading and staging the state.
+        let step = |runtime: &mut Runtime, start: usize, count: usize| {
+            let (graph, bindings) = recurrent_graph(&case, &inputs(&case, start, count, None));
+            graph.validate(&initial_operator_catalog()).unwrap();
+            let mut plan = prepare_first_native_plan_for_graph(
+                runtime,
+                &graph,
+                &instance,
+                revision,
+                count as u64,
+                PreparedExecutionPlanGeneration::new(1),
+                &provider,
+            )
+            .unwrap();
+            let (_, outputs, _, _) = execute_first_native_graph_materializing(
+                runtime,
+                &fixture,
+                &instance,
+                &cache,
+                &graph,
+                &mut plan,
+                bindings,
+                None,
+                Some(0),
+                &mut Vec::new(),
+                MaterializedEdges::All,
+                None,
+                None,
+            )
+            .unwrap();
+            [
+                "output.activation",
+                "output.convolution",
+                "output.recurrent",
+            ]
+            .map(|name| outputs[&TensorEdgeId::new(name)].data.clone())
+        };
+        let commit = |runtime: &mut Runtime| {
+            KvUpdateTransaction {
+                provider_binding: provider.clone(),
+                executor: executor.clone(),
+                promoted: Vec::new(),
+            }
+            .commit(runtime, &cache)
+            .unwrap();
+        };
+        let hidden = case.hidden_size;
+
+        // A prefill in two chunks of one attempt equals the full prefill.
+        let prefix = step(&mut runtime, 0, 2);
+        close(&prefix[0], &case.prefix_output, "prefix output");
+        let rest = step(&mut runtime, 2, case.tokens - 3);
+        close(
+            &rest[0],
+            &case.output[2 * hidden..(case.tokens - 1) * hidden],
+            "chunk output",
+        );
+        commit(&mut runtime);
+        // Decode continues from the committed prefill state.
+        let decoded = step(&mut runtime, case.tokens - 1, 1);
+        close(
+            &decoded[0],
+            &case.output[(case.tokens - 1) * hidden..],
+            "decode output",
+        );
+        close(&decoded[1], &case.conv_state, "decode convolution");
+        close(&decoded[2], &case.state, "decode recurrent");
+        // Not accepted: the next attempt decodes the same token again.
+        super::super::recurrent_state::discard_recurrent_state(&mut runtime, &executor, &cache);
+        let again = step(&mut runtime, case.tokens - 1, 1);
+        close(&again[0], &decoded[0], "retried decode output");
+        // A new sequence starts from zeros.
+        super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+        let reset = step(&mut runtime, 0, 1);
+        close(&reset[0], &case.output[..hidden], "reset output");
+    }
+}
+
 #[test]
 fn gated_delta_rejects_bad_shapes_and_mask() {
     let case = cases().remove(0);

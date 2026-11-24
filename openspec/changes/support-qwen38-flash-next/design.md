@@ -61,30 +61,29 @@ With DFlash2 drafting, decode reaches 38.3 tokens/s. The no-drafting column is M
 
 ### D1. Recurrent state is a session resource committed with KV
 
-Each `GraphRecurrentStateBinding` becomes a Runtime-owned resource of the session, admitted at its fixed size under the session's memory owner.
+The state belongs to the step's KV cache. `KvCache` holds, per graph resource id, the committed value and the value pending in the current attempt (`RecurrentStateResourceBinding`: resource, allocation, shape, compatibility key), admitted under the session's memory owner.
 
 **Execution**
-- The input edge binds to the committed resource. Before any commit, the Runtime writes a zero tensor of the layout's shape.
-- The output edge's value is written to an attempt-unique pending resource, as pending KV layers are.
-- `KvUpdateTransaction` gains a list of promoted recurrent slots:
-  - `commit` publishes them together with the KV layers;
-  - `abort` releases them and leaves the committed state untouched;
-  - releasing a session releases its state.
+- The executor binds each input edge to the pending value, else the committed value, else a zero tensor of the layout's shape. A caller-supplied state input is refused.
+- After a successful step, each output edge's value is copied under an attempt-unique resource and becomes the pending value, replacing (and releasing) the previous one. A failed step stages nothing.
+- `KvUpdateTransaction::commit` adopts the pending values once every KV layer is promoted and releases the values they replace.
+- Discarding the attempt's pending KV releases its pending state. Releasing the request's state, or the cache, releases everything.
 
 Rejected alternative: copy the output over the input in place. A failed or partial step would then corrupt the only copy of the state, which the WIT forbids.
 
-### D2. Steps and chunks
+### D2. Passes, padding and commit
 
-- Prefill and decode share layouts (already validated), so decode continues from the state prefill committed.
-- A chunked prefill commits state after each chunk, exactly as it commits KV per chunk. A failure fails the request; the committed state stays consistent with the committed KV.
-- Layer segments keep each slot on its segment's device. The scope check already exists.
+- Passes of one attempt (a prefill run in several exact-length passes) read the attempt's pending state.
+- The state is committed with the accepted token, as KV is, so the first decode step reads the prefill's state.
+- Prefill buckets and the chunk graph right-pad the prompt. Padding rows would advance the state, so a model whose graphs carry recurrent state prefills at the prompt's exact length: buckets and chunking are turned off for it.
+- Layer segments do not commit through the KV transaction; they refuse recurrent graphs until segment commits carry the state. Each slot would then stay on its segment's device; the scope check already exists.
 
 ### D3. Explicit refusals until each feature has its lot
 
 A graph with recurrent bindings:
-- does not reuse a prefix (state cannot be rebuilt from a KV prefix). The cache is bypassed, with an observation.
-- is not captured for step replay. The trace gives the reason, until replay alternates two pending/committed buffers (lot 1b).
-- is refused by continuous batching and speculative verification.
+- is not captured for step replay, in prefill or decode. The trace (`MAGNETAR_STEP_CAPTURE_TRACE=1`) gives the reason, until replay alternates paired committed/pending buffers (lot 1b).
+- does not reuse a prefix: state cannot be rebuilt from a KV prefix. The first-native engine has no cross-request prefix reuse yet; when it lands, it bypasses recurrent models with an observation.
+- is refused by continuous batching and speculative verification, which the first-native engine does not run yet either.
 
 No path silently runs with stale or shared state.
 

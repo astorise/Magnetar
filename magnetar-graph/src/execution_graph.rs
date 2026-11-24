@@ -408,13 +408,32 @@ impl Default for GraphPlanningPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphPlanStep {
     ExecuteOperator(ExecutionNodeId),
-    InsertDataMovement { edge: TensorEdgeId },
-    InsertDTypeConversion { edge: TensorEdgeId },
-    InsertLayoutConversion { edge: TensorEdgeId },
-    RequestWorkspace { node: ExecutionNodeId },
-    PreserveKvCache { edge: TensorEdgeId },
-    AdjustPrefillForPrefix { reused_prefix_length: u64 },
-    KernelSelectionPlaceholder { node: ExecutionNodeId },
+    InsertDataMovement {
+        edge: TensorEdgeId,
+    },
+    InsertDTypeConversion {
+        edge: TensorEdgeId,
+    },
+    InsertLayoutConversion {
+        edge: TensorEdgeId,
+    },
+    RequestWorkspace {
+        node: ExecutionNodeId,
+    },
+    PreserveKvCache {
+        edge: TensorEdgeId,
+    },
+    /// A recurrent state output: the Runtime keeps it past the step and
+    /// commits it with the accepted token (`support-qwen38-flash-next`).
+    PreserveRecurrentState {
+        edge: TensorEdgeId,
+    },
+    AdjustPrefillForPrefix {
+        reused_prefix_length: u64,
+    },
+    KernelSelectionPlaceholder {
+        node: ExecutionNodeId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -790,15 +809,6 @@ pub fn plan_execution_graph(
     planned_affinity: Option<&ResourceAffinity>,
 ) -> Result<ExecutionGraphPlan, GraphError> {
     graph.validate(catalog)?;
-    if graph
-        .edges
-        .values()
-        .any(|edge| edge.recurrent_state.is_some())
-    {
-        return Err(GraphError::ProviderCapabilityUnavailable(
-            "recurrent state lifecycle is not implemented by this execution planner".into(),
-        ));
-    }
     let mut steps = Vec::new();
     let mut observations = vec![GraphObservation::new(
         GraphObservationKind::GraphPlanningStarted,
@@ -829,6 +839,15 @@ pub fn plan_execution_graph(
         }
         if edge.kv_cache.is_some() {
             steps.push(GraphPlanStep::PreserveKvCache {
+                edge: edge.id.clone(),
+            });
+        }
+        if edge
+            .recurrent_state
+            .as_ref()
+            .is_some_and(|state| state.behavior == GraphRecurrentStateBehavior::Output)
+        {
+            steps.push(GraphPlanStep::PreserveRecurrentState {
                 edge: edge.id.clone(),
             });
         }

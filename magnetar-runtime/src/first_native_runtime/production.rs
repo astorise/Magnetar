@@ -1923,6 +1923,14 @@ impl ProductionLoadedModel {
                     self.graph_cache.set_prefill_chunk(0);
                     continue;
                 }
+                // Padding rows would advance recurrent state past the prompt
+                // (`support-qwen38-flash-next`): such graphs run at the
+                // prompt's exact length.
+                if component_graphs.recurrent && graph_length != prompt_token_count {
+                    self.graph_cache.set_prefill_buckets(Vec::new());
+                    self.graph_cache.set_prefill_chunk(0);
+                    continue;
+                }
                 break (graph_length, component_graphs);
             };
             self.runtime

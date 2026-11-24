@@ -503,6 +503,26 @@ pub struct KvCache {
     /// addressed by `TensorResourceId`, not in any executor-private map.
     /// Empty until the first successful prefill commit.
     pub layer_resources: BTreeMap<u32, KvLayerResourceBinding>,
+    /// Each recurrent state slot's committed value, keyed by the graph's
+    /// recurrent resource id (`support-qwen38-flash-next`). Empty until the
+    /// first commit: the slot then reads zeros.
+    pub recurrent_resources: BTreeMap<String, RecurrentStateResourceBinding>,
+    /// Each slot's value written by the steps of the current attempt and
+    /// not yet committed. A later step of the same attempt (a chunked
+    /// prefill's next pass) reads it; a commit adopts it, a discard
+    /// releases it.
+    pub pending_recurrent_resources: BTreeMap<String, RecurrentStateResourceBinding>,
+}
+
+/// One recurrent state slot's value: the Provider resource holding it, the
+/// `MemoryManager` allocation accounting for it, and the layout it was
+/// written with.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurrentStateResourceBinding {
+    pub resource: TensorResourceId,
+    pub allocation: MemoryAllocationId,
+    pub shape: Vec<u64>,
+    pub compatibility_key: String,
 }
 
 /// One layer's committed K/V tensor resource identities plus the
@@ -538,6 +558,8 @@ impl KvCache {
             idle_ttl_millis: None,
             total_ttl_millis: None,
             layer_resources: BTreeMap::new(),
+            recurrent_resources: BTreeMap::new(),
+            pending_recurrent_resources: BTreeMap::new(),
         }
     }
 

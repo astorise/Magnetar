@@ -88,6 +88,7 @@ mod prefill_buckets;
 mod prefill_chunks;
 mod prepared_plans;
 mod production;
+mod recurrent_state;
 mod segments;
 mod weights;
 

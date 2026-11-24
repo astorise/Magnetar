@@ -1,25 +1,30 @@
 ## 1. Recurrent state lifecycle (Runtime)
 
-- [ ] 1.1 Planner: drop the recurrent refusal in `plan_execution_graph`; keep recurrent output edges live to the end of the step.
-- [ ] 1.2 Prepared plans: drop the refusal; record each plan's recurrent bindings.
-- [ ] 1.3 Session state: map each binding to a committed resource, admitted at its fixed size and zero-initialized before the first commit.
-- [ ] 1.4 Executor: bind inputs to committed resources and write outputs to attempt-unique pending resources.
-- [ ] 1.5 `KvUpdateTransaction`: promote, commit and abort recurrent slots together with KV layers; release them with the session.
-- [ ] 1.6 Refusals and bypasses: prefix reuse bypassed with an observation; step capture skipped with a traced reason; batching and speculative verification refused.
-- [ ] 1.7 Tests on synthetic graphs:
-  - accumulation across steps;
-  - zero start for a new sequence;
-  - prefill → decode continuity;
-  - chunked prefill equal to one-pass prefill;
-  - a failed step that leaves state and KV unchanged;
-  - a `gated-delta-mixer` graph equal to the fixture's prefix and continuation.
+- [x] 1.1 Planner: `plan_execution_graph` plans recurrent graphs, with a `PreserveRecurrentState` step per state output.
+- [x] 1.2 Prepared plans: the refusal is gone; state edges need no Kernel.
+- [x] 1.3 Session state: `KvCache` holds each slot's committed and pending `RecurrentStateResourceBinding`, admitted under the session and released with the cache.
+- [x] 1.4 Executor: inputs bind to the pending value, else the committed value, else zeros; caller-supplied state inputs are refused. Outputs are copied under attempt-unique resources once the step succeeds.
+- [x] 1.5 `KvUpdateTransaction::commit` adopts the pending values after the KV layers; discarding pending KV releases them; releasing the request releases everything.
+- [x] 1.6 Refusals and bypasses:
+  - recurrent graphs are never captured or replayed (prefill and decode), with a traced reason;
+  - their prefills are never padded (buckets and chunking turned off for the model);
+  - layer segments refuse them.
+
+  The first-native engine has no cross-request prefix reuse, continuous batching or speculative verification yet, so there is nothing for those refusals to intercept.
+- [x] 1.7 Tests:
+  - `recurrent_state_starts_at_zero_and_commits_only_accepted_steps`: zero start, pending versus committed, a failing step, discard, superseded and released values, restart from zero;
+  - `recurrent_state_inputs_are_runtime_owned_and_need_a_cache`;
+  - `gated_delta_state_lives_in_the_runtime_across_steps`: fixture prefix and pass equal the full prefill, decode after commit, retry after discard, reset;
+  - planner tests in magnetar-graph and magnetar-engine.
+
+  Engine-level checks of the guards (no padding, no capture) run with the Qwen3.5 graph in 2.7.
 - [ ] 1.8 (1b) Step replay with paired committed/pending buffers, equal to the unreplayed steps.
 
 ## 2. Qwen3.5 hybrid graph (Qwen Component, Providers)
 
 - [ ] 2.1 Pin the Transformers Qwen3.5 modeling source used for semantics and fixtures; list its attention-block operators missing from the catalog.
 - [ ] 2.2 Add the missing operators additively with Reference CPU semantics and fixtures.
-- [ ] 2.3 Qwen Component: recognize the Qwen3.5 text configuration; emit the hybrid prefill and decode graphs with `conv`/`delta` recurrent slots; rebuild and repin the wasm.
+- [ ] 2.3 Qwen Component: recognize the Qwen3.5 text configuration; emit the hybrid prefill and decode graphs with `conv`/`delta` recurrent slots; rebuild and repin the wasm. Update the WIT `recurrent-resource` comment, which still says execution refuses such graphs.
 - [ ] 2.4 Hugging Face loader: map the Qwen3.5 tensor names and configuration.
 - [ ] 2.5 cpu-native: decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states.
 - [ ] 2.6 CUDA: the same two forms, qualified on the GPU runner.

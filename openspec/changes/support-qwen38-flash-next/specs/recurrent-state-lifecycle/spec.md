@@ -30,23 +30,29 @@ The Runtime SHALL write each recurrent output edge's value to a pending resource
 
 ### Requirement: Prefill and decode continue the same recurrent state
 
-The Runtime SHALL commit the recurrent state produced by a prefill, or by each chunk of a chunked prefill, so that the next chunk or decode step reads it. A chunked prefill SHALL produce the same state and outputs as the one-pass prefill, within the operator's tolerance.
+The Runtime SHALL make the state written by each pass of an attempt the input of its next pass, and SHALL commit the state of an accepted prefill so that the first decode step reads it. A prefill run in several passes SHALL produce the same outputs and state as the one-pass prefill, within the operator's tolerance. A prefill graph with recurrent state SHALL NOT be padded past the prompt.
 
-#### Scenario: Chunked prefill equals one pass
+#### Scenario: A prefill in passes equals one pass
 
-- **WHEN** a prompt is prefilled in chunks and, separately, in one pass, then decoded for one token
-- **THEN** the committed states and the decoded logits agree within tolerance
+- **WHEN** a prompt is prefilled in two passes of one attempt and, separately, in one pass
+- **THEN** the second pass's outputs equal the one-pass outputs for the same rows, and the states agree within tolerance
 
 #### Scenario: Gated-delta mixer continuation
 
-- **WHEN** a graph with one `gated-delta-mixer` node prefills the reference fixture's prefix and then decodes its next token
+- **WHEN** a graph with one `gated-delta-mixer` node prefills the reference fixture's prefix, commits, and then decodes its last token
 - **THEN** the output and both states equal the fixture's full-sequence values within tolerance
+
+#### Scenario: No padding
+
+- **WHEN** prompt buckets or a chunk length would pad the prefill of a model whose graphs carry recurrent state
+- **THEN** the prompt is prefilled at its exact length
 
 ### Requirement: Unsupported paths refuse or bypass recurrent graphs explicitly
 
 Until a path supports recurrent state, the Runtime SHALL NOT run a graph with recurrent bindings through it with stale, shared or missing state:
 - **Prefix reuse:** bypassed, with an observation.
 - **Step capture and replay:** not used, with a traced reason.
+- **Layer segments:** refused with an explicit error.
 - **Continuous batching and speculative verification:** refused with an explicit error.
 
 #### Scenario: A prefix-cache hit on a recurrent model
@@ -58,3 +64,8 @@ Until a path supports recurrent state, the Runtime SHALL NOT run a graph with re
 
 - **WHEN** decode would capture a step for a graph with recurrent bindings, before paired-buffer replay is implemented
 - **THEN** no capture is recorded, the trace gives the reason, and decode results equal those without capture
+
+#### Scenario: A layer segment
+
+- **WHEN** a layer segment graph with recurrent bindings is dispatched
+- **THEN** dispatch fails with an error naming recurrent state across layer segments, before any plan is prepared

@@ -179,6 +179,8 @@ impl KvUpdateTransaction {
                 },
             );
         }
+        // The step's recurrent state is accepted with its KV rows.
+        super::recurrent_state::commit_recurrent_state(runtime, &self.executor, cache)?;
         Ok(committed)
     }
 }
@@ -366,7 +368,13 @@ impl E2eRuntimeModelExecutionEngine {
         let key = Self::kv_state_key(request);
         // Only steps whose KV history is kept in place: their shapes and
         // resources are the same from one step to the next.
-        let replayable = self.step_replay.is_enabled()
+        // A replay would bypass the executor that binds and stages the
+        // recurrent state (`support-qwen38-flash-next`).
+        if graphs.recurrent && decode_index == STEP_CAPTURE_DECODE_INDEX {
+            trace_step_capture("not captured", "decode step with recurrent state");
+        }
+        let replayable = !graphs.recurrent
+            && self.step_replay.is_enabled()
             && kv_stores.is_some()
             && !kv_state.layer_kv.is_empty()
             && kv_state.layer_kv.values().all(|layer| layer.rows.is_some());

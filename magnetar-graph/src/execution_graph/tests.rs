@@ -104,10 +104,17 @@ fn recurrent_edges_require_matched_fixed_state_and_fail_closed_in_planning() {
     assert_eq!(bindings[0].layout.descriptor, tensor([2, 3]));
     assert_eq!(bindings[0].input_edge, input_id);
     assert_eq!(bindings[0].output_edge, output_id);
-    assert!(matches!(
-        plan_execution_graph(&graph, &catalog, &GraphPlanningPolicy::default(), None),
-        Err(GraphError::ProviderCapabilityUnavailable(_))
-    ));
+    let plan =
+        plan_execution_graph(&graph, &catalog, &GraphPlanningPolicy::default(), None).unwrap();
+    assert_eq!(
+        plan.steps
+            .iter()
+            .filter(|step| matches!(step, GraphPlanStep::PreserveRecurrentState { .. }))
+            .collect::<Vec<_>>(),
+        [&GraphPlanStep::PreserveRecurrentState {
+            edge: output_id.clone()
+        }]
+    );
 
     let mut invalid = graph.clone();
     invalid.edges.get_mut(&output_id).unwrap().descriptor = tensor([2, 4]);

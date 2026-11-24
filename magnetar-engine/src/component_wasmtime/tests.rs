@@ -601,15 +601,15 @@ fn wasmtime_engine_builds_and_validates_recurrent_state_graphs() {
         let split = &graph.nodes[&crate::ExecutionNodeId::new("split")];
         assert_eq!(split.outputs.len(), 2);
         assert_ne!(split.outputs[0], split.outputs[1]);
-        assert!(matches!(
+        assert!(
             crate::plan_execution_graph(
                 &graph,
                 &crate::default_graph_catalog(),
                 &crate::GraphPlanningPolicy::default(),
                 None
-            ),
-            Err(crate::GraphError::ProviderCapabilityUnavailable(_))
-        ));
+            )
+            .is_ok()
+        );
     }
     capability.prepare_session(
         instance.engine_key(),
