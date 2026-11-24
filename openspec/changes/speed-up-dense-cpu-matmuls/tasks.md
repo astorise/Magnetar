@@ -81,3 +81,9 @@
   | Ollama (FP16 GGUF, `n_threads = 2`) | 763 ms | — | 44.2 ms |
 
   On this host Magnetar is ahead of both, per request and per token. The host is an Intel CPU, not the Zen 4 of runs 44529384440 and 45343428878, so the Zen 4 TTFT question of task 4.8 needs a campaign on a Zen 4 runner.
+
+## 6. Gated matmuls and kernel diagnostics on the runners
+
+- [x] 6.1 Both CPU Providers advertise `gated-matmul` with the Runtime's Reference semantics, so the Runtime folds a gated MLP's two matmuls and `silu-mul` into one node. The optimized CPU Provider computes both products as the matmul family does (packed, compact or f32) and applies the activation in place. Test: `gated_matmuls_match_the_reference_cpu` (compact, f32 and packed weights; 1 and 5 rows). Locally, over 64 tokens: the same text, 0.602 ms per layer against 0.614 ms for the two matmuls and `silu-mul` (providers/cpu 6ec6040).
+- [x] 6.2 A real 64-token profile puts the decode step at its kernels' sum: 34.9 ms against a TPOT of 37.5 ms. The effective bandwidths are about 29 GB/s for gate/up, 30 GB/s for o and down, 40 GB/s for the LM head (6.9 ms per token) and 14 GB/s for the small q, k and v products. The isolated streaming diagnostic reads 400 MB per shape, part of which stays in this host's 260 MB L3, so it overstates those figures.
+- [ ] 6.3 The CPU benchmark streams each decode shape on the runner, with the default kernels and with AVX2 only (step "CPU kernel bandwidth"). The kernel choices (rows per pass, outputs per tile, vector width) are then checked on each runner CPU model, Zen 4 first.

@@ -70,6 +70,24 @@ jobs:
               real_checkpoint_qualification_campaign -- --include-ignored --nocapture > "$out/log.txt" 2>&1
           summary="$(grep -E '^\[cpu-native\] [0-9]+ prompt tokens: load' "$out/log.txt")"
           echo "Magnetar on $cores threads (one per physical core): $summary" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: CPU kernel bandwidth (diagnostic)
+        # Streams each decode matmul shape of a Qwen2.5-0.5B layer from
+        # memory, in both stored layouts, with the default kernels and with
+        # AVX2 only, so kernel choices are checked on each runner's CPU.
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/benchmark-results/cpu-kernels.txt"
+          for simd in default avx2; do
+            echo "== kernels: $simd" | tee -a "$out"
+            if [[ "$simd" == avx2 ]]; then export MAGNETAR_CPU_SIMD=avx2; else unset MAGNETAR_CPU_SIMD; fi
+            cargo test --release --manifest-path providers/cpu/Cargo.toml --lib -- \
+              --ignored --nocapture pool_and_streamed_matmul_costs 2>&1 \
+              | grep -E 'pool run|streamed' | tee -a "$out"
+          done
+          { echo '```'; cat "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload benchmark results
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
