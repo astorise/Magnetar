@@ -18,3 +18,12 @@ The `rmsnorm` Operator SHALL accept an optional finite `weight_offset` float. Wi
 
 - **WHEN** `weight_offset` is not finite, or `head_count` is not positive or does not divide the last dimension into even blocks
 - **THEN** graph validation refuses the node
+
+### Requirement: Optional gated-delta token mask
+
+The `gated-delta-mixer` Operator SHALL accept twelve inputs, without the trailing 0/1 token mask, and treat every token as valid. With the mask, it SHALL keep its thirteen-input behaviour.
+
+#### Scenario: Valid tokens without a mask
+
+- **WHEN** the mixer runs on tokens whose mask is all ones, once with the mask and once without it
+- **THEN** its output and both states are identical

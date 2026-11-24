@@ -1624,6 +1624,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             "rmsnorm" => 1,
             "moe-experts" => 5,
             "mamba2-mixer" => 10,
+            "gated-delta-mixer" => 12,
             "affine-layernorm" => 2,
             "attention" => 3,
             _ => inputs,
@@ -2315,7 +2316,9 @@ fn validate_gated_delta_mixer_shape(
     let invalid = || OperatorError::ShapeMismatch {
         reason: "invalid gated-delta mixer geometry, attributes or tensor shapes".into(),
     };
-    if inputs.len() != 13 || outputs.len() != 3 {
+    // The trailing 0/1 token mask is optional: without it every token is
+    // valid (`support-qwen38-flash-next`).
+    if !(12..=13).contains(&inputs.len()) || outputs.len() != 3 {
         return Err(invalid());
     }
     let positive = |name: &str| match attributes.get(name) {

@@ -584,7 +584,8 @@ pub(super) fn dispatch_first_native_graph_node(
             let valid_inputs = if name == "mamba2-mixer" {
                 (10..=13).contains(&inputs.len())
             } else {
-                inputs.len() == 13
+                // The token mask is optional.
+                (12..=13).contains(&inputs.len())
             };
             if !valid_inputs || node.outputs.len() != 3 {
                 return Err(InferenceApiError::GraphPlanningFailed {

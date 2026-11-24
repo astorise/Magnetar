@@ -19,8 +19,8 @@ use std::sync::Mutex;
 use crate::component::{ComponentError, ComponentValue, HostCapability};
 use crate::{
     ExpertGroupScore, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
-    LatentAttentionConfig, LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig,
-    RopeFrequencyScaling,
+    LatentAttentionConfig, LayerSpec, LinearAttentionConfig, MixtureOfExpertsConfig,
+    ModelArchitectureConfig, RopeFrequencyScaling,
 };
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
@@ -67,7 +67,9 @@ pub struct ModelConfigCapability {
 /// when the bound configuration declares one, a Component must have read
 /// it before its graph is accepted. Activation must always be read, so a
 /// Component can distinguish an unknown activation from a supported one.
-const FEATURE_FUNCTIONS: [&str; 10] = [
+const FEATURE_FUNCTIONS: [&str; 12] = [
+    "linear-attention",
+    "decoder-variants",
     "layer-layout",
     "options",
     "multi-head-latent-attention",
@@ -199,6 +201,8 @@ impl ModelConfigCapability {
                         .is_some_and(|mla| mla.norm_eps.is_some()),
                     "rope-layers" => config.rope_layers.is_some(),
                     "encoder-config" => entry.encoder.is_some(),
+                    "linear-attention" => config.linear_attention.is_some(),
+                    "decoder-variants" => decoder_variants_declared(config),
                     // Even an absent activation is meaningful: a fixed-activation
                     // decoder must see and reject it instead of guessing.
                     "hidden-activation" => true,
@@ -340,6 +344,61 @@ fn encode_latent_attention(mla: Option<&LatentAttentionConfig>) -> ComponentValu
                 ComponentValue::S64(mla.qk_rope_head_dim as i64),
             ),
             field("v-head-dim", ComponentValue::S64(mla.v_head_dim as i64)),
+        ]))
+    }))
+}
+
+/// `option<linear-attention-config>` (`1.13.0`).
+fn encode_linear_attention(linear: Option<&LinearAttentionConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(linear.map(|linear| {
+        Box::new(ComponentValue::Record(vec![
+            field(
+                "layers",
+                ComponentValue::List(
+                    linear
+                        .layers
+                        .iter()
+                        .map(|&l| ComponentValue::Bool(l))
+                        .collect(),
+                ),
+            ),
+            field("key-heads", ComponentValue::U32(linear.key_heads)),
+            field("value-heads", ComponentValue::U32(linear.value_heads)),
+            field(
+                "key-head-dimension",
+                ComponentValue::S64(linear.key_head_dim as i64),
+            ),
+            field(
+                "value-head-dimension",
+                ComponentValue::S64(linear.value_head_dim as i64),
+            ),
+            field("conv-kernel", ComponentValue::U32(linear.conv_kernel)),
+        ]))
+    }))
+}
+
+/// Whether the configuration declares a `decoder-variants` form.
+fn decoder_variants_declared(config: &ModelArchitectureConfig) -> bool {
+    config
+        .norm_weight_offset
+        .is_some_and(|offset| offset != 0.0)
+        || config.attention_output_gate
+}
+
+/// `option<decoder-variants>` (`1.13.0`).
+fn encode_decoder_variants(config: &ModelArchitectureConfig) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(decoder_variants_declared(config).then(|| {
+        Box::new(ComponentValue::Record(vec![
+            field(
+                "norm-weight-offset",
+                ComponentValue::F64(config.norm_weight_offset.unwrap_or(0.0)),
+            ),
+            field(
+                "attention-output-gate",
+                ComponentValue::Bool(config.attention_output_gate),
+            ),
         ]))
     }))
 }
@@ -578,6 +637,8 @@ impl HostCapability for ModelConfigCapability {
             | "expert-normalization"
             | "latent-norm-epsilon"
             | "encoder-config"
+            | "linear-attention"
+            | "decoder-variants"
             | "rope-layers"
             | "hidden-activation" => {
                 if !arguments.is_empty() {
@@ -605,6 +666,8 @@ impl HostCapability for ModelConfigCapability {
                     }
                     "layer-layout" => encode_layer_layout(config.layer_layout.as_deref()),
                     "encoder-config" => encode_encoder_config(entry.encoder.as_ref()),
+                    "linear-attention" => encode_linear_attention(config.linear_attention.as_ref()),
+                    "decoder-variants" => encode_decoder_variants(config),
                     "multi-head-latent-attention" => {
                         encode_latent_attention(config.latent_attention.as_ref())
                     }

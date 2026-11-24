@@ -83,8 +83,11 @@ pub fn gated_delta_mixer(
     inputs: &[HostTensor],
     config: GatedDeltaMixer,
 ) -> Result<[HostTensor; 3], ReferenceCpuError> {
-    if inputs.len() != 13 {
-        return Err(invalid("gated-delta mixer requires thirteen inputs"));
+    // Twelve inputs: no token mask, every token is valid.
+    if !(12..=13).contains(&inputs.len()) {
+        return Err(invalid(
+            "gated-delta mixer requires twelve or thirteen inputs",
+        ));
     }
     let [tokens, hidden] = inputs[0].shape.as_slice() else {
         return Err(invalid("gated-delta hidden input must be rank two"));
@@ -133,15 +136,19 @@ pub fn gated_delta_mixer(
     for (input, shape) in inputs.iter().zip(&shapes) {
         check(input, shape)?;
     }
-    let mask = inputs[12]
-        .data
-        .iter()
-        .map(|value| match *value {
-            0.0 => Ok(0),
-            1.0 => Ok(1),
-            _ => Err(invalid("gated-delta mask must contain only zero or one")),
+    let mask = inputs
+        .get(12)
+        .map(|mask| {
+            mask.data
+                .iter()
+                .map(|value| match *value {
+                    0.0 => Ok(0),
+                    1.0 => Ok(1),
+                    _ => Err(invalid("gated-delta mask must contain only zero or one")),
+                })
+                .collect::<Result<Vec<u8>, _>>()
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .transpose()?;
     let output = mixer_f32(
         MixerConfig {
             hidden: usize::try_from(*hidden).map_err(|_| invalid("hidden size too large"))?,
@@ -154,7 +161,7 @@ pub fn gated_delta_mixer(
         },
         usize::try_from(*tokens).map_err(|_| invalid("token count too large"))?,
         &inputs[0].data,
-        Some(&mask),
+        mask.as_deref(),
         MixerWeights {
             in_qkv: &inputs[3].data,
             in_z: &inputs[4].data,

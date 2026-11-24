@@ -702,3 +702,18 @@ fn gated_delta_graph_matches_real_checkpoint_mixer() {
     close(&suffix[1].data, &case.conv_state, "real decode convolution");
     close(&suffix[2].data, &case.state, "real decode recurrence");
 }
+
+#[test]
+fn gated_delta_mask_is_optional() {
+    for case in cases() {
+        // The fixture's first two tokens are both valid.
+        let masked = inputs(&case, 0, 2, None);
+        assert!(masked[12].data.iter().all(|&value| value == 1.0));
+        let mut unmasked = masked.clone();
+        unmasked.pop();
+        let (with_mask, without_mask) = (run(&case, masked), run(&case, unmasked));
+        for (a, b) in with_mask.iter().zip(&without_mask) {
+            assert_eq!(a.data, b.data);
+        }
+    }
+}

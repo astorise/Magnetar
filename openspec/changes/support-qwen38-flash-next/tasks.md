@@ -29,8 +29,16 @@
   - `rmsnorm.weight_offset` and `split.head_count` are gated by the `rmsnorm-weight-offset` and `split-per-head` Kernel features. The executor now forwards both attributes; it dropped them before.
   - The fixture `qwen35-attention-reference.json` comes from the pinned `Qwen3_5Attention`. `qwen35_gated_attention_block_matches_pinned_reference` matches it on the Reference CPU.
   - The CPU and CUDA Providers do not advertise these features yet (2.5, 2.6).
-- [ ] 2.3 Qwen Component: recognize the Qwen3.5 text configuration; emit the hybrid prefill and decode graphs with `conv`/`delta` recurrent slots; rebuild and repin the wasm. Update the WIT `recurrent-resource` comment, which still says execution refuses such graphs.
-- [ ] 2.4 Hugging Face loader: map the Qwen3.5 tensor names and configuration.
+- [ ] 2.3 Qwen Component: build the hybrid graphs.
+  - [x] Runtime side: `model-config` 1.13.0 adds `linear-attention` and `decoder-variants`. Both must be read when declared, and the host keeps linking 1.2.0–1.12.0. The WIT's `recurrent-resource` comment is updated.
+  - [x] Linear layers have no KV row width.
+  - [x] `gated-delta-mixer` takes an optional token mask (12 inputs), since the engine feeds no mask.
+  - [ ] Component: read both functions and emit the per-layer mixer with `conv`/`delta` recurrent slots, or the gated attention block with KV. Rebuild and repin the wasm.
+- [x] 2.4 Hugging Face loader:
+  - `qwen3_5`/`qwen3_5_text` are parsed: layer types, `linear_*` geometry, partial rotary from `rope_parameters`, output gate, and norm offset 1.
+  - Mixer tensors are named without `proj`, so they keep checkpoint `[out, in]` order; `conv1d` `[C, 1, K]` becomes `[C, K]`.
+  - The vision tower and MTP head are left out.
+  - Tested against the pinned 0.8B-Base `config.json` and the names in its safetensors header (488 tensors).
 - [ ] 2.5 CPU Provider: `rmsnorm.weight_offset` and per-head `split`. cpu-native: decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states.
 - [ ] 2.6 CUDA: the same forms (norm offset, per-head split, both mixer forms), qualified on the GPU runner.
 - [ ] 2.7 Qualify Qwen3.5-0.8B-Base (revision dc7cdfe…, digest pinned) on Reference CPU, cpu-native and CUDA:

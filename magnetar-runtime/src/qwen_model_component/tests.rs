@@ -1622,6 +1622,27 @@ fn kv_row_widths_follow_the_layer_layout() {
     assert_eq!(config.kv_row_widths(), vec![Some(4), Some(16), None]);
 }
 
+/// `support-qwen38-flash-next`: a linear-attention layer keeps recurrent
+/// state, never KV history.
+#[test]
+fn linear_attention_layers_keep_no_kv_rows() {
+    let mut config = small_config();
+    let layers = config.architecture.layer_count as usize;
+    let uniform = config.architecture.kv_head_count * config.architecture.head_dimension;
+    config.linear_attention = Some(crate::LinearAttentionConfig {
+        layers: (0..layers).map(|layer| layer + 1 != layers).collect(),
+        key_heads: 1,
+        value_heads: 1,
+        key_head_dim: 2,
+        value_head_dim: 2,
+        conv_kernel: 2,
+    });
+    let mut expected = vec![None; layers];
+    expected[layers - 1] = Some(uniform);
+    assert_eq!(config.kv_row_widths(), expected);
+    assert_eq!(config.kv_value_row_widths(), expected);
+}
+
 /// `per-layer-kv-geometry`: a layered artifact's tensor inventory and shapes
 /// are checked against each layer's own geometry. A layer reusing an earlier
 /// layer's K/V has no K/V projections and one deriving V from K no V
