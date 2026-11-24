@@ -16,21 +16,38 @@ Status: **Proposed (RFC lot 2).** No task is implemented yet. Requires lots 0 an
 - [ ] 2.4 Promotion publishes a revision without mutating plans. Rollback re-promotes within the window. Revocation follows `RevocationInFlightPolicy`.
 - [ ] 2.5 Observability: lease counts per generation, draining generations, promotions, rollbacks and revocations, with bundle identities and no payload data.
 
-## 3. Adversarial and concurrency tests
+## 3. Promotion policy (design D6)
 
-- [ ] 3.1 Sources: corrupt archive, wrong digest, a size lie, an oversized chunk, a Component that traps, loops or imports; a resolvable bundle without a configured source; the same bundle embedded and from OCI.
-- [ ] 3.2 Trust: a trusted Component serving an unsigned bundle, a revoked key, a wrong architecture (`sm_90` on `sm_86`).
-- [ ] 3.3 Swap, on the GPU runner:
+- [ ] 3.1 Hardware target identity (Provider, Device architecture or CPU model with features, driver or runtime major version); evidence and promotions keyed on it.
+- [ ] 3.2 Interleaved A/B comparison on a qualified workload, off the token path:
+  - a policy minimum of 10 runs per generation;
+  - a bootstrap 95% interval of the relative gain on the primary latency metric;
+  - guarded metrics (TTFT, TPOT, p95, peak memory, error rate) with a 2% default tolerance;
+  - correctness checks.
+- [ ] 3.3 Bands: automatic promotion at 10% or more; manual promotion offered from 5% to below 10%; none below 5%; each decision recorded with its evidence.
+- [ ] 3.4 Automatic rollback within the observation and rollback windows, recorded with its reason, and a bar on automatic re-promotion until new evidence.
+- [ ] 3.5 Tests with scripted measurements:
+  - 11% significant (automatic); 12% not significant (refused); 7% (manual only); 3% (refused);
+  - 12% with a significant 8% memory regression (refused);
+  - evidence from another target (refused);
+  - a regression after promotion (rolled back and barred).
+
+## 4. Adversarial and concurrency tests
+
+- [ ] 4.1 Sources: corrupt archive, wrong digest, a size lie, an oversized chunk, a Component that traps, loops or imports; a resolvable bundle without a configured source; the same bundle embedded and from OCI.
+- [ ] 4.2 Trust: a trusted Component serving an unsigned bundle, a revoked key, a wrong architecture (`sm_90` on `sm_86`).
+- [ ] 4.3 Swap, on the GPU runner:
   - prepare N+1 while 4 concurrent requests decode on N;
   - promote; check in-flight tokens are unchanged and the next requests use N+1;
   - roll back; revoke under each in-flight policy;
   - cancel requests mid-drain;
   - check modules are released at zero leases and nothing leaks after 100 promote and rollback cycles.
-- [ ] 3.4 The same swap tests on the optimized CPU Provider's captures (lot 3 kernels, or a test-only prepared kernel).
-- [ ] 3.5 `cargo fmt`, `clippy -D warnings`, tests of both workspaces, and the Providers' tests.
+- [ ] 4.4 The same swap tests on the optimized CPU Provider's captures (lot 3 kernels, or a test-only prepared kernel).
+- [ ] 4.5 `cargo fmt`, `clippy -D warnings`, tests of both workspaces, and the Providers' tests.
 
-## 4. Documentation
+## 5. Documentation
 
-- [ ] 4.1 `docs/architecture/kernel-artifact-sources.md`: the kernel-package world, embedded and resolvable bundles, leases, promotion boundary, drain, rollback.
-- [ ] 4.2 `docs/architecture/component-runtime.md`: the kernel-package role and its empty import set.
-- [ ] 4.3 RFC acceptance criteria 1, 2, 3, 6, 7 and 8 (section 13), checked against the tests.
+- [ ] 5.1 `docs/architecture/kernel-artifact-sources.md`: the kernel-package world, embedded and resolvable bundles, leases, promotion boundary, drain, rollback.
+- [ ] 5.2 `docs/architecture/component-runtime.md`: the kernel-package role and its empty import set.
+- [ ] 5.3 RFC acceptance criteria 1, 2, 3, 6, 7 and 8 (section 13), checked against the tests.
+- [ ] 5.4 `docs/architecture/kernel-artifact-sources.md`: the promotion policy (bands, significance, guarded metrics, per-target scope, automatic rollback) and its parameters.

@@ -21,7 +21,13 @@ Status: **Proposed (RFC lot 0).** No task is implemented yet.
   - an in-memory source and a scripted adversarial source: size lie, oversized chunk, endless reads, past the deadline, wrong digest, corrupt archive;
   - each scenario of `kernel-artifact-source` as a test;
   - a repacked bundle resolving to the same identity.
-- [ ] 3.2 Trust: a valid signature, a signature over another digest, a revoked key, envelope metadata alone, a pinned digest, a trusted Component serving an unsigned bundle.
+- [ ] 3.2 Trust:
+  - a valid signature, a signature over another digest, a revoked key, envelope metadata alone, a pinned digest;
+  - a trusted Component serving an unsigned bundle;
+  - a valid signature under a key the operator has not authorized;
+  - a Component serving its own public key.
+
+  A check that no WIT or host call carries key material or a signing operation.
 - [ ] 3.3 Permission: trusted without permission, permission per format, revocation after qualification.
 - [ ] 3.4 The lifecycle: delivery without preparation, a skipped stage refused, `KernelRegistrationAuthority::Component` still refused.
 - [ ] 3.5 `cargo fmt`, `clippy -D warnings` and the tests of both workspaces; `magnetar-kernel` on `wasm32-unknown-unknown` (the source and trust types build there; OCI and file sources are native only).

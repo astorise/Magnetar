@@ -105,16 +105,38 @@ GenerationRef = (KernelId, PreparedKernelGeneration)
   Draining applies in every case.
 - Revocation survives re-import (`Revocation Survives Re-Import`).
 
-### D6. Answers to RFC questions
+### D6. Promotion policy (RFC Q9, decided)
+
+The decision is per hardware target: the Provider identity, the Device architecture or CPU model with its feature set, and the driver or runtime major version.
+
+- **Evidence.** The candidate generation and the active one are run interleaved on the same host, on a qualified workload. Model, weights, prompts, precision, batch and memory policy are identical (RFC section 11). Each generation gets at least 10 measured runs (a policy minimum).
+- **Gain.** The relative reduction of the workload's primary latency metric (end-to-end request latency, or TTFT or TPOT when the workload profile names it). Its 95% confidence interval comes from a bootstrap over the runs, and the gain counts only when that interval excludes zero.
+- **No significant regression.** TTFT, TPOT, p95 request latency, peak memory and error rate are guarded. A significant degradation beyond the tolerance (2% by default, a policy parameter) blocks promotion, as does any correctness failure.
+- **Bands:**
+
+  | Significant gain | Outcome |
+  | --- | --- |
+  | 10% or more | automatic promotion on that target |
+  | from 5% to below 10% | manual promotion by an operator possible |
+  | below 5% | no promotion |
+
+- **Automatic rollback.** After any promotion, the guarded metrics are watched on that target during an observation window. A significant regression against the pre-promotion baseline, a correctness check failure or an error triggers a rollback within the rollback window (D5). The generation is then barred from automatic re-promotion on that target until a new comparison.
+- **Evidence from elsewhere** (another target, published evidence from lot 5) informs, but never promotes.
+- **Pins.** The explicit pin of lot 1 stays an experiment control, recorded as a pin, not a promotion.
+
+### D7. Answers to RFC questions
 
 - **Q2, the WIT interface:** chunked reads for the MVP, a stream resource later, and manifest identity only in WIT (D1).
 - **Q5, the activation boundary:** the plan, with capture keys carrying generations (D4).
+- **Q9, benchmarks and thresholds:** D6.
 
 ## Risks / Trade-offs
 
 - **Recapture after promotion costs one warm step per pooled store set.** That cost is paid once per promotion, not per token.
 - **Lease accounting across the CUDA executor adds bookkeeping** to capture creation and release. These are not per-token paths, because a replay reuses the lease taken at capture.
 - **A kernel-package Component could serve a bundle larger than useful.** The gateway quota bounds it whatever the Component does.
+- **A comparison costs benchmark time on the target**: at least 10 runs per generation, interleaved. It runs off the token path, as a cold-path campaign, and only for ready generations.
+- **The 2% tolerance on guarded metrics is a default.** Each deployment sets it in its policy, like the minimum number of runs.
 
 ## Open Questions
 

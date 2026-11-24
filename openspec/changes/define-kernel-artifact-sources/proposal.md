@@ -30,7 +30,8 @@ Three gaps keep any external kernel from running:
 - **Kernel execution trust** (`magnetar-kernel`, reusing `magnetar-core`'s Ed25519 verification):
   - a `KernelTrustStore` with trusted publisher keys, revoked keys and pinned manifest digests, which verifies a bundle's signature envelope over its manifest digest;
   - a separate, deployment-owned `KernelExecutionPermission` per Provider identity, artifact format and publisher, denied by default;
-  - preparation requires trusted bytes, execution permission and qualification. A Component's own signature never extends to the bundles it serves.
+  - preparation requires trusted bytes, execution permission and qualification. A Component's own signature never extends to the bundles it serves;
+  - decentralized signing, centralized authorization (RFC Q4, decided): each publisher signs its packages with its own key, the Runtime verifies against the public keys the deployment's operator authorizes, and no private key reaches the Runtime or a Component.
 - **Delivery lifecycle.** One stage sequence: discovered, staged, ingested (accepted, quarantined or rejected), qualified, prepared, benchmarked, ready, active, draining, retired, rolled back. It maps onto the existing ingestion and registry states, and each transition has its own authority. No stage implies the next.
 - **Contract tests** for each acceptance and rejection scenario below: corrupt bytes, wrong digest, size claim exceeded, chunk overflow, an unsigned bundle under the production policy, a revoked key, a missing execution permission, a Component-signed but kernel-unsigned bundle.
 

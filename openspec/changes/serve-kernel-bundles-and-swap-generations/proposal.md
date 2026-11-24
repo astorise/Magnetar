@@ -26,6 +26,11 @@ Lot 2 of the [accelerator packages RFC](../../../docs/rfcs/accelerator-packages-
   - rollback re-promotes a retained generation inside the rollback window;
   - revocation stops new work at once, and in-flight work follows `RevocationInFlightPolicy` (allow to complete, cancel if safe, or fail closed at the next step boundary);
   - retired modules are released only after drain.
+- **Promotion policy (RFC Q9, decided)**, per hardware target, from an interleaved A/B comparison on a qualified workload:
+  - a significant gain of at least 10% with no significant regression promotes automatically;
+  - between 5% and 10%, an operator may promote manually;
+  - below 5%, nothing is promoted;
+  - any promotion is watched, and rolled back automatically on a significant regression or a correctness failure.
 - **Adversarial tests:** corruption, wrong digest, wrong architecture, trust refused, concurrent load, cancellation mid-read, revocation during a request, handle leaks.
 
 ## Capabilities
@@ -34,6 +39,7 @@ Lot 2 of the [accelerator packages RFC](../../../docs/rfcs/accelerator-packages-
 
 - `kernel-source-component`: the `kernel-package` world, its host, and the Component-served and OCI-resolved sources.
 - `kernel-generation-swap`: generation references, promotion at plan boundaries, capture invalidation, drain, rollback and revocation.
+- `kernel-promotion-policy`: evidence per hardware target, gain and significance, guarded metrics, promotion bands, automatic rollback.
 
 ### Modified Capabilities
 

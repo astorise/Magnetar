@@ -71,5 +71,5 @@ Magnetar-accelerators/
 
 ## Open Questions
 
-- RFC Q9: the benchmark workload and gain threshold that let published evidence feed promotion policy. Until decided, evidence informs ranking only through `kernel-selection-policy`'s existing rules.
-- Who holds the library's publisher key and how it is rotated (RFC Q4).
+- How the library's publisher key is rotated. RFC Q4 is decided (lot 0, design D3): the library signs with its own key, and each deployment's operator decides whether to authorize it.
+- RFC Q9 is decided (lot 2, design D6): published evidence informs, and promotion needs a comparison on the deployment's own hardware target.

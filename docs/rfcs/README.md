@@ -20,11 +20,11 @@ The RFC's open questions (section 14) and where each is answered:
 | Question | Answer |
 | --- | --- |
 | 1. Publication granularity | lot 0 design, D5 |
-| 2. The WIT interface | lot 2 design, D1 and D6 |
+| 2. The WIT interface | lot 2 design, D1 and D7 |
 | 3. Association with model Components | lot 0 design, D5 |
-| 4. Trust policy | lot 0 design, D3; the signing key holder is open |
+| 4. Trust policy | **decided**: decentralized signing by each publisher, centralized authorization of public keys by the deployment's operator; no private key in the Runtime or a Component, and no trust conferred by a serving Component (lot 0 design, D3) |
 | 5. The hot swap boundary | lot 2 design, D4 |
 | 6. The CPU ABI | lot 3 design; decided after the measurement of D5 |
 | 7. CompiledGraph | lot 4 design, D1 and D6 |
 | 8. Intel | deferred to `evaluate-hardware-gated-npu-compute` (G04) |
-| 9. Benchmarks and thresholds | lot 1 design (proposal); lot 5, open |
+| 9. Benchmarks and thresholds | **decided**: automatic promotion at a significant gain of 10% or more with no significant regression, per hardware target, with automatic rollback; manual promotion possible from 5% to 10% (lot 2 design, D6) |

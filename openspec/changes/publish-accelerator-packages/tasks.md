@@ -33,4 +33,4 @@ Status: **Proposed (RFC lot 5, optional).** No task is implemented yet. Requires
 
 - [ ] 6.1 `cargo fmt`, `clippy -D warnings`, tests of both workspaces and `tools/release-publish`.
 - [ ] 6.2 `docs/architecture/kernel-artifact-sources.md`: publication, evidence, ports, discovery and revocation. `SECURITY.md`: the revocation feed.
-- [ ] 6.3 RFC question 9: record the decided workload and threshold once the team sets them.
+- [ ] 6.3 Show, in `magnetar kernels list`, the band a local comparison would need (10% automatic, 5% to 10% manual, lot 2 design D6). Published evidence is labelled as informative only.

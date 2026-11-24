@@ -108,4 +108,4 @@ struct PreparedKernelHandle { id: PreparedKernelId, advertisement: KernelAdverti
 
 ## Open Questions
 
-- The promotion threshold and noise model for leaving the pin and letting policy rank (RFC question 9). Proposed: a gain whose 95% interval excludes zero and exceeds a team-set minimum, on the same job.
+- None for the threshold: RFC question 9 is decided in lot 2 (`serve-kernel-bundles-and-swap-generations`, design D6). A significant gain of at least 10% with no significant regression promotes automatically per hardware target; from 5% to 10%, promotion is manual. Until lot 2 lands, this lot's experiment uses the explicit pin and records the gain, interval and guarded metrics that the policy will use.

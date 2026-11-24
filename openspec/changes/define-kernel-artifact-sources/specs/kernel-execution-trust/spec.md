@@ -24,6 +24,25 @@ The Runtime SHALL evaluate kernel bundle trust against a deployment-owned kernel
 - **WHEN** a manifest carries a publisher claim and a signature envelope that does not verify
 - **THEN** the bundle is not trusted, and the claim is recorded as a claim only
 
+### Requirement: Decentralized Signing, Operator Authorization
+
+Each publisher SHALL sign its own kernel bundles with its own private key, outside the Runtime. The Runtime SHALL verify those signatures only against public keys that the deployment's operator has authorized in the kernel trust store. Neither the Runtime nor any Component SHALL hold, receive or use a private key, and no WIT contract SHALL carry key material or a signing operation.
+
+#### Scenario: A valid signature under an unauthorized key
+
+- **WHEN** a bundle's signature verifies under a publisher key the operator has not authorized
+- **THEN** the bundle is untrusted, and the decision names the unauthorized key identifier
+
+#### Scenario: A Component bundles its own key
+
+- **WHEN** a kernel-package Component serves bundles together with the public key that signed them
+- **THEN** that key is ignored for trust unless the operator has authorized it in the trust store
+
+#### Scenario: No signing capability reaches a Component
+
+- **WHEN** the kernel-package world and its host are inspected
+- **THEN** no import, export or host call exposes a private key or a signing operation
+
 ### Requirement: Execution Permission Is Separate From Trust
 
 The Runtime SHALL require, before asking a Provider to prepare a kernel artifact, a deployment-granted execution permission for that Provider identity, artifact format and publisher, in addition to trust. Permissions SHALL be denied by default. Neither trust, a passed qualification nor a Component's own signature SHALL grant one.

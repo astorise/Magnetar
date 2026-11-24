@@ -67,7 +67,14 @@ One reader shape serves a Component export (lot 2), an OCI blob fetch through `A
 - **Execution permission** answers "may Provider P execute format F from publisher X on this deployment?". `KernelExecutionPermission` entries are deployment configuration, denied by default. `nvidia:cubin` on the CUDA Provider and a native shared object on the CPU Provider (lot 3) are different permissions, because their blast radius differs.
 - **Preparation eligibility** requires trust, permission, qualification for the requested envelope, and no revocation.
 
-A Component's signature authenticates the Component's code. Bundles embedded in it carry their own envelope and are verified as kernels (RFC question 4).
+A Component's signature authenticates the Component's code. Bundles embedded in it carry their own envelope and are verified as kernels.
+
+**Decentralized signing, centralized authorization** (RFC Q4, decided):
+
+- **Signing is decentralized.** Each publisher signs its own packages with its own private key, with its own tooling, at publication time.
+- **Authorization is centralized** in the deployment. The Runtime verifies signatures only against the public keys that the deployment's operator has authorized in the kernel trust store. A valid signature under a key the operator has not authorized is untrusted.
+- **No private key on the Runtime side.** Neither the Runtime nor any Component holds, receives or uses a private key, and no WIT interface carries key material or a signing operation. A kernel-package Component serves bytes and signatures produced elsewhere.
+- **A Component confers no trust on the binaries it serves**, whatever its own signature or publisher.
 
 ### D4. The delivery lifecycle maps onto existing states
 
@@ -90,7 +97,7 @@ A `KernelDeliveryStage` value records the stage reached per bundle identity and 
 
 - **Q1, publication granularity.** One logical bundle per semantic binding, with several compiled variants (manifest v1 already supports multiple compiled variants per artifact list). Distinct semantics are distinct bundles.
 - **Q3, association with model Components.** No association in the model WIT. The Runtime resolves bundles from an independent catalog through policy. A model Component's recommendations, if ever added, stay advisory (`Recommendation Is Advisory`).
-- **Q4, trust policy.** Decided per D3: deployment-owned Ed25519 publisher keys, local revocation lists and per-Provider execution permissions. Who holds the signing keys is left to the team.
+- **Q4, trust policy.** Decided (D3): decentralized signing by each publisher; centralized authorization of public keys by the deployment's operator; no private key in the Runtime or a Component; no trust conferred by a serving Component; local revocation lists and per-Provider execution permissions.
 
 ## Risks / Trade-offs
 
@@ -100,5 +107,4 @@ A `KernelDeliveryStage` value records the stage reached per bundle identity and 
 
 ## Open Questions
 
-- Who signs Magnetar-maintained kernel bundles, and where the key lives (RFC Q4).
 - Whether kernel revocation lists share a file and format with Component and Model revocations.
