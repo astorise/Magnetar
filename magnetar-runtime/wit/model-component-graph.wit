@@ -466,7 +466,7 @@ interface model-config {
   linear-attention: func() -> option<linear-attention-config>;
 
   /// Decoder forms `architecture-config` cannot carry. Added in 1.13.0.
-  record decoder-variants {
+  record decoder-variant-config {
     /// Every decoder RMSNorm scales by `norm-weight-offset + weight`
     /// (Qwen3.5's zero-centered norms: 1). The linear-attention mixer's
     /// gated norm keeps its plain weight.
@@ -478,7 +478,7 @@ interface model-config {
 
   /// Added in 1.13.0: `none` keeps the plain forms. A declared value must
   /// be read before a graph is accepted.
-  decoder-variants: func() -> option<decoder-variants>;
+  decoder-variants: func() -> option<decoder-variant-config>;
 }
 
 /// A separate graph-producing world for one bidirectional encoder pass.

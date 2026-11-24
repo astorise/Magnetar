@@ -29,11 +29,17 @@
   - `rmsnorm.weight_offset` and `split.head_count` are gated by the `rmsnorm-weight-offset` and `split-per-head` Kernel features. The executor now forwards both attributes; it dropped them before.
   - The fixture `qwen35-attention-reference.json` comes from the pinned `Qwen3_5Attention`. `qwen35_gated_attention_block_matches_pinned_reference` matches it on the Reference CPU.
   - The CPU and CUDA Providers do not advertise these features yet (2.5, 2.6).
-- [ ] 2.3 Qwen Component: build the hybrid graphs.
-  - [x] Runtime side: `model-config` 1.13.0 adds `linear-attention` and `decoder-variants`. Both must be read when declared, and the host keeps linking 1.2.0–1.12.0. The WIT's `recurrent-resource` comment is updated.
-  - [x] Linear layers have no KV row width.
+- [x] 2.3 Qwen Component: build the hybrid graphs.
+  - [x] Runtime side: `model-config` 1.13.0 adds `linear-attention` and `decoder-variants` (record `decoder-variant-config`). Both must be read when declared, and the host keeps linking 1.2.0–1.12.0. The WIT's `recurrent-resource` comment is updated.
+  - [x] Linear layers have no KV row width, and the Runtime derives their mixer weight shapes (plus the gated `q_proj` and the q/k norms).
   - [x] `gated-delta-mixer` takes an optional token mask (12 inputs), since the engine feeds no mask.
-  - [ ] Component: read both functions and emit the per-layer mixer with `conv`/`delta` recurrent slots, or the gated attention block with KV. Rebuild and repin the wasm.
+  - [x] Component 0.5.0 (digest `sha256:136e96ac…`, families `qwen3_5`/`qwen3_5_text`) reads both functions and, for Qwen3.5 only, the layer layout (a Qwen2 graph still leaves a declared layout unread, so the Runtime refuses it). It emits:
+    - for a linear layer, a `gated-delta-mixer` with `conv`/`delta` recurrent slots;
+    - for a full-attention layer, the gated block with per-head q/k norms and partial rotary;
+    - zero-centered norms throughout.
+  - [x] End to end: `tests_qwen3_5_logits::a_qwen3_5_hybrid_bundle_matches_transformers`.
+    - Setup: a tiny random `qwen3_5_text` bundle, 2 linear and 2 gated full-attention layers, through the Hugging Face loader, the rebuilt Component and the Reference CPU.
+    - Result: the 12 greedy tokens equal `transformers` 5.23's and the top-8 logits agree within 1.1e-5, across the prefill and 11 decode steps that carry the recurrent state.
 - [x] 2.4 Hugging Face loader:
   - `qwen3_5`/`qwen3_5_text` are parsed: layer types, `linear_*` geometry, partial rotary from `rope_parameters`, output gate, and norm offset 1.
   - Mixer tensors are named without `proj`, so they keep checkpoint `[out, in]` order; `conv1d` `[C, 1, K]` becomes `[C, K]`.
