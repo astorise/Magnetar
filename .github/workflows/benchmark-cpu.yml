@@ -96,7 +96,8 @@ jobs:
       - name: CPU kernel bandwidth (diagnostic)
         # Streams each decode matmul shape of a Qwen2.5-0.5B layer from
         # memory, in both stored layouts, with the default kernels and with
-        # AVX2 only, so kernel choices are checked on each runner's CPU.
+        # AVX2 only, and in llama.cpp's row-at-a-time pattern, so kernel
+        # choices are checked on each runner's CPU.
         if: ${{ always() }}
         continue-on-error: true
         shell: bash
@@ -107,7 +108,7 @@ jobs:
             echo "== kernels: $simd" | tee -a "$out"
             if [[ "$simd" == avx2 ]]; then export MAGNETAR_CPU_SIMD=avx2; else unset MAGNETAR_CPU_SIMD; fi
             cargo test --release --manifest-path providers/cpu/Cargo.toml --lib -- \
-              --ignored --nocapture pool_and_streamed_matmul_costs 2>&1 \
+              --ignored --nocapture streamed_matmul_costs 2>&1 \
               | grep -E 'pool run|streamed' | tee -a "$out"
           done
           { echo '```'; cat "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
