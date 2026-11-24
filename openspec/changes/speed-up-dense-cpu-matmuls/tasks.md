@@ -54,4 +54,21 @@
   - The 16 generated tokens are those of earlier runs (" Paris. It is the largest city in Europe and the third largest city in the").
   - Run 44529384440 (the same CPU model, before section 4) measured about 34.3 ms per token in steady state. So the long-row kernels gave the runner much less than the local 18%, and its per-token time is about the same as before.
   - The remaining gap to Ollama is about 8 ms per token and 45 ms of TTFT.
-- [ ] 4.8 TTFT on the runner went from 48.2 ms (run 44529384440) to 71.5 ms (run 45343428878, every logical CPU), while it did not regress locally (91.0 to 88.3 ms with profiling). Find whether the prefill's output-major matmuls on the new orientation, or a Runtime change merged from main between the two runs, cost it. Profile the bucketed prefill replay on an AVX-512 Zen 4 runner and fix it.
+- [x] 4.8 TTFT on the runner went from 48.2 ms (run 44529384440) to 71.5 ms (run 45343428878, every logical CPU), on the same CPU model (EPYC 9V74), while TPOT stayed about 35 ms. Locally (4 cores without SMT), on the same machine, nothing regressed:
+
+  | Magnetar | CPU Provider | TTFT | TPOT |
+  | --- | --- | --- | --- |
+  | 522d2e4 (before the merge with main) | 8324c36 | 94.7 ms | 48-50 ms |
+  | 2e5e7f0 (after the merge) | 20b34ce | 95 ms | 48.2 ms |
+  | dab7c3f (section 4) | 3c01cf3 | 87.3 ms | 38.3 ms |
+
+  Step capture still replays: with `MAGNETAR_CPU_STEP_CAPTURE=0` the last row becomes TTFT 110.6 ms and TPOT 49.8 ms. The runner's regression may be specific to Zen 4, in the several-row (prefill) kernels that section 4's orientation routes the down, k and v projections through. Section 5 replaces those kernels. The next campaign tells whether the runner's TTFT comes back.
+
+## 5. Register-tiled prefill kernels
+
+- [x] 5.1 Several rows of `a` run register tiles of up to six rows by four vectors (AVX-512) or two (AVX2), accumulated across the whole reduction. Each weight vector is loaded once for every row of the tile, and outputs are stored once. Input-major tiles walk their weight rows in blocks of 32 (unblocked, a wide weight read one page per load). The tests cover 3, 5 and 8 rows with tails (`dense_matmuls_match_the_reference_cpu`, `both_vector_widths_match_the_reference_cpu`).
+- [x] 5.2 Locally, 5 rows, AVX-512:
+  - gate/up 0.634 to 0.268 ms;
+  - the down projection 0.598 to 0.26-0.33 ms;
+  - Qwen2.5-0.5B TTFT 87.3 to 71.8-78.4 ms, with the same 16 tokens (providers/cpu e135ad2).
+- [ ] 5.3 Benchmark CPU on the same machine as Ollama and llama-server.

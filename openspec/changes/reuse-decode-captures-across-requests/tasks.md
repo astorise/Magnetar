@@ -22,3 +22,11 @@
   | Ollama (FP16 GGUF) | 80.0 ms | 5.0 ms | 4.54 ms |
 
   Before this change, run 44490170115 measured Magnetar at 92.6 ms per request, with its first two decode steps at 11.7-16.7 ms. llama-server did not build in this run (llama.cpp's prebuilt web UI assets were missing; `benchmark/ci.sh` now builds it without them).
+
+  With llama-server, all engines in one job (run 45346099731, RTX 3060, driver 595.71.05, Magnetar aa35dbf). Magnetar's 16 tokens are llama-server's:
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar (CUDA) | 74 ms | 10.7 ms | 4.16 ms |
+  | llama-server (FP16 GGUF) | 80 ms | — | 4.87 ms |
+  | Ollama (FP16 GGUF) | 80 ms | — | 4.56 ms |

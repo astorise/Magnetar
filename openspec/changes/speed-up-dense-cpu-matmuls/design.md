@@ -39,6 +39,16 @@ A decode step reads each weight once, a few stored rows side by side. Locally (4
 - **AVX-512 for one row too.** With these kernels the 16-lane variants were faster for a single row as well (gate/up 38.9 against 34.7 GB/s, down 44.0 against 37.9).
 - **Splits.** An input-major weight narrower than 4,096 columns per thread is shared out by blocks of whole rows (gate/up on 2 threads used to split into 2,048 + 2,048 + 768 columns, one thread doing twice the other's share). A wider one (the LM head) takes one column block per thread, two when they stay wider than 16,384 columns: 2,000-column blocks read 4 KB runs between 300 KB strides (27 against 47 GB/s in a standalone measurement). Output-major tasks are whole groups of sixteen outputs, about eight tasks per thread.
 
+### Prefill tiles
+
+Several rows of `a` (a bucketed prefill computes its live rows) are compute-bound, not bandwidth-bound. The decode loops, applied to them, loaded and stored the output once per row of `a` and broadcast each scale from memory: about 29 loads for 20 fused multiply-adds.
+
+The prefill kernels are register tiles of up to six rows of `a`:
+- by four vectors of outputs on AVX-512, two on AVX2: 24 or 12 accumulators, plus the weight vectors and one broadcast, within the register file;
+- accumulated across the whole reduction, so each weight vector is loaded and widened once for all the tile's rows, and each output is stored once.
+
+Input-major tiles read their strip of columns down the weight rows at a stride of a whole row, so they walk the rows in blocks of 32. A block bounds the pages and streams a tile touches. Unblocked, a 151,936-column weight read a new page on every load.
+
 ### Thread count
 
 The pool keeps one thread per logical CPU (`available_parallelism`); `MAGNETAR_CPU_THREADS` overrides it.
