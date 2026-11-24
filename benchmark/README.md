@@ -23,6 +23,26 @@ indisponible dans le tableau. Une comparaison à cinq nécessite d'abord un
 modèle effectivement pris en charge par tous les moteurs et par la campagne
 Magnetar.
 
+## Référence Strata pour Qwen3.8-Flash-Next
+
+Le workflow **Benchmark GPU** lancé avec `suite: strata-flash-next` mesure
+[Strata](https://github.com/Niko1221/Strata) (MIT), à un commit fixé
+(`strata_ref`), servant Qwen3.8-Flash-Next sur le runner GPU : la référence
+de l'implémentation du modèle dans Magnetar. Le setup de Strata télécharge la
+taille ISTA-DASLab choisie (`strata_model`, IQ2_XS par défaut, environ 70 Go
+avec la table n-gram) et la place lui-même : les poids actifs à chaque token et
+un cache d'experts en VRAM sur les deux cartes, les autres experts en RAM ou
+lus depuis le SSD quand la RAM ne suffit pas, la table n-gram sur le SSD.
+Contexte 8 192 tokens, sans images.
+
+Le serveur est mesuré deux fois, avec puis sans la couche MTP de drafting
+(`"mtp": false` dans sa configuration), Magnetar n'ayant pas de drafting :
+une cellule du harness (`benchmark/ci.sh`, le prompt de la campagne) et
+`terminal/tools/strata_bench.py` de Strata (questions courtes : décodage et
+TTFT ; prompts de 4K et 16K tokens : prefill). L'artefact contient le journal
+du setup, la configuration générée, les journaux du serveur, la mémoire GPU et
+RAM occupée et les rapports.
+
 ## Résultats et interprétation
 
 Le résumé du job et l'artefact contiennent `comparison.md`, `status.tsv`, les

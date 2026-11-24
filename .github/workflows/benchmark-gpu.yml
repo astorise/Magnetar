@@ -11,6 +11,24 @@ on:
         description: Number of measured requests per engine
         default: '5'
         required: true
+      suite:
+        description: "campaign: Qwen2.5-0.5B, every engine; strata-flash-next: the Strata reference run of Qwen3.8-Flash-Next"
+        type: choice
+        options: [campaign, strata-flash-next]
+        default: campaign
+      strata_model:
+        description: "strata-flash-next: the ISTA-DASLab size (setup's --model)"
+        type: choice
+        options: [IQ2_XS, Q2_0, IQ3_XXS]
+        default: IQ2_XS
+      strata_ref:
+        description: "strata-flash-next: the Strata commit"
+        default: d46f5f268f8ed797e83a5c63a69bffbd7a581cf6
+        required: true
+      strata_build:
+        description: "strata-flash-next: compile the engine (setup's --build) instead of the ready-made one"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +40,7 @@ concurrency:
 jobs:
   benchmark:
     name: GPU / same-machine comparison
+    if: ${{ inputs.suite == 'campaign' }}
     runs-on: arc-gpu-magnetar
     timeout-minutes: 360
     container:
@@ -61,5 +80,125 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: benchmark-gpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/benchmark-results/
+          if-no-files-found: warn
+
+  strata-flash-next:
+    # The reference for Magnetar's Qwen3.8-Flash-Next support: Strata
+    # (github.com/Niko1221/Strata, MIT) serving the model on this runner,
+    # with its expert placement (the always-active weights and an expert
+    # cache in VRAM, the other experts in RAM or mapped from the SSD, the
+    # n-gram table on the SSD). Measured with and without its MTP draft
+    # layer: Magnetar has no drafting yet.
+    name: GPU / Strata reference, Qwen3.8-Flash-Next
+    if: ${{ inputs.suite == 'strata-flash-next' }}
+    runs-on: arc-gpu-magnetar
+    timeout-minutes: 360
+    container:
+      image: nvidia/cuda:13.5.0-cudnn-devel-ubuntu24.04
+      options: --gpus all
+    defaults:
+      run:
+        shell: bash
+    env:
+      BENCH_DEVICE: gpu
+      BENCH_TOKENS: ${{ inputs.tokens }}
+      BENCH_RUNS: ${{ inputs.runs }}
+      STRATA_MODEL: ${{ inputs.strata_model }}
+      STRATA_REF: ${{ inputs.strata_ref }}
+      STRATA_BUILD: ${{ inputs.strata_build }}
+    steps:
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates build-essential cmake python3 python3-venv python3-pip procps
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Record the host
+        run: |
+          set -u
+          results="$RUNNER_TEMP/benchmark-results"
+          mkdir -p "$results"
+          {
+            nvidia-smi
+            nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version,memory.total --format=csv
+            free -g
+            df -h "$RUNNER_TEMP"
+            lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-300
+            echo "locked memory limit: $(ulimit -l)"
+          } 2>&1 | tee "$results/host.txt"
+      - name: Fetch Strata at the pinned commit
+        run: |
+          set -euo pipefail
+          git clone --no-tags https://github.com/Niko1221/Strata.git "$RUNNER_TEMP/strata"
+          git -C "$RUNNER_TEMP/strata" checkout --detach "$STRATA_REF"
+          git -C "$RUNNER_TEMP/strata" rev-parse HEAD | tee "$RUNNER_TEMP/benchmark-results/strata-revision.txt"
+      - name: Set up the model (Strata setup, no start)
+        # Two cards, an 8K context, no pictures; setup picks the placement
+        # (its low-RAM mode when the experts do not fit beside the system).
+        # No Hugging Face token is handed to Strata's setup: the ISTA-DASLab
+        # files are public.
+        timeout-minutes: 270
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/strata"
+          build=()
+          if [[ "$STRATA_BUILD" == true ]]; then build=(--build); fi
+          ./setup.sh --family qwen --model "$STRATA_MODEL" --context 8192 --vision no --gpus 0,1 \
+            --data-dir "$RUNNER_TEMP/strata-data" --no-browser --no-start --yes "${build[@]}" \
+            < /dev/null 2>&1 | tee "$RUNNER_TEMP/benchmark-results/setup.log"
+          df -h "$RUNNER_TEMP" | tee -a "$RUNNER_TEMP/benchmark-results/setup.log"
+      - name: Serve and measure, with and without the MTP draft layer
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          strata="$RUNNER_TEMP/strata"
+          results="$RUNNER_TEMP/benchmark-results"
+          cfg="$(find "$strata" -maxdepth 2 -name 'strata-*.json' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+          [[ -n "$cfg" ]] || { echo "::error::setup wrote no strata-*.json run config"; exit 1; }
+          py="$strata/terminal/.venv/bin/python"
+          cp "$cfg" "$results/run-config.json"
+          url=http://127.0.0.1:8080
+          pid=
+          start() {
+            "$py" "$strata/terminal/serve/server.py" --engine strata --config "$cfg" --port 8080 > "$results/server-$1.log" 2>&1 &
+            pid=$!
+            for _ in $(seq 1 540); do
+              if curl -sf "$url/health" > "$results/health-$1.json"; then
+                break
+              fi
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "::error::the Strata server stopped while loading ($1)"; tail -n 60 "$results/server-$1.log"; exit 1
+              fi
+              sleep 5
+            done
+            curl -sf "$url/health" > /dev/null || { echo "::error::the model did not load within 45 minutes ($1)"; exit 1; }
+            { nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv; free -g; } > "$results/memory-$1.txt"
+          }
+          stop() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+          measure() {
+            model="$("$py" -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"])' "$results/health-$1.json")"
+            BENCH_ENGINE=strata BENCH_URL="$url" BENCH_MODEL="$model" BENCH_ENGINE_REF="$STRATA_REF" bash benchmark/ci.sh || echo "::warning::the Magnetar harness cell failed ($1)"
+            "$py" "$strata/terminal/tools/strata_bench.py" --url "$url" --runs 3 --out "$results/strata-bench-$1" || echo "::warning::strata_bench failed ($1)"
+            { nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv; free -g; } >> "$results/memory-$1.txt"
+          }
+          start mtp-on
+          measure mtp-on
+          stop
+          # The run config's "mtp": false starts the engine without the draft layer.
+          "$py" -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p, encoding="utf-8-sig")); c["mtp"]=False; open(p, "w", encoding="utf-8").write(json.dumps(c, indent=2))' "$cfg"
+          start mtp-off
+          measure mtp-off
+          stop
+          for run in mtp-on mtp-off; do
+            echo "### Strata $STRATA_MODEL, $run" >> "$GITHUB_STEP_SUMMARY"
+            for readme in "$results/strata-bench-$run"/*/README.md "$results/strata-bench-$run"/README.md; do
+              if [[ -f "$readme" ]]; then sed -n 1,60p "$readme" >> "$GITHUB_STEP_SUMMARY"; fi
+            done
+            cat "$results/memory-$run.txt" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload the results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: strata-flash-next-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/benchmark-results/
           if-no-files-found: warn
