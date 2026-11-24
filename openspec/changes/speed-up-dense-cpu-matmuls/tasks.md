@@ -171,6 +171,20 @@ Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally,
   - On this host every logical CPU decodes faster (37.9 against 39.8 ms), unlike the Xeon 6975P-C: the better thread count for the decode step depends on the CPU model.
   - Streamed alone, its kernels reach 30.1 GB/s (gate/up) and 29.3 GB/s (down), below the Xeon 6 hosts.
 
+  Third sample: run 45442269420, AMD EPYC 9V45 (Zen 5), 2 cores × 2 threads, Magnetar 17d4ff9, providers/cpu 3b22bd5. The same 16 tokens.
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar, 4 threads (default) | 440 ms | 35.5 ms | 27.0 ms |
+  | Magnetar, 2 threads (one per core) | — | 43.6 ms | 26.6 ms |
+  | Magnetar, decode on 2 threads, prefill on 4 | — | 35.5 ms | 26.9 ms |
+  | llama-server (FP16 GGUF) | 380 ms | — | 22.7 ms |
+  | Ollama (FP16 GGUF, 4 prompt tokens cached) | 370 ms | — | 21.4 ms |
+
+  - Against run 44525765520 on the same CPU model (before this change's kernels): Magnetar 493 -> 440 ms per request, TTFT 53.5 -> 35.5 ms, 29.2 -> 27.0 ms per token; llama-server 23.2 and Ollama 21.3 ms per token then.
+  - On this AMD host the engines built on llama.cpp stream the same 988 MB per token at 44-46 GB/s, Magnetar at 37 GB/s; streamed alone, Magnetar's kernels reach 38-42 GB/s on every shape. The gap is in the kernels' access pattern on this CPU, not in the step's other work: the next lever on AMD.
+  - The thread count barely matters here (26.6 against 27.0 ms per token).
+
 - [ ] 7.8 A decode pool of its own: `MAGNETAR_CPU_DECODE_THREADS=N` runs one-row Kernels (dense and packed products, gated sums, attention over one query) on N threads, Kernels of several rows on the main pool (test: `one_row_kernels_run_on_the_decode_pool`; providers/cpu c2967a3). The CPU benchmark measures it on one thread per physical core (step "Magnetar decoding on one thread per physical core"). Whether it becomes the default on hosts with two threads per core is decided on a Zen 4 sample. First samples disagree: one thread per core decoded faster on the Xeon 6975P-C (32.5 against 34.2 ms), slower on the Xeon Platinum 8573C (39.8 against 37.9 ms).
 - [x] 7.9 Small Kernels in a replayed step (rmsnorm, rope, kv-write, attention: about 170 calls per token, 9-11 us each for 896 values, about 1.8 ms per token). Timed in the model, an rmsnorm call split into its input copy (1.6 us), its weight copy (2.0), the arithmetic (2.0) and the output store with its result (2.6); a rope call computed `sin_cos` per head (448 times for a 14-head query row).
   - rope computes a row's rotations once for every head; rmsnorm and rope read their inputs where they are stored; an output keeps its slot's key; a replay builds no `KernelResult` (providers/cpu 3b22bd5). The same values and tokens.
