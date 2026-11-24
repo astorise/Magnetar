@@ -71,4 +71,13 @@
   - gate/up 0.634 to 0.268 ms;
   - the down projection 0.598 to 0.26-0.33 ms;
   - Qwen2.5-0.5B TTFT 87.3 to 71.8-78.4 ms, with the same 16 tokens (providers/cpu e135ad2).
-- [ ] 5.3 Benchmark CPU on the same machine as Ollama and llama-server.
+- [x] 5.3 Benchmark CPU, all engines in one job (run 45353462271, Intel Xeon Platinum 8370C with AVX-512, 2 cores × 2 threads, providers/cpu e135ad2). Magnetar's 16 tokens are llama-server's:
+
+  | Engine | Request | TTFT / prompt | Per token |
+  | --- | --- | --- | --- |
+  | Magnetar `cpu-native`, 4 threads (default) | 632 ms | 61.5 ms | 38.1 ms |
+  | Magnetar `cpu-native`, 2 threads (one per core) | — | 59.6 ms | 39.3 ms |
+  | llama-server (FP16 GGUF) | 749 ms | — | 46.3 ms |
+  | Ollama (FP16 GGUF, `n_threads = 2`) | 763 ms | — | 44.2 ms |
+
+  On this host Magnetar is ahead of both, per request and per token. The host is an Intel CPU, not the Zen 4 of runs 44529384440 and 45343428878, so the Zen 4 TTFT question of task 4.8 needs a campaign on a Zen 4 runner.
