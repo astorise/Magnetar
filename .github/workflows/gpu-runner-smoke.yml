@@ -1619,26 +1619,36 @@ jobs:
           mkdir -p "$dir"
           curl -fsSL "https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/$REVISION/gemma-4-12B-it-Q4_0.gguf" -o "$dir/model.gguf"
           echo "MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
-      - name: Gemma 4 12B instruct Q4_0 GGUF on CUDA
+      - name: Gemma 4 12B instruct Q4_0 GGUF on CUDA and the optimized CPU Provider
         # read-unified-text-decoder 2.3: the 12B's layout on real weights
         # (five sliding layers to one full layer, one K/V head of width 512
         # on the full layers, a quarter of each full head rotated) through
-        # the Gemma 4 Component on one GPU.
+        # the Gemma 4 Component. The first run (45570555856) loaded and ran
+        # on one GPU but generated "0111...": every variant below runs and
+        # reports, to say whether the fault is in a CUDA Kernel (Tensor
+        # Cores, int8 activations) or in what the Providers share.
         if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' && env.MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR != '' }}
-        timeout-minutes: 45
+        timeout-minutes: 60
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
         shell: bash
         run: |
-          set -o pipefail
+          set -uo pipefail
           trap 'rm -rf "$MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR"' EXIT
           dir="$RUNNER_TEMP/qualification-reports/gemma-4-12b-q4_0-gguf"
           mkdir -p "$dir"
-          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/one-gpu.log"
-          grep -Eq 'generated text " ?Paris' "$dir/one-gpu.log" || {
-            echo "::error::Gemma 4 12B Q4_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
-            exit 1
+          status=0
+          run_variant() {
+            local label="$1" test="$2"; shift 2
+            env "$@" cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml "$test" -- --include-ignored --test-threads=1 --nocapture > "$dir/$label.log" 2>&1 || echo "::warning::Gemma 4 12B $label: the test failed"
+            grep -h 'generated text\|warm TTFT' "$dir/$label.log" | sed "s/^/$label: /" || true
+            grep -Eq 'generated text " ?Paris' "$dir/$label.log"
           }
+          run_variant cuda real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda X=1 || { echo "::error::Gemma 4 12B Q4_0 on CUDA: the greedy continuation of 'The capital of France is' does not start with 'Paris'"; status=1; }
+          run_variant cuda-no-tensor-cores real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_CUDA_TENSOR_CORES=0 || echo "::warning::Gemma 4 12B without Tensor Cores: not Paris"
+          run_variant cuda-f32-activations real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_CUDA_INT8_ACTIVATIONS=0 || echo "::warning::Gemma 4 12B with f32 activations: not Paris"
+          run_variant cpu-native real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_native_cpu X=1 || echo "::warning::Gemma 4 12B on the optimized CPU: not Paris"
+          exit "$status"
       - name: TurboQuant KV stores on real checkpoints against f32
         # turboquant-kv-history: each checkpoint generates on one GPU with
         # f32, tq4 and tq3 KV stores (MAGNETAR_KV_PRECISION); the greedy

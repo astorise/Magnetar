@@ -1053,6 +1053,23 @@ fn real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda() {
     });
 }
 
+/// The same Gemma 4 12B checkpoint on the optimized CPU Provider: the
+/// first run on real weights produced a degenerate continuation on CUDA,
+/// and this one says whether the fault is in a CUDA Kernel or in what both
+/// Providers share (the Component's graph, the loader's layout).
+#[test]
+#[ignore = "downloads/holds a 7.2GB real quantized checkpoint"]
+fn real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native gemma-4-12b-it q4_0 gguf",
+        dir_env: "MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR",
+        repository: "ggml-org/gemma-4-12B-it-GGUF",
+        revision: GEMMA4_12B_REVISION,
+        file: "gemma-4-12B-it-Q4_0.gguf",
+        sha256: GEMMA4_12B_Q4_0_SHA256,
+    });
+}
+
 /// The same Gemma 4 E2B checkpoint on the optimized CPU Provider, its
 /// packed `Q4_0`, `Q6_K` and `F16` weights read in their checkpoint
 /// encoding.
