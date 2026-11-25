@@ -32,7 +32,8 @@ on:
         description: >-
           Comma-separated groups to run: kernels, dense, long-context, gguf,
           multi-gpu, moe, gemma, kv, hybrid; or "standard" (all but long-context and kv) or "all".
-          The daily schedule always runs "all".
+          "latent" (the f32 latent history's context ceiling, 16.7 GB to download) is never part of
+          "standard" or "all". The daily schedule always runs "all".
         required: false
         default: standard
   schedule:
@@ -68,7 +69,7 @@ jobs:
             *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe,gemma,kv,hybrid" ;;
             *,standard,*) suite="$suite,kernels,dense,gguf,multi-gpu,moe,gemma,hybrid" ;;
           esac
-          for group in kernels dense long-context gguf multi-gpu moe gemma kv hybrid; do
+          for group in kernels dense long-context gguf multi-gpu moe gemma kv hybrid latent; do
             var="SUITE_$(echo "$group" | tr 'a-z-' 'A-Z_')"
             case ",$suite," in
               *",$group,"*) echo "$var=true" >> "$GITHUB_ENV"; echo "$group: on" ;;
@@ -77,7 +78,7 @@ jobs:
           done
           for group in $(echo "$suite" | tr ',' ' '); do
             case "$group" in
-              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe|gemma|kv|hybrid) ;;
+              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe|gemma|kv|hybrid|latent) ;;
               *) echo "::error::unknown suite group: $group"; exit 1 ;;
             esac
           done
@@ -1863,7 +1864,7 @@ jobs:
         # register-deepseek-model-component: 16.7 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
         # Qwen1.5-MoE checkpoint is removed first to free the disk.
-        if: ${{ !cancelled() && env.SUITE_MOE == 'true' }}
+        if: ${{ !cancelled() && (env.SUITE_MOE == 'true' || env.SUITE_LATENT == 'true') }}
         env:
           REVISION: b6350f4c672640e949652ae480226b25deb88091
         shell: bash
@@ -1961,6 +1962,33 @@ jobs:
           kill "$clocks" || true
           echo "GPU clocks (timestamp, index, SM MHz, memory MHz, temperature, power, P-state):"
           cat "$report/clocks.csv" || true
+          cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF f32 latent history ceiling
+        # bound-one-pass-prefill-memory 3.2: the longest context an f32
+        # latent history prefills on the two 12 GB GPUs, the layers
+        # balanced. 16,384 tokens ran out of the second GPU's memory at
+        # layer 25 (run 44382825307); 4,096 runs. Ascending contexts, the
+        # test stops at the first that fails and prints each GPU's free
+        # memory after it.
+        if: ${{ !cancelled() && env.SUITE_LATENT == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+          MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32"
+          MAGNETAR_KV_GAINS_CONTEXTS: "4096,8192,12288,16384"
+          MAGNETAR_KV_GAINS_LABEL: deepseek-v2-lite-chat-q8_0-f32-ceiling
+        shell: bash
+        run: |
+          set -o pipefail
+          report="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-f32-ceiling"
+          mkdir -p "$report"
+          MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR" \
+          MAGNETAR_KV_GAINS_REPORT="$report/gains.md" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains.log"
           cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
       - name: Download the pinned real Qwen3.5-0.8B-Base checkpoint
         if: ${{ !cancelled() && env.SUITE_HYBRID == 'true' }}
