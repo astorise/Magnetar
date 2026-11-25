@@ -4,6 +4,7 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
+use crate::DecoderExtensions;
 
 fn sample_config() -> ModelArchitectureConfig {
     ModelArchitectureConfig {
@@ -32,6 +33,7 @@ fn sample_config() -> ModelArchitectureConfig {
         linear_attention: None,
         norm_weight_offset: None,
         attention_output_gate: false,
+        decoder_extensions: Default::default(),
         bos_token_id: None,
         eos_token_id: Some(151643),
     }
@@ -693,5 +695,126 @@ fn hybrid_decoder_forms_are_exposed_and_must_be_read() {
     assert_eq!(
         capability.call("b", "decoder-variants", &[]).unwrap(),
         vec![ComponentValue::Option(None)]
+    );
+}
+
+/// `1.14.0` (`support-qwen38-flash-next`): residual streams, n-gram
+/// embeddings, token selection and the linear layers' gate are exposed
+/// as their own functions, each must be read when declared, and a plain
+/// decoder declares none of them.
+#[test]
+fn qwen4_exp_decoder_forms_are_exposed_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.decoder_extensions = DecoderExtensions {
+        hyper_connections: Some(HyperConnectionConfig {
+            streams: 4,
+            lowrank: 320,
+        }),
+        ngram_embeddings: Some(NgramEmbeddingConfig {
+            layers: (0..24).map(|layer| layer == 1).collect(),
+            embedding_dim: 256,
+            conv_kernel: 4,
+            ngram_size: 3,
+            heads_per_ngram: 8,
+            vocabulary_base: 20_000_000,
+            vocabulary_multiple: 128,
+            seed: 1234,
+            eos_token: 7,
+        }),
+        token_selection: Some(TokenSelectionConfig {
+            heads: 4,
+            key_heads: 1,
+            head_dim: 128,
+            budget: 2048,
+            compress_ratio: 4,
+        }),
+        sigmoid_linear_gate: true,
+    };
+    capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec![
+            "hyper-connections",
+            "ngram-embeddings",
+            "token-selection",
+            "linear-attention-gate"
+        ]
+    );
+    let record = |function: &str| {
+        let result = capability.call("a", function, &[]).unwrap();
+        let [ComponentValue::Option(Some(value))] = result.as_slice() else {
+            panic!("{function} is absent")
+        };
+        let ComponentValue::Record(fields) = value.as_ref().clone() else {
+            panic!("{function} is not a record")
+        };
+        fields
+    };
+    let field = |fields: &Vec<(String, ComponentValue)>, name: &str| {
+        fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .unwrap()
+            .1
+            .clone()
+    };
+    let streams = record("hyper-connections");
+    assert_eq!(field(&streams, "streams"), ComponentValue::U32(4));
+    assert_eq!(field(&streams, "lowrank"), ComponentValue::U32(320));
+    let ngram = record("ngram-embeddings");
+    let ComponentValue::List(layers) = field(&ngram, "layers") else {
+        panic!("wrong layer list")
+    };
+    assert_eq!(layers.len(), 24);
+    assert_eq!(layers[1], ComponentValue::Bool(true));
+    assert_eq!(layers[0], ComponentValue::Bool(false));
+    assert_eq!(field(&ngram, "embedding-dim"), ComponentValue::S64(256));
+    assert_eq!(field(&ngram, "ngram-size"), ComponentValue::U32(3));
+    assert_eq!(
+        field(&ngram, "vocabulary-base"),
+        ComponentValue::S64(20_000_000)
+    );
+    assert_eq!(field(&ngram, "seed"), ComponentValue::S64(1234));
+    assert_eq!(field(&ngram, "eos-token"), ComponentValue::U32(7));
+    let selection = record("token-selection");
+    assert_eq!(field(&selection, "budget"), ComponentValue::U32(2048));
+    assert_eq!(field(&selection, "key-heads"), ComponentValue::U32(1));
+    assert_eq!(
+        capability.call("a", "linear-attention-gate", &[]).unwrap(),
+        vec![ComponentValue::Option(Some(Box::new(
+            ComponentValue::Enum("sigmoid".into())
+        )))]
+    );
+    assert!(capability.unread_declared_features("a").is_empty());
+
+    // A plain decoder declares none of them.
+    capability.bind_config("b", sample_config());
+    capability.call("b", "hidden-activation", &[]).unwrap();
+    assert!(capability.unread_declared_features("b").is_empty());
+    for function in [
+        "hyper-connections",
+        "ngram-embeddings",
+        "token-selection",
+        "linear-attention-gate",
+    ] {
+        assert_eq!(
+            capability.call("b", function, &[]).unwrap(),
+            vec![ComponentValue::Option(None)],
+            "{function}"
+        );
+    }
+    // A silu gate is the default and declares nothing.
+    let mut silu = sample_config();
+    silu.decoder_extensions.hyper_connections = Some(HyperConnectionConfig {
+        streams: 2,
+        lowrank: 8,
+    });
+    capability.bind_config("c", silu);
+    capability.call("c", "hidden-activation", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("c"),
+        vec!["hyper-connections"]
     );
 }

@@ -448,6 +448,7 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             linear_attention: None,
             norm_weight_offset: None,
             attention_output_gate: false,
+            decoder_extensions: Default::default(),
             bos_token_id: None,
             eos_token_id: None,
         },

@@ -144,6 +144,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
         linear_attention: None,
         norm_weight_offset: None,
         attention_output_gate: false,
+        decoder_extensions: Default::default(),
         moe_layers: None,
         expert_routing: None,
         require_bos: false,
