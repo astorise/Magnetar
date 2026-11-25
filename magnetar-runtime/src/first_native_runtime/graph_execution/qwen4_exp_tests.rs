@@ -199,6 +199,56 @@ fn the_qsa_selection_runs_as_a_graph_node() {
     }
 }
 
+/// The attention that reads a token selection, run as a graph node over the
+/// selection the `qsa-select` node computes, against the pinned Transformers
+/// attention.
+#[test]
+fn the_selected_attention_runs_as_a_graph_node() {
+    let fixture = fixture();
+    let case = &fixture.qsa_attention;
+    let index = &case.index;
+    let tokens = index.keys.shape[0] as usize;
+    let slots = index.budget + index.compress_ratio - 1;
+    let [selection] = run_node(
+        "qsa-select",
+        OperatorFamily::Tensor,
+        vec![
+            ("head_count", int(index.head_count)),
+            ("head_dim", int(index.head_dim)),
+            ("compress_ratio", int(index.compress_ratio)),
+            ("budget", int(index.budget)),
+            ("rotary_dim", int(index.rotary_dim)),
+            ("epsilon", float(fixture.epsilon)),
+            ("weight_offset", float(1.0)),
+            ("rope_base", float(index.rope_base)),
+        ],
+        vec![
+            index.queries.tensor(),
+            index.keys.tensor(),
+            index.key_norm_weight.tensor(),
+        ],
+        &[vec![tokens as u64, slots as u64]],
+    )
+    .try_into()
+    .unwrap();
+    let [attended] = run_node(
+        "attention",
+        OperatorFamily::Attention,
+        vec![
+            ("head_count", int(case.head_count as usize)),
+            ("kv_head_count", int(case.kv_head_count as usize)),
+            ("head_dimension", int(case.head_dim as usize)),
+            ("scale", float(case.scaling)),
+            ("token_selection", OperatorAttributeValue::Boolean(true)),
+        ],
+        vec![case.q.tensor(), case.k.tensor(), case.v.tensor(), selection],
+        std::slice::from_ref(&case.output.shape),
+    )
+    .try_into()
+    .unwrap();
+    assert_matches(&attended, &case.output, "selected attention");
+}
+
 #[test]
 fn the_ngram_ple_runs_as_graph_nodes_with_its_states() {
     let fixture = fixture();

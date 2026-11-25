@@ -237,5 +237,60 @@ fixture["moe_block"] = {
     "shared_expert_gate": flat(moe.shared_expert_gate.weight),
     "output": flat(moe_output[0]),
 }
+# The QSA attention: the module's own projections, norms and rotary, then the
+# eager attention over the causal mask narrowed by the indexer's selection.
+# The fixture holds the attention's output before its output gate and
+# projection; the selection is recomputed from the indexer's inputs.
+for attempt in range(200):
+    attention = m.Qwen4ExpTextAttention(qsa_config, 3)
+    randomize(attention)
+    attention_hidden = torch.randn(1, QSA_TOKENS, HIDDEN)
+    position_ids = torch.arange(QSA_TOKENS).view(1, 1, -1).expand(3, 1, -1)
+    with torch.no_grad():
+        cos, sin = rotary(attention_hidden, position_ids)
+        qk = attention.indexer.index_qk_proj(attention_hidden)
+        iq, token_k = torch.split(qk, [INDEX_HEADS * INDEX_DIM, INDEX_DIM], dim=-1)
+        iq = attention.indexer.q_layernorm(iq.reshape(1, QSA_TOKENS, INDEX_HEADS, INDEX_DIM))
+        iq = m.apply_rotary_pos_emb(iq, cos=cos, sin=sin, unsqueeze_dim=2)
+        index_keys = token_k.reshape(QSA_TOKENS, INDEX_DIM)
+        if not has_tie_at_cut(iq[0], index_keys, attention.indexer.k_layernorm.weight):
+            break
+else:
+    sys.exit("no seed without a tie at the top-k cut for the attention")
+with torch.no_grad():
+    causal = torch.tril(torch.ones(QSA_TOKENS, QSA_TOKENS, dtype=torch.bool))[None, None]
+    selected = attention.indexer(attention_hidden, (cos, sin), causal, None)
+    mask = (causal & selected)
+    float_mask = torch.zeros(mask.shape).masked_fill(~mask, torch.finfo(torch.float32).min)
+    input_shape = attention_hidden.shape[:-1]
+    hidden_shape = (*input_shape, -1, attention.head_dim)
+    query_states, _gate = torch.chunk(
+        attention.q_proj(attention_hidden).view(*input_shape, -1, attention.head_dim * 2), 2, dim=-1)
+    query_states = attention.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = attention.k_norm(attention.k_proj(attention_hidden).view(hidden_shape)).transpose(1, 2)
+    value_states = attention.v_proj(attention_hidden).view(hidden_shape).transpose(1, 2)
+    query_states, key_states = m.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    attended, _ = m.eager_attention_forward(
+        attention, query_states, key_states, value_states, float_mask, scaling=attention.scaling)
+    dense, _ = m.eager_attention_forward(
+        attention, query_states, key_states, value_states,
+        torch.zeros(causal.shape).masked_fill(~causal, torch.finfo(torch.float32).min),
+        scaling=attention.scaling)
+fixture["qsa_attention"] = {
+    "head_count": qsa_config.num_attention_heads, "kv_head_count": qsa_config.num_key_value_heads,
+    "head_dim": attention.head_dim, "scaling": attention.scaling,
+    "index": {
+        "head_count": INDEX_HEADS, "head_dim": INDEX_DIM, "budget": BUDGET,
+        "compress_ratio": RATIO, "rotary_dim": int(cos.shape[-1]), "rope_base": 10000.0,
+        "key_norm_weight": flat(attention.indexer.k_layernorm.weight),
+        "queries": flat(iq.reshape(QSA_TOKENS, INDEX_HEADS * INDEX_DIM)),
+        "keys": flat(index_keys),
+    },
+    "q": flat(query_states.transpose(1, 2).reshape(QSA_TOKENS, -1)),
+    "k": flat(key_states.transpose(1, 2).reshape(QSA_TOKENS, -1)),
+    "v": flat(value_states.transpose(1, 2).reshape(QSA_TOKENS, -1)),
+    "output": flat(attended.reshape(QSA_TOKENS, -1)),
+    "dense_output": flat(dense.reshape(QSA_TOKENS, -1)),
+}
 json.dump(fixture, sys.stdout, indent=1)
 print()
