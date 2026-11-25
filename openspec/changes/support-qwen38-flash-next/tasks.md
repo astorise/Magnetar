@@ -86,7 +86,9 @@
 
 ## 3. Qwen3.8-Flash-Next blocks
 
-- [ ] 3.1 Pin a reviewable upstream modeling source for `qwen4_exp` (QSA, gated residual, n-gram PLE, MoE gate), or keep this lot design-only.
+- [x] 3.1 Pin a reviewable upstream modeling source for `qwen4_exp` (QSA, gated residual, n-gram PLE, MoE gate).
+  - Transformers' `models/qwen4_exp` (Apache-2.0), pinned in design D7 by file SHA-256: the installed 5.23.0 is the executable reference, and 5.24.1 differs only in API names. D7 records the semantics.
+  - QSA equals dense attention up to 2,051 visible tokens.
 - [ ] 3.2 QSA attention with its indexer: operator, Reference semantics and fixtures.
 - [ ] 3.3 Four-stream gated residual (`hc_count` 4, low-rank 320): operator, Reference semantics and fixtures.
 - [ ] 3.4 N-gram PLE: hashed row lookup from a disk-resident table, added at layer 2; Reference semantics and fixtures.

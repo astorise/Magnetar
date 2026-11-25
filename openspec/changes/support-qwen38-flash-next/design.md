@@ -102,22 +102,49 @@ No path silently runs with stale or shared state.
 
 ### D6. Flash-Next blocks (lots 3–6)
 
-- QSA, the four-stream gated residual and the n-gram PLE are new portable operators. Their semantics come from a pinned upstream modeling source and are checked against fixtures generated from it, as for Qwen3.5. Until that source is pinned, these lots stay design-only.
+- QSA, the four-stream gated residual and the n-gram PLE are new portable operators. Their semantics come from the pinned upstream modeling source of D7 and are checked against fixtures generated from it, as for Qwen3.5.
 - The n-gram table is a disk-resident weight. The residency manager reads only the hashed rows each step needs; it is never fully admitted.
 - Experts reuse the MoE operator and are placed by the residency policy:
   - mapped or in RAM;
   - an adaptive GPU cache sized to free VRAM;
   - misses computed by the CPU Provider in place, rather than uploaded.
 
+### D7. The pinned `qwen4_exp` source and what it defines
+
+The reference is Transformers' own `models/qwen4_exp` (Apache-2.0, "Copyright 2026 The Qwen Team and The HuggingFace Inc. team"), not Strata's engine. Transformers 5.23.0 and 5.24.1 both ship it. The executable reference is the installed 5.23.0:
+
+| File (5.23.0) | SHA-256 |
+| --- | --- |
+| `modular_qwen4_exp.py` | `a5350d43d3bd8169c566200ad7efc87580d39da0371eeaf3b3e14e6f9696dde2` |
+| `modeling_qwen4_exp.py` | `6bba060180c7f3c9d4d208941bbc2dfffb8933698ca332ef86179ce72355b3c0` |
+| `configuration_qwen4_exp.py` | `8dfb0ef09612a7eea896672798d9a3e735b1d00e0caf935072d2cffe5afce9ab` |
+
+5.24.1 (wheel `505b39d3e45a3715f3acb81b858eb245ce1a462373b7f99e26f0dcd41ed4cd0f`) differs only in the cache argument's name (`past_key_values` → `cache`), the model output classes and imports; its numerics are the same. The model card names no modeling file and the checkpoint's `config.json` is not read here, so tensor names and configuration values come from the loader's own tests (lot 5), not from this table.
+
+What the source defines, as Magnetar must reproduce it:
+
+- **Residual streams.** The embedding is repeated `hc_count` times along the feature axis, so the residual is `[T, hc_count * hidden]`. A decoder layer has no input or post-attention norm. Each block (mixer or attention, then MoE) is wrapped as:
+  1. `GatedResidual(h)` gives `mixed [T, hidden]`, `h` itself, and `injection [T, hc_count]`;
+  2. the block runs on `mixed`;
+  3. `h' = h + block_out[:, None, :] * injection[:, :, None]` (flattened back to `[T, hc_count * hidden]`).
+
+  `GatedResidual` is: `n = grouped_rmsnorm(h)` (groups of `hidden`, the weight `[hc_count * hidden]` as `1 + w`); `m = sigmoid(up(silu(down(n) / hc_count)))`, `[T, hc_count, hidden]`; `mixed = mean over streams of (m * n)`; `injection = 2 * sigmoid(inject(n) / hc_count)`. The final `hyper_connection_mixer` is the same without `injection`, and its output feeds the LM head directly (there is no final norm).
+- **Per-layer embedding (PLE).** Only on a linear-attention layer (layer 2 in the real model). Before the layer's first `GatedResidual`, `h += PLE(h, token_ids)`: the n-gram embedding `e` (`ple_embed_dim`) feeds `key = grouped_rmsnorm(key_proj(e))` per stream and `value = value_proj(e)`; `gate = sum(key * grouped_rmsnorm(h)) / sqrt(hidden)`, then `signed_sqrt`, `sigmoid`; `gated = sigmoid(gate) * value`; the output is `gated + silu(depthwise_conv1d(grouped_rmsnorm(gated)))`, with kernel `ple_conv_kernel_size` and dilation `ngram_size`, so it keeps `(kernel - 1) * ngram_size` past columns of state.
+- **N-gram ids.** Per layer and head: `ids = remainder(xor_k(shifted_token_k * multiplier_k), head_vocab_size) + head_offset`. The multipliers come from splitmix64 and the seed; head vocabulary sizes are consecutive primes above `ngram_vocab_size_base`. Tokens shift right within an EOS-delimited segment, and the two previous token ids are state, like a convolution state.
+- **QSA.** An `indexed_attention` layer is the Qwen3.5 gated attention (per-head q/k norms, partial rotary, `[query | gate]` projection) plus an indexer. For each query the indexer takes the visible keys, groups complete blocks of `indexer_compress_ratio` tokens, and averages the raw index keys per block, normalizes them, and rotates them at the block's first position. The block's score is `sum over indexer heads of relu(q · k) / sqrt(index_dim)`. The `indexer_budget / ratio` best blocks are kept, every token of those blocks plus the incomplete tail block is attended, and the result masks ordinary causal attention. The indexer's raw keys `[T, index_dim]` are an extra cache per layer.
+- **Dense equivalence.** With `budget = 2048` and `ratio = 4`, a query that sees at most `budget + ratio - 1 = 2051` tokens keeps every block, so QSA equals dense causal attention. Only longer contexts select.
+- **MoE.** Qwen3-Next's router (softmax, top-k, `norm_topk_prob`) with a shared expert; the router normalization is checked against the existing operator in lot 3.5.
+- **Linear attention.** The Qwen3.5 gated-delta mixer, with the output gate's activation `output_gate_type` (`silu` or `sigmoid`).
+
 ## Risks / Trade-offs
 
-- **QSA and residual semantics.** The upstream semantics may not be public in a reviewable form. Mitigation: those lots stay blocked rather than reverse-engineered from Strata's binary engine.
+- **QSA and residual semantics.** They are defined by D7's pinned source, which is public and Apache-2.0. Fixtures come from running that source, never from Strata's binary engine.
 - **Lot 1 replay cost.** Disabling step replay for recurrent graphs costs decode speed. Mitigation: lot 1b restores it with paired buffers.
 - **Mapped experts on a slow SSD.** Misses can dominate decode. Mitigation: measure hit rate and miss latency in the same way as Strata's logs.
 - **License.** The qwen-community-1.0 license must be reviewed before CI downloads the checkpoint. No weights are committed.
 
 ## Open Questions
 
-- The exact QSA indexer selection and when it reduces to dense attention (context ≤ budget × ratio?).
+- Ties in the indexer's top-k: PyTorch's `topk` does not define them. Fixtures use values without ties; whether to break ties by lowest block index is decided when a long-context fixture needs it.
 - Whether the n-gram hash and shard layout is stable across the GGUF and Hugging Face exports.
 - Which GGUF tensor types ISTA-DASLab uses beyond IQ2_XS/IQ3_XXS/Q2_0, and whether they all have Magnetar kernels.
