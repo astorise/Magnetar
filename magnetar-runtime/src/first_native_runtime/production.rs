@@ -414,6 +414,7 @@ fn insert_ngram_shapes(
             .count() as u64,
         seed: ngram.seed,
         eos_token_id: 0,
+        gathered_rows: false,
     };
     let heads = hash.heads() as u64;
     let head_dim = ngram.embedding_dim / heads;

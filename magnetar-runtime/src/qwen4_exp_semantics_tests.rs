@@ -283,6 +283,67 @@ fn the_qsa_selection_matches_the_pinned_transformers_indexer() {
 /// first's) over a sequence with EOS tokens that end n-gram segments; then
 /// the same sequence in two chunks, the context and the convolution history
 /// carried between them.
+/// Design D8: the rows the Runtime reads by itself, handed over in the
+/// gathered form, give exactly the dense lookup's outputs, and the operator's
+/// own row ids are the ones to read.
+#[test]
+fn the_gathered_ngram_rows_equal_the_dense_lookup() {
+    let fixture = fixture();
+    let case = &fixture.ngram_ple;
+    let hash = NgramEmbedding {
+        ngram_size: case.ngram_size,
+        heads_per_ngram: case.heads_per_ngram,
+        vocab_size: case.vocab_size,
+        vocab_base: case.vocab_base,
+        layer_index: case.layer_index,
+        seed: case.seed,
+        eos_token_id: case.eos_token_id,
+        gathered_rows: false,
+    };
+    let tokens = case.token_ids.len();
+    let ids = HostTensor::new([tokens as u64], case.token_ids.clone()).unwrap();
+    let start =
+        HostTensor::new([hash.context_len() as u64], vec![0.0; hash.context_len()]).unwrap();
+    let table = case.table.tensor();
+    let dense = ngram_embedding(&[ids.clone(), start.clone(), table.clone()], hash).unwrap();
+
+    // What the Runtime reads: each token's `heads` rows, in (token, head)
+    // order, named by the operator's own hash.
+    let head_dim = table.shape[1] as usize;
+    let token_ids: Vec<i64> = case.token_ids.iter().map(|&token| token as i64).collect();
+    let context_ids = vec![case.eos_token_id; hash.context_len()];
+    let mut gathered = Vec::new();
+    for row_ids in hash.row_ids(&token_ids, &context_ids) {
+        assert_eq!(row_ids.len(), hash.heads());
+        for row in row_ids {
+            let from = row as usize * head_dim;
+            gathered.extend_from_slice(&table.data[from..from + head_dim]);
+        }
+    }
+    let rows =
+        HostTensor::new([(tokens * hash.heads()) as u64, head_dim as u64], gathered).unwrap();
+    let gathered_hash = NgramEmbedding {
+        gathered_rows: true,
+        ..hash
+    };
+    let from_rows =
+        ngram_embedding(&[ids.clone(), start.clone(), rows.clone()], gathered_hash).unwrap();
+    assert_eq!(from_rows[0].shape, dense[0].shape);
+    assert_eq!(
+        from_rows[0].data, dense[0].data,
+        "the gathered rows are the dense embeddings, bit for bit"
+    );
+    assert_eq!(from_rows[1].data, dense[1].data, "the next context");
+
+    // The count of rows must be tokens x heads.
+    let short = HostTensor::new(
+        [(tokens * hash.heads() - 1) as u64, head_dim as u64],
+        rows.data[..rows.data.len() - head_dim].to_vec(),
+    )
+    .unwrap();
+    assert!(ngram_embedding(&[ids, start, short], gathered_hash).is_err());
+}
+
 #[test]
 fn the_ngram_ple_matches_the_pinned_transformers_layer() {
     let fixture = fixture();
@@ -295,6 +356,7 @@ fn the_ngram_ple_matches_the_pinned_transformers_layer() {
         layer_index: case.layer_index,
         seed: case.seed,
         eos_token_id: case.eos_token_id,
+        gathered_rows: false,
     };
     assert_eq!(
         hash.head_vocab_sizes(),

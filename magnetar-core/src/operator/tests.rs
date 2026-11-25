@@ -728,6 +728,25 @@ fn required_kernel_features_name_only_non_baseline_forms() {
         ),
         vec![ATTENTION_TOKEN_SELECTION_FEATURE]
     );
+    // The n-gram embedding reads a whole table unless it says the third input
+    // holds the rows the step reads.
+    assert!(required_kernel_features("ngram-embedding", &none, 3).is_empty());
+    assert_eq!(
+        required_kernel_features(
+            "ngram-embedding",
+            &attributes(&[("gathered_rows", OperatorAttributeValue::Boolean(true))]),
+            3
+        ),
+        vec![NGRAM_EMBEDDING_GATHERED_ROWS_FEATURE]
+    );
+    assert!(
+        required_kernel_features(
+            "ngram-embedding",
+            &attributes(&[("gathered_rows", OperatorAttributeValue::Boolean(false))]),
+            3
+        )
+        .is_empty()
+    );
     // The mixer's output gate is `silu` unless it says otherwise.
     for (kind, expected) in [
         (None, Vec::new()),

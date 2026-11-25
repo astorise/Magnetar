@@ -111,25 +111,40 @@ No path silently runs with stale or shared state.
 
 ### D8. The n-gram table is read by row and never admitted (task 4.4)
 
+Choices here follow performance: a decode step must not wait on the disk.
+
 **What the code does today.** Three things stop a table of about 320 million rows from running:
 - Model Loading reads each tensor whole into a `HostTensor` (`stream_stage_tensor`) and stages it as a Provider resource. Peak host memory is one tensor, which for this table is over 100 GB in `f32`.
 - `ngram-embedding` takes the table as a dense input, and its Reference semantics cap every tensor at 67,108,864 elements.
-- The payload source is only borrowed (`&dyn ProductionArtifactPayloadSource`) for the duration of the load, so nothing could read a row later.
+- The payload source is only borrowed (`&dyn ProductionArtifactPayloadSource`) during the load, so nothing could read a row later.
+
+**What a step costs.** Every layer with an n-gram embedding reads `heads` rows per token: with 16 to 48 heads and tens of such layers, one decode token reads on the order of 1,000 to 1,700 random rows of a few hundred bytes. The Strata reference decodes at 23 tokens/s, 43 ms per token, so the lookup has to hide behind compute. Measured on this development VM's virtual disk with a 1 GiB file of 256-byte rows (indicative only: a real NVMe is faster, the ranking is what matters), cold cache, 1,728 rows:
+
+| Access | Time |
+|---|---|
+| `pread` one row at a time | 158 ms |
+| `pread` on 16 threads | 77 ms |
+| `mmap`, page faults one at a time | 238 ms |
+| `mmap`, one `madvise(WILLNEED)` per row, then read | **13 ms** |
+| any of them, warm (page cache) | 0.2 to 1 ms |
+
+A batched `WILLNEED` queues every read at once, so the kernel keeps the device's queue full without any threads of ours; it is 6 times faster than the best threaded `pread` and 18 times faster than faulting page by page. Hot n-grams stay in the page cache, which makes a Runtime row cache pointless until a measurement says otherwise.
 
 **Options.**
-- *A. A row-addressed resource in every Provider* (a new `TensorValue` or resource kind). Each Provider implements it, and a GPU Provider keeps host mapping logic of its own. Rejected for now: the largest blast radius for a weight read a few dozen times per token.
-- *B. A Runtime-side gather (chosen).* The table stays in the artifact. The Runtime keeps a `RowTable` per Model Instance (a retained handle to the payload source, the tensor's byte range, rows, columns and storage type) and uploads nothing. When the first-native executor dispatches an `ngram-embedding` node whose table edge is a row table, it computes the row ids with the operator's own shared semantics (`NgramEmbedding::row_ids`, from the token ids, which are a host graph input, and the layer's context state, `ngram_size - 1` values read back from the Provider), reads exactly those `T x heads` rows, and dispatches the operator in its *gathered* form.
-- *C. Prefetching the whole table into RAM.* Rejected: the table does not fit, which is the reason for the task.
+- *A. A row-addressed resource in every Provider* (a new `TensorValue` or resource kind). Rejected: the largest blast radius for a weight read a few dozen times per token, and each Provider would reimplement the I/O.
+- *B. A Runtime-side gather over a memory-mapped table (chosen).* The table stays in its artifact. The Runtime keeps a `RowTable` per Model Instance and uploads nothing.
+- *C. Prefetching the whole table into RAM.* Rejected: it does not fit.
 
-**The gathered form.** `ngram-embedding` gets an optional boolean attribute `gathered_rows`. When set, its third input is the rows already read, `[T * heads, head_dim]` in (token, head) order, and the operator does no lookup: it reshapes them to `[T, heads * head_dim]` and computes the next context as before. The Kernel feature `ngram-embedding-gathered-rows` is required only then. The result is byte-for-byte the dense form's, since no arithmetic touches the rows. The hash stays in one place, the shared semantics, used by both the dense operator and the Runtime's gather, and a test checks that they name the same rows.
+**Design.**
+- *Mapped access.* The payload source gains `map_range`: a read-only mapping of a tensor's bytes when the artifact is a local file, `None` otherwise (a source that cannot map falls back to `read_payload`). A `RowTable` is a list of segments, each a mapped range of whole rows, since the shards of a table are separate files (`stack_ngram_shards`). A row is read by copying its bytes out of a segment and converting them to `f32`; there is no intermediate buffer.
+- *One prefetch per step.* When a step starts, its token ids and the committed token history are known on the host. The executor computes the row ids of every layer's `ngram-embedding` from them (`NgramEmbedding::row_ids`, the operator's own shared hash, so there is one definition) and issues `WILLNEED` for all of them at once, sorted and deduplicated by page. The reads then overlap the compute of the layers before the first embedding, and each node finds its rows resident. The layer's context state is **not** read back from the Provider: it is the last `ngram_size - 1` tokens of the same history, so a node costs no device synchronization.
+- *Gathered form.* `ngram-embedding` gets an optional boolean attribute `gathered_rows`. When set, its third input is the rows already read, `[T * heads, head_dim]` in (token, head) order, and the operator does no lookup: it reshapes them to `[T, heads * head_dim]` and computes the next context as before. The Kernel feature `ngram-embedding-gathered-rows` is required only then. The result is byte-for-byte the dense form's, since no arithmetic touches the rows; a test checks that the rows the executor names are the rows the dense operator reads.
+- *Loading.* The Runtime derives the row-addressed set from the architecture (`layers.{L}.ple.table` of each layer that declares an n-gram embedding) and `stream_stage_tensor` registers those instead of staging them. The loaded model retains the payload source as an `Arc`. The table's digest is checked while streaming it once in bounded chunks, so the integrity check keeps its guarantee without holding the table. A table counts in the residency budget as mapped bytes, never as resident weight.
+- *Prefill.* A chunk reads `chunk * heads` rows per layer; sorting by offset merges adjacent pages and the chunk size bounds the gather buffer. A read that fails fails the step, with nothing partially written.
 
-**Loading.** The Runtime derives the row-addressed set from the architecture (`layers.{L}.ple.table` of each layer that declares an n-gram embedding) and `stream_stage_tensor` registers those instead of staging them. The loaded model retains the payload source as an `Arc` (today's `&dyn` call sites change to share it). The table's digest is checked while streaming it once in bounded chunks, so the integrity check keeps its guarantee without holding the table. A table counts in the residency budget as streamed bytes, never as resident weight.
+**Out of scope.** The GGUF export keeps its n-gram table in a separate file (task 5.1) and gets its own segments. CUDA does not advertise `ngram-embedding` at all yet; the gathered form needs only the host read and a small upload (a few hundred KiB per step), so it adds nothing to that gap.
 
-**Cost.** A decode step reads `heads` rows per layer that has an n-gram embedding, a few hundred bytes each, from the page cache. A prefill chunk reads `chunk * heads` rows, sorted by offset and coalesced where adjacent. Both are bounded by the chunk size; the Runtime has no row cache of its own until a measurement asks for one. A read that fails fails the step, with nothing partially written.
-
-**Out of scope.** The GGUF export keeps its n-gram table in a separate file (task 5.1) and gets its own `RowTable` reader. CUDA does not advertise `ngram-embedding` at all yet; the gathered form needs only the host read and a small upload, so it adds nothing to that gap.
-
-**Tests.** The `ple` bundle matches `transformers` with its table row-addressed. The model instance holds no resource for the table. The source sees at most `T * heads` row reads per step and none of the rest. A synthetic table with more elements than the operator's cap runs through the gathered form.
+**Tests.** The `ple` bundle matches `transformers` with its table row-addressed. The model instance holds no resource for the table. A step reads at most `T * heads` rows per layer and none of the rest. The dense and gathered forms agree, and a table larger than the operator's element cap runs through the gathered form.
 
 ### D7. The pinned `qwen4_exp` source and what it defines
 

@@ -52,6 +52,10 @@ pub struct NgramEmbedding {
     pub seed: u64,
     /// The token that ends an n-gram segment (and fills missing context).
     pub eos_token_id: i64,
+    /// The third input is the rows the step reads, `[tokens * heads,
+    /// head_dim]` in (token, head) order, not the table: the Runtime read them
+    /// itself, so the table is never held whole (design D8).
+    pub gathered_rows: bool,
 }
 
 fn invalid(reason: impl Into<String>) -> ReferenceCpuError {
@@ -221,6 +225,12 @@ fn token_ids(tensor: &HostTensor, what: &str) -> Result<Vec<i64>, ReferenceCpuEr
 /// `[T, heads * head_dim]`, each head's row concatenated, and the next
 /// context.
 ///
+/// With `gathered_rows` the third input is not the table but the rows
+/// [`NgramEmbedding::row_ids`] names for these tokens and context, already
+/// read, `[T * heads, head_dim]` in (token, head) order, and no lookup
+/// happens: the embeddings are those rows reshaped, byte for byte what the
+/// dense form returns.
+///
 /// The context is the layer's state, held as each token's id minus
 /// `eos_token_id`: a new sequence's all-zero state is the `eos_token_id`
 /// fill a sequence starts from, which is what the Runtime gives every
@@ -246,24 +256,40 @@ pub fn ngram_embedding(
         return Err(invalid("ngram-embedding table must be rank two"));
     };
     let context_len = config.context_len();
+    let heads = config.heads();
     check(ids, &[tokens], "ngram-embedding ids")?;
     check(context, &[context_len as u64], "ngram-embedding context")?;
-    check(table, &[rows, head_dim], "ngram-embedding table")?;
+    let what = if config.gathered_rows {
+        "ngram-embedding gathered rows"
+    } else {
+        "ngram-embedding table"
+    };
+    check(table, &[rows, head_dim], what)?;
     let tokens_ids = token_ids(ids, "ngram-embedding ids")?;
     let context_ids = relative_token_ids(context, config.eos_token_id, "ngram-embedding context")?;
-    let heads = config.heads();
-    let total: u64 = config.head_vocab_sizes().iter().sum();
-    if total > rows {
-        return Err(invalid(format!(
-            "ngram-embedding table has {rows} rows, its heads need {total}"
-        )));
-    }
     let head_dim = head_dim as usize;
-    let mut out = Vec::with_capacity(tokens_ids.len() * heads * head_dim);
-    for row_ids in config.row_ids(&tokens_ids, &context_ids) {
-        for row in row_ids {
-            let start = row as usize * head_dim;
-            out.extend_from_slice(&table.data[start..start + head_dim]);
+    let mut out;
+    if config.gathered_rows {
+        let expected = tokens as usize * heads;
+        if rows as usize != expected {
+            return Err(invalid(format!(
+                "ngram-embedding gathered rows must be {expected} (tokens x heads), got {rows}"
+            )));
+        }
+        out = table.data.clone();
+    } else {
+        let total: u64 = config.head_vocab_sizes().iter().sum();
+        if total > rows {
+            return Err(invalid(format!(
+                "ngram-embedding table has {rows} rows, its heads need {total}"
+            )));
+        }
+        out = Vec::with_capacity(tokens_ids.len() * heads * head_dim);
+        for row_ids in config.row_ids(&tokens_ids, &context_ids) {
+            for row in row_ids {
+                let start = row as usize * head_dim;
+                out.extend_from_slice(&table.data[start..start + head_dim]);
+            }
         }
     }
     let history: Vec<f32> = context_ids

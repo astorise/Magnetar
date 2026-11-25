@@ -122,10 +122,10 @@
 - [ ] 4.2 Adaptive GPU expert cache sized to free VRAM, with hit-rate observations.
 - [ ] 4.3 CPU computation of expert misses in place (`enforce-local-multigpu-and-expert-placement`).
 - [ ] 4.4 N-gram table rows read on demand, never admitted whole (design D8).
-  - [ ] `ngram-embedding` takes `gathered_rows` (feature `ngram-embedding-gathered-rows`): Reference semantics, catalog, the two CPU Providers; a test that the dense and gathered forms give the same bytes and that the Runtime's row ids equal the operator's.
-  - [ ] `RowTable`: Model Loading registers the tensors of `layers.{L}.ple.table` instead of staging them, retains the payload source as an `Arc` and verifies the table's digest in bounded chunks.
-  - [ ] The first-native executor gathers the rows of an `ngram-embedding` node whose table is a row table and dispatches the gathered form.
-  - [ ] The `ple` bundle matches `transformers` with its table row-addressed; the instance holds no resource for it; reads per step are bounded by `T * heads`.
+  - [x] `ngram-embedding` takes `gathered_rows` (feature `ngram-embedding-gathered-rows`): Reference semantics, catalog and both CPU Providers advertise it (the shared hyper-stream entry point computes it, so cpu-native needs no kernel). `the_gathered_ngram_rows_equal_the_dense_lookup` checks that the rows named by the operator's own `row_ids`, handed over gathered, give the dense lookup's embeddings and next context bit for bit, and that a wrong row count is refused.
+  - [ ] `ProductionArtifactPayloadSource::map_range` and `RowTable` (mapped segments per shard); Model Loading registers the tensors of `layers.{L}.ple.table` instead of staging them, retains the payload source as an `Arc` and verifies the table's digest in bounded chunks.
+  - [ ] The first-native executor computes every layer's row ids from the token history at the start of a step, prefetches them with one batched `madvise(WILLNEED)` and gathers the rows of an `ngram-embedding` node into its gathered form.
+  - [ ] The `ple` bundle matches `transformers` with its table row-addressed; the instance holds no resource for it; reads per step are bounded by `T * heads` per layer; a measurement of decode time with a cold table against the dense baseline.
 
 ## 5. Loaders
 

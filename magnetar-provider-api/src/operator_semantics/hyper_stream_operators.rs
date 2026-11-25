@@ -104,6 +104,10 @@ pub fn ngram_embedding_from_attributes(
         layer_index: unsigned("layer_index")?,
         seed: unsigned("seed")?,
         eos_token_id: integer(attributes, "eos_token_id")?,
+        gathered_rows: matches!(
+            attributes.get("gathered_rows"),
+            Some(OperatorAttributeValue::Boolean(true))
+        ),
     })
 }
 

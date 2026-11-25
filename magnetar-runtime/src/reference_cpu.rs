@@ -1611,7 +1611,12 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("gated-residual-inject", OperatorFamily::Tensor),
         baseline_advertisement("repeat-features", OperatorFamily::Tensor),
         baseline_advertisement("qsa-select", OperatorFamily::Tensor),
-        baseline_advertisement("ngram-embedding", OperatorFamily::Tensor),
+        // Honours `gathered_rows` (the n-gram table is read by row).
+        with_features(
+            "ngram-embedding",
+            OperatorFamily::Tensor,
+            &[crate::operator::NGRAM_EMBEDDING_GATHERED_ROWS_FEATURE],
+        ),
         baseline_advertisement("ngram-ple", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),

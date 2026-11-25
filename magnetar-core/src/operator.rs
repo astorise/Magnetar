@@ -375,6 +375,13 @@ pub const ATTENTION_LATENT_KV_FEATURE: &str = "attention-latent-kv";
 /// selection of `qsa-select`).
 pub const ATTENTION_TOKEN_SELECTION_FEATURE: &str = "attention-token-selection";
 
+/// Kernel feature an `ngram-embedding` Kernel advertises when it honours
+/// `gathered_rows`: its third input holds the table rows the step reads,
+/// `[tokens * heads, head_dim]` in (token, head) order, instead of the whole
+/// table, and the Kernel does no lookup (`support-qwen38-flash-next`: the
+/// n-gram table is read by row and never admitted, design D8).
+pub const NGRAM_EMBEDDING_GATHERED_ROWS_FEATURE: &str = "ngram-embedding-gathered-rows";
+
 /// Kernel feature a `gated-delta-mixer` Kernel advertises when it honours
 /// `output_gate_type = "sigmoid"`: the gated normalization multiplies by
 /// `sigmoid(z)` instead of `silu(z)` (Qwen4-Exp's linear-attention layers,
@@ -443,6 +450,14 @@ pub fn required_kernel_features(
                 Some(OperatorAttributeValue::String(kind)) if kind != "silu"
             ) {
                 features.push(GATED_DELTA_SIGMOID_GATE_FEATURE);
+            }
+        }
+        "ngram-embedding" => {
+            if matches!(
+                attributes.get("gathered_rows"),
+                Some(OperatorAttributeValue::Boolean(true))
+            ) {
+                features.push(NGRAM_EMBEDDING_GATHERED_ROWS_FEATURE);
             }
         }
         "concat" => {
@@ -1964,6 +1979,11 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "eos_token_id",
                 OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            // The third input is the rows the step reads, not the table.
+            .with_rule(
+                "gathered_rows",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
             ),
         "ngram-ple" => OperatorAttributeSchema::default()
             .with_rule(
