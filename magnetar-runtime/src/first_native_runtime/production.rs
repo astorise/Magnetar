@@ -40,7 +40,7 @@ pub(super) const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub(super) const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:136e96acfb84b8d8da46461f945c21d0c1a4be161a6e7b0a8a3e104635ae34e8";
+    "sha256:c0b68349740abdeaee38c3f922433bfdba17e95e3292f98a891b46df97d4772d";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has

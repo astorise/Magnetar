@@ -50,15 +50,17 @@ pub(super) fn qwen_real_component_runtime()
     // `rope-scaling` (`1.4.0`). The current Component also verifies the
     // checkpoint activation exposed by `1.8.0`. `1.13.0`
     // (`support-qwen38-flash-next`): Qwen3.5's hybrid decoder, through
-    // `linear-attention`, `decoder-variants` and recurrent resources.
+    // `linear-attention`, `decoder-variants` and recurrent resources;
+    // `1.14.0`: Qwen4-Exp's residual streams, token selection and linear
+    // gate.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.13.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.14.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.13.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.14.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,

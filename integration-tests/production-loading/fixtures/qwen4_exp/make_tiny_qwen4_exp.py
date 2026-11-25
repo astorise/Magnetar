@@ -1,6 +1,8 @@
 """Tiny random Qwen4ExpForCausalLM bundles with well-scaled weights.
 
 Variants:
+  sigmoid The same with the linear layers' output gate a sigmoid
+          (`output_gate_type`), and other weights.
   dense   4 layers: linear, indexed, linear, indexed attention. Gated-delta
           mixers with 2 key heads and 4 value heads of 8 (kernel 4), gated
           attention with 2 query heads and 1 KV head of 16, a quarter of each
@@ -18,9 +20,10 @@ VOCAB = 64
 
 
 def config(variant):
-    if variant != "dense":
+    if variant not in ("dense", "sigmoid"):
         raise SystemExit(f"unknown variant {variant}")
     return Qwen4ExpTextConfig(
+        output_gate_type="sigmoid" if variant == "sigmoid" else None,
         vocab_size=VOCAB, hidden_size=32, num_hidden_layers=4,
         num_attention_heads=2, num_key_value_heads=1, head_dim=16,
         linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=8,
@@ -67,7 +70,7 @@ def main():
     out, variant = sys.argv[1], sys.argv[2]
     torch.manual_seed(0)
     model = Qwen4ExpForCausalLM(config(variant)).float().eval()
-    scaled_init(model, {"dense": 1}[variant])
+    scaled_init(model, {"dense": 1, "sigmoid": 2}[variant])
     model.save_pretrained(out, safe_serialization=True)
     vocab = {f"t{i}": i for i in range(VOCAB)}
     tokenizer = {

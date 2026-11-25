@@ -110,8 +110,10 @@
 - [ ] 3.6 Qwen Component: recognize `qwen4_exp` and emit its graph; refuse it explicitly until 3.2–3.5 are qualified.
   - [x] The `gated-delta-mixer` operator takes `output_gate_type` (`silu`, the default, or `sigmoid`), with the kernel feature `gated-delta-sigmoid-output-gate` required only for `sigmoid`. The shared semantics, both CPU Providers (`gated_delta_graph_honours_the_output_gate_type` at the Runtime, `gated_delta_mixer_reads_compact_weights` on cpu-native) and the CUDA gated norm (`gdn_gated_norm_kernel`; its conformance test runs both gates at two geometries) implement it. `sigmoid(z) * z` equals the `silu` output element by element and the two next states do not change. The CUDA kernel compiles on the GPU runner only; the hardware run is queued with the next campaign.
   - [x] `model-config` 1.14.0 (host side): `hyper-connections`, `ngram-embeddings`, `token-selection` and `linear-attention-gate` are WIT functions with their records, encoded by the host, listed among the functions a Component must read when declared, and validated against the architecture (`qwen4_exp_decoder_forms_are_exposed_and_must_be_read`, `decoder_extensions_validate_against_the_architecture`). The Runtime serves 1.14.0 alongside 1.2.0 to 1.13.0. `components/qwen`'s WIT, its graph and the rebuilt wasm follow together.
-  - [ ] The Component reads the four functions, emits `output_gate_type`, residual streams, n-gram embeddings and the indexer, and the Runtime sizes their weights.
-  - [ ] Tiny `qwen4_exp` bundle against Transformers on the Reference CPU: layers, residual streams, the PLE layer and an indexer that prunes.
+  - [x] The Component (`components/qwen`, WIT 1.14.0, wasm rebuilt and repinned) reads the four functions and builds Qwen4-Exp's residual streams: the embedding repeated into the streams, each layer's mixer (gated-delta with `output_gate_type`, or the gated attention) and mixture of experts reading a `gated-residual` mix and written back with `gated-residual-inject`, and the final `gated-residual-final` mix feeding the LM head. The Runtime sizes the stream and indexer weights (`qwen4_exp_residual_streams_and_indexer_derive_their_weight_shapes`) and the HF loader reads the configuration and tensor names (`qwen4_exp_declares_streams_embeddings_indexer_gate_and_experts`, `normalizes_qwen4_exp_tensors`).
+  - [x] Until the indexer's selection is built the graph attends densely, which equals QSA up to `budget + compress_ratio - 1` visible tokens (2,051 in the real model); a longer graph is refused, and so is a declared n-gram embedding. The Component also refuses Qwen4-Exp as a segment of a graph (a segment would hand the streams to the next one).
+  - [x] Tiny `qwen4_exp` bundles against Transformers 5.23 on the Reference CPU and the optimized CPU Provider (`tests_qwen4_exp_logits`; `fixtures/qwen4_exp/`): 4 layers (two gated-delta, two gated attention with an indexer), 4 streams, 4 experts with a gated shared expert, 18-token prompt and 12 greedy steps. The `silu` gate differs from Transformers' logits by at most 1.7e-6 (3.7e-6 on cpu-native) and the `sigmoid` gate by 2.1e-6, with the same tokens.
+  - [ ] The same with an n-gram embedding layer (the PLE layer: `ngram-embedding` and `ngram-ple` with their two states as recurrent resources) and with an indexer that prunes (a budget smaller than the prompt, which needs the per-layer index-key cache of 3.2).
 
 ## 4. Expert and table residency
 
@@ -124,6 +126,8 @@
 
 - [ ] 5.1 GGUF: the ISTA-DASLab Qwen3.8-Flash-Next export (architecture keys, tensor types, n-gram file).
 - [ ] 5.2 Hugging Face: `qwen4_exp` configuration and tensor names.
+  - [x] Configuration (residual streams, n-gram embeddings, indexer, gate, experts in every layer with the default routing; no dense MLP width) and the names of the stream mixers, indexer, shared expert and its gate (which is read as `[in, out]`), checked on a Transformers `save_pretrained` bundle with per-expert tensors.
+  - [ ] The indexer's fused projection split into queries and key, the n-gram tables (`split_ngram_parts` shards) and the real checkpoint's stacked expert tensors (`experts.gate_up_proj`, `experts.down_proj`).
 
 ## 6. Qualification against Strata
 
