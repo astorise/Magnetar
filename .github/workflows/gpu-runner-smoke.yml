@@ -202,6 +202,15 @@ jobs:
         # table first; diagnostic only.
         timeout-minutes: 10
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml packed_embedding_lookup_times -- --ignored --nocapture
+      - name: CUDA captured step Device memory (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # capture-and-replay-cuda-graphs 1.2: the Device memory a captured
+        # rope -> rmsnorm step retains (its graph executable) and what its
+        # release gives back; the retirement test
+        # (`a_replay_in_flight_survives_the_retirement_of_its_resources`)
+        # runs with the conformance tests above.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml captured_step_device_memory -- --ignored --nocapture
       - name: Build and test the real first-native Qwen Component against a real CudaProvider
         if: ${{ env.SUITE_DENSE == 'true' }}
         # #58: `integration-tests/cuda-first-native` runs the real

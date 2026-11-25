@@ -85,6 +85,16 @@ Real Qwen2.5-0.5B, greedy, on an RTX 3060, GPU CI run 41652697101 (Runtime f2cec
 - The step is now bound by the Device: 6.84 of its 7.99 ms are spent waiting for the GPU, close to the 5.5 ms the f32 weight reads take at the card's bandwidth. Half precision (B02) is what reduces it further.
 - Capture costs one step: 0.12 ms of host time, on top of a normal per-node step. Peak RSS is unchanged (1.38 GB). A capture holds no buffer of its own beyond the 8-byte offset; the graph executable's own Device memory is not measured.
 
+### Qualification gates (task 1.2)
+
+Confirmed by the owner on 2026-11-25; each value is one this change already measures.
+
+- **Hardware.** The `arc-gpu-magnetar` runner: RTX 3060 12 GB, Linux x86_64. CUDA graphs on Windows, macOS and ARM are skipped, not passed (task 3.2).
+- **Checkpoint.** Qwen2.5-0.5B, public, no authorization needed; the pooled-capture checkpoints already in the GPU workflow for the reuse change.
+- **Numeric threshold.** Replayed steps bit-identical to per-node steps over the 16-step reference prompt; CUDA logits within 1.3e-5 of the independent corpus.
+- **Performance objective.** Replayed TPOT no higher than the per-node TPOT of the same run (the disable control): 7.99 against 12.84 ms measured, warm TTFT unchanged.
+- **Memory budget.** Peak RSS unchanged (1.38 GB). The capture's Device memory, its graph executable, is reported by the diagnostic `captured_step_device_memory` and bounded at 32 MiB for the two-Kernel step it captures; the whole-model step's figure comes from the same run's report.
+
 ## Risks / Trade-offs
 
 - Address reuse, stream changes and Device loss invalidate capture generations before replay.
