@@ -145,6 +145,6 @@ What the source defines, as Magnetar must reproduce it:
 
 ## Open Questions
 
-- Ties in the indexer's top-k: PyTorch's `topk` does not define them. Fixtures use values without ties; whether to break ties by lowest block index is decided when a long-context fixture needs it.
+- Ties in the indexer's top-k. PyTorch's `topk` does not define them, and the `relu` makes zero scores common (a block scores zero when every head's dot product is negative). Magnetar breaks ties toward the lower block, so a result is reproducible. The fixture generator picks a seed whose top-k has no tie at its cut, so the comparison with Transformers is exact. On the real model a tie at the cut may select a different, equally scored block than Transformers does; the qualification compares logits and tokens, not selections.
 - Whether the n-gram hash and shard layout is stable across the GGUF and Hugging Face exports.
 - Which GGUF tensor types ISTA-DASLab uses beyond IQ2_XS/IQ3_XXS/Q2_0, and whether they all have Magnetar kernels.

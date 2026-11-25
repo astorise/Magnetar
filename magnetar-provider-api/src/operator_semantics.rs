@@ -21,6 +21,7 @@ mod mamba3_core;
 mod mamba3_mimo;
 mod mamba3_mixer;
 mod projected_differential_attention;
+mod qsa_select;
 mod sigmoid_routing;
 mod token_shift;
 pub use differential_attention::{
@@ -45,6 +46,7 @@ pub use projected_differential_attention::{
     ProjectedDifferentialAttention, projected_differential_attention,
     projected_differential_attention_from_attributes,
 };
+pub use qsa_select::{QsaSelect, qsa_select};
 pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,

@@ -4,7 +4,8 @@
 //! `fixtures/generate-qwen4-exp-reference.py`.
 
 use magnetar_provider_api::{
-    GatedResidual, HostTensor, gated_residual, gated_residual_inject, repeat_features,
+    GatedResidual, HostTensor, QsaSelect, gated_residual, gated_residual_inject, qsa_select,
+    repeat_features,
 };
 use serde::Deserialize;
 
@@ -37,10 +38,26 @@ struct GatedResidualCase {
 }
 
 #[derive(Deserialize)]
+struct QsaCase {
+    head_count: usize,
+    head_dim: usize,
+    budget: usize,
+    compress_ratio: usize,
+    rotary_dim: usize,
+    rope_base: f32,
+    key_norm_weight: Flat,
+    queries: Flat,
+    keys: Flat,
+    /// The `[T, K]` mask the module builds, one per query.
+    selected: Flat,
+}
+
+#[derive(Deserialize)]
 struct Fixture {
     hc_count: usize,
     epsilon: f32,
     gated_residual: GatedResidualCase,
+    qsa_indexer: QsaCase,
 }
 
 fn fixture() -> Fixture {
@@ -113,4 +130,71 @@ fn the_gated_residual_matches_the_pinned_transformers_module() {
         .is_err()
     );
     assert!(repeat_features(&case.embedding.tensor(), 0).is_err());
+}
+
+/// The QSA selection against the pinned indexer: for every one of 20
+/// queries, the set of tokens kept equals the module's mask, where the
+/// 8-token budget in blocks of 2 prunes from the tenth query on. A query
+/// with fewer visible tokens than the budget keeps them all.
+#[test]
+fn the_qsa_selection_matches_the_pinned_transformers_indexer() {
+    let fixture = fixture();
+    let case = &fixture.qsa_indexer;
+    let config = QsaSelect {
+        head_count: case.head_count,
+        head_dim: case.head_dim,
+        compress_ratio: case.compress_ratio,
+        budget: case.budget,
+        epsilon: fixture.epsilon,
+        weight_offset: 1.0,
+        rope_base: case.rope_base,
+        rotary_dim: case.rotary_dim,
+    };
+    let inputs = [
+        case.queries.tensor(),
+        case.keys.tensor(),
+        case.key_norm_weight.tensor(),
+    ];
+    let selection = qsa_select(&inputs, config).unwrap();
+    let tokens = case.keys.shape[0] as usize;
+    assert_eq!(selection.shape, [tokens as u64, config.slots() as u64]);
+    let mut pruned = 0;
+    for query in 0..tokens {
+        let kept: Vec<usize> = selection.data[query * config.slots()..(query + 1) * config.slots()]
+            .iter()
+            .filter(|&&index| index >= 0.0)
+            .map(|&index| index as usize)
+            .collect();
+        assert!(kept.windows(2).all(|pair| pair[0] < pair[1]), "ascending");
+        let expected: Vec<usize> = (0..tokens)
+            .filter(|&token| case.selected.data[query * tokens + token] != 0.0)
+            .collect();
+        assert_eq!(kept, expected, "query {query}");
+        pruned += usize::from(kept.len() < query + 1);
+    }
+    // The fixture would prove nothing if it never pruned.
+    assert!(pruned >= 8, "{pruned} pruned queries");
+
+    // Malformed geometry and inputs are refused.
+    assert!(qsa_select(&inputs[..2], config).is_err());
+    assert!(
+        qsa_select(
+            &inputs,
+            QsaSelect {
+                budget: 7,
+                ..config
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        qsa_select(
+            &inputs,
+            QsaSelect {
+                rotary_dim: config.head_dim + 2,
+                ..config
+            }
+        )
+        .is_err()
+    );
 }
