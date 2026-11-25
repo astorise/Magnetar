@@ -278,6 +278,46 @@ fn the_qsa_selection_matches_the_pinned_transformers_indexer() {
     );
 }
 
+/// A head's row count is its place in one sequence of primes shared by every
+/// layer, and the sequence is kept (a layer's search used to start again
+/// from the base): the layers asked in any order, each count the prime a
+/// direct search finds.
+#[test]
+fn the_head_row_counts_are_the_primes_a_direct_search_finds() {
+    fn is_prime(value: u64) -> bool {
+        value >= 2 && (2..).take_while(|d| d * d <= value).all(|d| value % d != 0)
+    }
+    fn nth_prime_after(start: u64, count: u64) -> u64 {
+        let mut prime = start;
+        for _ in 0..count {
+            prime += 1;
+            while !is_prime(prime) {
+                prime += 1;
+            }
+        }
+        prime
+    }
+    let base = 10_007;
+    // Later layers first, so that the kept sequence is extended in steps.
+    for layer_index in [5, 0, 3, 3, 1] {
+        let hash = NgramEmbedding {
+            ngram_size: 3,
+            heads_per_ngram: 4,
+            vocab_size: 64,
+            vocab_base: base,
+            layer_index,
+            seed: 1,
+            eos_token_id: 0,
+            gathered_rows: false,
+        };
+        let heads = hash.heads() as u64;
+        let direct: Vec<u64> = (0..heads)
+            .map(|head| nth_prime_after(base - 1, layer_index * heads + head + 1))
+            .collect();
+        assert_eq!(hash.head_vocab_sizes(), direct, "layer {layer_index}");
+    }
+}
+
 /// The hashed n-gram lookup and the PLE layer against the pinned modules,
 /// on a second PLE layer (so its primes and multipliers differ from the
 /// first's) over a sequence with EOS tokens that end n-gram segments; then
