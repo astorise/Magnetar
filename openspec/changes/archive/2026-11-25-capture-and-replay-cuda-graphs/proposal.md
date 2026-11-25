@@ -8,7 +8,7 @@ The 29 October 2026 inference optimization roadmap identifies execution gaps bey
 
 Keep native capture objects, queues, addresses and events inside CUDA. Runtime reserves bounded capture memory and pins required leases; it receives only opaque prepared execution metadata and completion. Benchmark launch savings against cold preparation and retained memory.
 
-Status: **Implemented and qualified on the initial profile (design.md); promotion beyond it requires the qualification gates below.** Indicative waves, dependencies, priorities, acceptance profiles and unresolved decisions are recorded in the [roadmap coverage index](../../../docs/roadmaps/inference-optimizations-2026-2028.md).
+Status: **Implemented and qualified on the initial profile (design.md); promotion beyond it requires the qualification gates below.** Indicative waves, dependencies, priorities, acceptance profiles and unresolved decisions are recorded in the [roadmap coverage index](../../../../docs/roadmaps/inference-optimizations-2026-2028.md).
 
 ## Capabilities
 
@@ -25,15 +25,15 @@ None by default; profile-specific replacements, where required, are enumerated i
 Owning layer: CUDA Provider; Runtime plan and memory contracts. Implementation may span Magnetar and the appropriate pinned Component, Provider, Format or Loader repositories; submodule revisions are updated only after their own validation. No runtime code, dependencies, WIT or canonical specifications are changed by this proposal.
 
 Existing contracts to reuse:
-- [`provider-prepared-kernel-execution`](../../specs/provider-prepared-kernel-execution/spec.md)
-- [`execution-stream`](../../specs/execution-stream/spec.md)
-- [`kernel-execution-plan`](../../specs/kernel-execution-plan/spec.md)
-- [`device-memory-pool`](../../specs/device-memory-pool/spec.md)
+- [`provider-prepared-kernel-execution`](../../../specs/provider-prepared-kernel-execution/spec.md)
+- [`execution-stream`](../../../specs/execution-stream/spec.md)
+- [`kernel-execution-plan`](../../../specs/kernel-execution-plan/spec.md)
+- [`device-memory-pool`](../../../specs/device-memory-pool/spec.md)
 
 ## Dependencies
 
-- `B02`: [`execute-native-half-precision`](../execute-native-half-precision/proposal.md).
-- `C02`: [`cache-and-optimize-prepared-graphs`](../cache-and-optimize-prepared-graphs/proposal.md).
+- `B02`: [`execute-native-half-precision`](../../execute-native-half-precision/proposal.md).
+- `C02`: [`cache-and-optimize-prepared-graphs`](../../cache-and-optimize-prepared-graphs/proposal.md).
 
 Dependencies are exit-gate prerequisites, not a ban on independent design or hardware experiments.
 
