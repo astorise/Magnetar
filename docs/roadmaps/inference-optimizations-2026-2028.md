@@ -32,6 +32,16 @@ Waves overlap. The critical path is evidence/production CLI → native precision
 
 Four workstreams retain the source allocation: kernels/numerics (B01-B10, C03-C07), memory/residency (D01-D11, F02/F05), serving/scheduler (A05, E01-E10), hardware/distribution (G01-G10). A01-A04/A06/A08/C01/C09 form the shared qualification platform. P0/P1 establish the baseline; P2/P3 require bounded experiments and benefit evidence. P3 is conditional, never a delivery commitment.
 
+## Delivered scope and maturity
+
+This section records, change by change, what the roadmap's proposals have delivered and on which evidence. A change is listed when its qualification tasks pass; the row of the coverage table below keeps the source wording.
+
+- **C04, CUDA graph replay** ([capture-and-replay-cuda-graphs](../../openspec/changes/capture-and-replay-cuda-graphs/proposal.md), 2026-11-25). Maturity: **qualified on its initial profile**, enabled by default where the Provider supports it, with a disable control (`ProductionLoadedModel::set_step_replay(false)`) and a per-node fallback. The profile is Linux x86_64 on one RTX 3060 12 GB (the `arc-gpu-magnetar` runner), F32, a first-native whole-model decode step with in-place KV history; the checkpoint is Qwen2.5-0.5B.
+  - Benefit: over a 64-token decode profile, TPOT 7.99 ms replayed against 12.84 ms per node in the same run (run 41652697101). Replayed steps are bit-identical to per-node ones over the 16-step reference prompt; CUDA logits stay within 1.3e-5 of the independent corpus.
+  - Memory: a capture retains about 6 KiB of Device memory per Kernel (12 MiB for 2,048 Kernels, so about 2 MiB for a decode step of 315 launches) and later captures reuse it: eight capture and release cycles drift by 0 KiB (run 45585781551).
+  - Safety: a failed or invalidated capture runs the step per node; a request released between two replayed steps gives its capture back; two sessions replay their own captures; a replay in flight survives the retirement of its resources on the hardware (same run).
+  - Skipped, not passed: CUDA graphs on Windows, macOS and ARM (no CUDA hardware in the repository's runners). Outside this change: half precision (B02), and prefill capture (`replay-bucketed-prefill`).
+
 ## Complete action coverage
 
 Priority, effort and action-level dependency columns preserve the source. Effort S/M/L/XL is qualitative, not a person-day estimate. `F03`'s source dependency `F02/E08 selon modèle` is conditional: ordinary exact draft/verify E08 does not require MoE or MTP; E09 requires E08 and compatible F03; a MoE-specific draft profile additionally needs F02. An independent dense draft/MTP profile does not create a dependency cycle.

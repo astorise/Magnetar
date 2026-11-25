@@ -8,7 +8,7 @@ The 29 October 2026 inference optimization roadmap identifies execution gaps bey
 
 Keep native capture objects, queues, addresses and events inside CUDA. Runtime reserves bounded capture memory and pins required leases; it receives only opaque prepared execution metadata and completion. Benchmark launch savings against cold preparation and retained memory.
 
-Status: **Proposed implementation; production status requires the qualification gates below.** All tasks are future work; authoring or validating this proposal does not implement an optimization. Indicative waves, dependencies, priorities, acceptance profiles and unresolved decisions are recorded in the [roadmap coverage index](../../../docs/roadmaps/inference-optimizations-2026-2028.md).
+Status: **Implemented and qualified on the initial profile (design.md); promotion beyond it requires the qualification gates below.** Indicative waves, dependencies, priorities, acceptance profiles and unresolved decisions are recorded in the [roadmap coverage index](../../../docs/roadmaps/inference-optimizations-2026-2028.md).
 
 ## Capabilities
 
