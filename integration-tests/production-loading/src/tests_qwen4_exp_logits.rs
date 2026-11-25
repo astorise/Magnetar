@@ -35,6 +35,23 @@ fn a_qwen4_exp_sigmoid_gate_bundle_matches_transformers() {
     }
 }
 
+/// A hashed n-gram embedding added in the first layer, its token context
+/// and convolution history carried as recurrent states.
+#[test]
+fn a_qwen4_exp_ngram_embedding_bundle_matches_transformers() {
+    for (provider, label) in cpu_providers() {
+        let difference = compare_on(
+            provider,
+            label,
+            "qwen4_exp",
+            "ple",
+            Format::HuggingFace,
+            "qwen4_exp_text",
+        );
+        eprintln!("n-gram embedding, {label}: max |logit difference| {difference:.3e}");
+    }
+}
+
 /// The same checkpoint on `providers/cpu`'s Reference CPU Provider and its
 /// optimized CPU Provider.
 #[test]

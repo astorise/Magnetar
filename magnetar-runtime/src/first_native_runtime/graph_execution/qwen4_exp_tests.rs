@@ -286,8 +286,8 @@ fn the_ngram_ple_runs_as_graph_nodes_with_its_states() {
         )
         .unwrap()
     };
-    let mut carried_context =
-        HostTensor::new([context as u64], vec![case.eos_token_id as f32; context]).unwrap();
+    // A new sequence's context state is zeros: the end token before it.
+    let mut carried_context = HostTensor::new([context as u64], vec![0.0; context]).unwrap();
     let mut carried_history = HostTensor::new(
         [width, state_len as u64],
         vec![0.0; width as usize * state_len],

@@ -40,7 +40,7 @@ pub(super) const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub(super) const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:c0b68349740abdeaee38c3f922433bfdba17e95e3292f98a891b46df97d4772d";
+    "sha256:924c12742e3b2044de8461b7093d16db28389efffea4476ab6ee324f2ff0371b";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -268,6 +268,13 @@ pub(super) fn weight_shapes_for_architecture_config(
                 }
             }
         }
+        // An n-gram embedding added before the layer's first block.
+        if let (Some(ngram), Some(connections)) =
+            (config.decoder_extensions.ngram_embeddings.as_ref(), hyper)
+            && ngram.layers.get(layer as usize).copied().unwrap_or(false)
+        {
+            insert_ngram_shapes(&mut shapes, &prefix, config, connections, layer);
+        }
         // A gated-delta linear-attention layer (`support-qwen38-flash-next`):
         // the mixer's projections in checkpoint `[out, in]` order.
         if let Some(linear) = config
@@ -368,6 +375,55 @@ fn insert_hyper_shapes(
     shapes.insert(format!("{prefix}.up"), vec![width, rank]);
     if inject {
         shapes.insert(format!("{prefix}.inject"), vec![streams, width]);
+    }
+}
+
+/// A layer's n-gram embedding: the hashed table (the heads' vocabularies
+/// one after another, padded to the declared multiple), the projections of
+/// the embedding into the streams' gate and the value, the three norms and
+/// the depthwise convolution, in checkpoint `[out, in]` order.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn insert_ngram_shapes(
+    shapes: &mut BTreeMap<String, Vec<u64>>,
+    prefix: &str,
+    config: &ModelArchitectureConfig,
+    connections: crate::HyperConnectionConfig,
+    layer: u32,
+) {
+    let Some(ngram) = config.decoder_extensions.ngram_embeddings.as_ref() else {
+        return;
+    };
+    let hash = crate::operator_semantics::NgramEmbedding {
+        ngram_size: ngram.ngram_size as usize,
+        heads_per_ngram: ngram.heads_per_ngram as usize,
+        vocab_size: config.vocab_size,
+        vocab_base: ngram.vocabulary_base,
+        layer_index: ngram.layers[..layer as usize]
+            .iter()
+            .filter(|layer| **layer)
+            .count() as u64,
+        seed: ngram.seed,
+        eos_token_id: 0,
+    };
+    let heads = hash.heads() as u64;
+    let head_dim = ngram.embedding_dim / heads;
+    let rows = hash
+        .head_vocab_sizes()
+        .iter()
+        .sum::<u64>()
+        .next_multiple_of(u64::from(ngram.vocabulary_multiple));
+    let hidden = config.hidden_size;
+    let width = u64::from(connections.streams) * hidden;
+    for (name, shape) in [
+        ("table", vec![rows, head_dim]),
+        ("key", vec![width, ngram.embedding_dim]),
+        ("value", vec![hidden, ngram.embedding_dim]),
+        ("norm_key", vec![width]),
+        ("norm_query", vec![width]),
+        ("norm_conv", vec![width]),
+        ("conv1d", vec![width, u64::from(ngram.conv_kernel)]),
+    ] {
+        shapes.insert(format!("{prefix}.ple.{name}"), shape);
     }
 }
 

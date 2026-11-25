@@ -305,18 +305,19 @@ fn the_ngram_ple_matches_the_pinned_transformers_layer() {
 
     let tokens = case.token_ids.len();
     let ids = HostTensor::new([tokens as u64], case.token_ids.clone()).unwrap();
-    let start = HostTensor::new(
-        [hash.context_len() as u64],
-        vec![case.eos_token_id as f32; hash.context_len()],
-    )
-    .unwrap();
+    // A new sequence's state is all zeros: every earlier token the end token.
+    let start =
+        HostTensor::new([hash.context_len() as u64], vec![0.0; hash.context_len()]).unwrap();
     let [embeddings, context] =
         ngram_embedding(&[ids.clone(), start.clone(), case.table.tensor()], hash).unwrap();
     assert_matches(&embeddings, &case.embeddings, "n-gram embeddings");
     assert_eq!(
         context.data,
-        &case.token_ids[tokens - hash.context_len()..],
-        "the next context is the last tokens"
+        case.token_ids[tokens - hash.context_len()..]
+            .iter()
+            .map(|token| token - case.eos_token_id as f32)
+            .collect::<Vec<_>>(),
+        "the next context is the last tokens, relative to the end token"
     );
 
     let ple = NgramPle {
