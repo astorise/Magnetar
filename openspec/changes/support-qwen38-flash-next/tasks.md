@@ -48,7 +48,12 @@
 - [ ] 2.5 CPU Provider.
   - [x] `rmsnorm.weight_offset` and a `split` kernel (with `head_count`) are implemented and advertised. The executor passes a resident `split` input through.
   - [x] The tiny hybrid checkpoint matches `transformers` on the Reference CPU Provider (1.1e-5) and on cpu-native (8.6e-6).
-  - [ ] cpu-native decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states. The mixer runs the shared f32 semantics, one thread, today.
+  - [x] cpu-native runs `gated-delta-mixer` natively.
+    - Before: it fell back to the Reference kernel, which expanded the compact bf16 projection weights to f32 at every call (about 10M values per layer and token) and multiplied on one thread.
+    - Now: the four input projections and the output projection are cpu-native's dense matmuls over the compact weights, across the pool. The rest runs the shared semantics, split out as `gated_delta_mixer_from_projections`, which reproduces the whole mixer bit for bit (unit test).
+    - `gated_delta_mixer_reads_compact_weights` checks the outputs and both states against the Reference over a masked prefill and a decode step, with nothing expanded to f32.
+    - Real 0.8B-Base: 16 tokens in 2.2 s instead of 22.6 s, still 16/16 equal to `transformers` (max |logit diff| 3.1e-5).
+  - [ ] Parallel recurrence (heads across the pool) and a chunked prefill form, once long prompts are measured.
 - [ ] 2.6 CUDA: the same forms (norm offset, per-head split, both mixer forms), qualified on the GPU runner.
   - [x] Kernels:
     - the `rmsnorm` weight offset;
@@ -71,6 +76,7 @@
     |---|---|---|---|
     | Reference CPU | 3.2e-5 | 16/16 equal | 74.6 s |
     | cpu-native (4 threads) | 2.8e-5 | 16/16 equal | 22.6 s |
+    | cpu-native, native mixer (2.5) | 3.1e-5 | 16/16 equal | 2.2 s |
 
     Output: `[11751, 13, 561, 6511, 314, 31868, 369, 35938, 13, 561, 6511, 314, 279, 24844, 369, 36492]` (2026-11-25, x86-64 container).
   - [ ] CUDA, on the GPU runner (after 2.6).
