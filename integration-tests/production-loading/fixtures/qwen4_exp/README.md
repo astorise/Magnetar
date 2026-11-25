@@ -1,7 +1,7 @@
 # Tiny Qwen4-Exp checkpoint and its `transformers` logits
 
 Used by `src/tests_qwen4_exp_logits.rs` (`support-qwen38-flash-next`).
-`dense/`, `sigmoid/`, `ple/` and `prune/` hold Hugging Face bundles (`qwen4_exp_text`), each with its `reference.json`; they differ in the linear layers' output gate (`silu`, `sigmoid`), an n-gram embedding in layer 0 (`ple`), an indexer that prunes (`prune`) and weights.
+`dense/`, `sigmoid/`, `ple/`, `prune/` and `stacked/` hold Hugging Face bundles (`qwen4_exp_text`), each with its `reference.json`; they differ in the linear layers' output gate (`silu`, `sigmoid`), an n-gram embedding in layer 0 (`ple`), an indexer that prunes (`prune`), the routed experts stacked (`stacked`) and weights.
 The reference holds the logits that `transformers` 5.23's
 `Qwen4ExpForCausalLM` computes in float32
 (`magnetar.inference-qualification.logit-reference/v1`), greedy, with the
@@ -45,6 +45,8 @@ With the two scripts here: Python with torch 2.15.0 (CPU), `transformers`
     python qwen4_exp_reference_logits.py ple 12 ple/reference.json 5 17 33 8 41 3 60 12 9 27 44 19 7 52 30 11 38 21
     python make_tiny_qwen4_exp.py prune prune
     python qwen4_exp_reference_logits.py prune 12 prune/reference.json 5 17 33 8 41 3 60 12 9 27 44 19 7 52 30 11 38 21
+    python stack_qwen4_exp_experts.py dense stacked
+    python qwen4_exp_reference_logits.py stacked 12 stacked/reference.json 5 17 33 8 41 3 60 12 9 27 44 19 7 52 30 11 38 21
 
 `generation_config.json` is removed after saving: the Runtime does not read
 it. The `dense` reference generates `16 28 42 51 51 51 51 11 10 38 40 28`, with
@@ -52,8 +54,11 @@ every step's top-two margin at least 0.089; the `sigmoid` one generates
 `37 14 55 2 51 23 40 27 11 61 2 51` (margin at least 0.019) and the `ple` one
 `35 25 35 25 51 45 11 34 44 51 45 39` (margin at least 0.043); `prune` generates
 `25 34 34 40 25 22 43 60 55 33 30 62` (margin at least 0.0014, at step 8; every
-other step at least 0.03).
+other step at least 0.03). `stacked` is `dense` with each layer's routed experts
+rewritten as `mlp.experts.gate_up_proj` `[4, 24, 32]` and `mlp.experts.down_proj`
+`[4, 32, 12]` (the layout `transformers` holds in memory), so it generates the same
+tokens as `dense`.
 
 On the Reference CPU Provider the largest logit difference is 1.7e-6 (`dense`)
-2.1e-6 (`sigmoid`), 3.0e-7 (`ple`) and 1.2e-6 (`prune`), and on the optimized CPU
-Provider 4.5e-6, 1.9e-6, 2.6e-6 and 1.8e-6.
+2.1e-6 (`sigmoid`), 3.0e-7 (`ple`), 1.2e-6 (`prune`) and 1.7e-6 (`stacked`), and on the
+optimized CPU Provider 4.5e-6, 1.9e-6, 2.6e-6, 1.8e-6 and 4.5e-6.

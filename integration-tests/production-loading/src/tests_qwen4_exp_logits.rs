@@ -71,6 +71,24 @@ fn a_qwen4_exp_pruning_indexer_bundle_matches_transformers() {
     }
 }
 
+/// The `dense` checkpoint with its routed experts stacked, as `transformers`
+/// holds them and other checkpoints store them (`mlp.experts.gate_up_proj`
+/// and `mlp.experts.down_proj`): the same logits as with one tensor per expert.
+#[test]
+fn a_qwen4_exp_stacked_experts_bundle_matches_transformers() {
+    for (provider, label) in cpu_providers() {
+        let difference = compare_on(
+            provider,
+            label,
+            "qwen4_exp",
+            "stacked",
+            Format::HuggingFace,
+            "qwen4_exp_text",
+        );
+        eprintln!("stacked experts, {label}: max |logit difference| {difference:.3e}");
+    }
+}
+
 /// The same checkpoint on `providers/cpu`'s Reference CPU Provider and its
 /// optimized CPU Provider.
 #[test]
