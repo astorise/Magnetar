@@ -13,7 +13,17 @@
 ## 3. GPU qualification
 
 - [x] 3.1 The new conformance tests pass on CUDA, and `moe_prefill_kernel_times` gives the grouped prefill's time against one pair at a time. Run 44375603855: the grouped prefill matches the per-pair Kernels bit for bit, 107.56 against 187.09 ms at 1,024 tokens, 429.70 against 750.54 ms at 4,096; DeepSeek-V2-Lite's TTFT 3,800.4 ms (1,024 tokens) and 16,281.5 ms (4,096). Run 44382825307: every conformance test passes, `long_prefill_matmuls_run_in_row_blocks` included. Run 44389385779: two columns per warp, still bit for bit, 76.17 ms at 1,024 tokens and 302.26 ms at 4,096.
-- [ ] 3.2 DeepSeek-V2-Lite-Chat Q8_0 across both GPUs (balanced) prefills 16,384 tokens with `f32` and `tq4` latent histories; TTFT and TPOT recorded in `cache-latent-attention-history` task 6.7. Run 44382825307: `tq4` does (TTFT 99.5 s with the exact head, 114.7 s without); `f32` runs out of the second GPU's memory at layer 25.
+- [x] 3.2 DeepSeek-V2-Lite-Chat Q8_0 across both GPUs (balanced) prefills 16,384 tokens with `f32` and `tq4` latent histories; TTFT and TPOT recorded in `cache-latent-attention-history` task 6.7. Run 44382825307: `tq4` does (TTFT 99.5 s with the exact head, 114.7 s without); `f32` runs out of the second GPU's memory at layer 25.
+  - Result, 2026-11-25 (run 45576847703, the `latent` suite, providers/cuda 8182423): the `f32` history now prefills 16,384 tokens on the two 12 GB GPUs, the layers balanced (free memory after the load: 3,890 MiB on the first, 2,740 MiB on the second). Over 64 tokens, every request equal to the `f32` one (it is that one):
+
+    | `f32` latent history | TTFT | TPOT |
+    | --- | --- | --- |
+    | 4,096 tokens | 13,122 ms | 17.03 ms |
+    | 8,192 tokens | 31,069 ms | 21.05 ms |
+    | 12,288 tokens | 54,133 ms | 24.95 ms |
+    | 16,384 tokens | 82,862 ms | 29.56 ms |
+
+    The out-of-memory of run 44382825307 no longer reproduces: later changes to the prefill (the chunked latent passes and what followed) removed it. With `tq4` at 16,384 tokens (runs 44382825307 and 44389385779): TTFT 82,740 ms with the exact head, 90,385 ms without. The task's two histories both prefill 16,384 tokens, so it closes on its own wording; whether `f32` goes further (32,768 tokens) is tried by the `moe` suite's long-context step.
   - Analysis, 2026-11-25 (the owner prefers failing fast; asked whether it costs the nominal cases anything):
     - The failure is already structured, not a crash: the CUDA allocation failure is `KernelOutOfDeviceMemory`, which the generation ends as a memory-limit finish. What is wrong is when: after 74 s, at layer 25.
     - The history's size is known up front (1,024 MB in `f32`, 144 MB in `tq4`, `kv_set_bytes`) and its stores are admitted at the first step. What does not fit is the prefill's working memory on the second GPU (176 MiB free after the failure, 1,806 MiB on the first).
