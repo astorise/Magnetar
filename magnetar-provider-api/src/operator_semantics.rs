@@ -25,6 +25,7 @@ mod ngram_ple;
 mod projected_differential_attention;
 mod qsa_select;
 mod sigmoid_routing;
+mod token_selected_attention;
 mod token_shift;
 pub use differential_attention::{
     DifferentialAttention, differential_attention, differential_attention_from_attributes,
@@ -59,6 +60,7 @@ pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,
 };
+pub use token_selected_attention::attention_over_selection;
 pub use token_shift::token_shift;
 
 /// The optimized CPU Provider (`execute-quantized-weights-on-cpu`): like

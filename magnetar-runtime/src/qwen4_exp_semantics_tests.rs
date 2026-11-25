@@ -3,10 +3,11 @@
 //! (pinned in design D7) on synthetic weights:
 //! `fixtures/generate-qwen4-exp-reference.py`.
 
-use crate::reference_cpu::{attention_over_selection, attention_scaled};
+use crate::reference_cpu::attention_scaled;
 use magnetar_provider_api::{
-    GatedResidual, HostTensor, MoeRouting, NgramEmbedding, NgramPle, QsaSelect, gated_residual,
-    gated_residual_inject, moe_experts, ngram_embedding, ngram_ple, qsa_select, repeat_features,
+    GatedResidual, HostTensor, MoeRouting, NgramEmbedding, NgramPle, QsaSelect,
+    attention_over_selection, gated_residual, gated_residual_inject, moe_experts, ngram_embedding,
+    ngram_ple, qsa_select, repeat_features,
 };
 use serde::Deserialize;
 
