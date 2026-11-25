@@ -50,6 +50,15 @@
   - [x] The tiny hybrid checkpoint matches `transformers` on the Reference CPU Provider (1.1e-5) and on cpu-native (8.6e-6).
   - [ ] cpu-native decode and chunked-prefill `gated-delta-mixer` kernels, equal to the Reference within tolerance including states. The mixer runs the shared f32 semantics, one thread, today.
 - [ ] 2.6 CUDA: the same forms (norm offset, per-head split, both mixer forms), qualified on the GPU runner.
+  - [x] Kernels:
+    - the `rmsnorm` weight offset;
+    - `split` per head, through a multi-output dispatch path;
+    - `gated-delta-mixer`: projections through the existing matmul against `[out, in]` weights; convolution, gates, q/k norms, the delta rule (one thread per value column, state in registers, `key_dim` ≤ 128) and the gated norm, following the shared f32 semantics term by term.
+
+    All three are advertised.
+  - [x] A CPU emulation of the `.cu` Kernels matches `gated_delta_mixer` exactly, all three outputs, at the test geometry and at 0.8B's (16/16 heads of 128). The case is a masked five-token prefill, then a decode step from the returned states.
+  - [ ] On the GPU runner: the conformance tests (`qwen3_5_norm_offset_and_per_head_split_match_reference_cpu`, `gated_delta_mixer_matches_reference_cpu_across_steps`) and the real-checkpoint qualification (2.7). The workflow `gpu-runner-smoke.yml` has a `hybrid` group for this.
+  - [ ] Decode speed: `[out, in]` projections go through the generic matmul. A row-per-warp GEMV (or transposing them at upload) comes after qualification.
 - [ ] 2.7 Qualify Qwen3.5-0.8B-Base (revision dc7cdfe…, digest pinned) on Reference CPU, cpu-native and CUDA:
   - last-position logits against Transformers;
   - 16 greedy tokens equal;

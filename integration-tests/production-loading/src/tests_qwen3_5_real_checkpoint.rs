@@ -16,7 +16,8 @@
 //!    `model.safetensors-00001-of-00001.safetensors` saved as
 //!    `model.safetensors`, into one directory.
 //! 2. `MAGNETAR_QWEN35_REAL_CHECKPOINT_DIR=<that directory>`, and optionally
-//!    `MAGNETAR_QUALIFICATION_PROVIDERS` (comma-separated, default
+//!    `MAGNETAR_QUALIFICATION_PROVIDERS` (comma-separated among
+//!    `reference-cpu`, `cpu-native` and `cuda`; default
 //!    `reference-cpu,cpu-native`).
 //! 3. `cargo test --release --manifest-path integration-tests/production-loading/Cargo.toml \
 //!      qwen3_5_real_checkpoint -- --include-ignored --nocapture`
@@ -57,30 +58,48 @@ fn corpus_path() -> PathBuf {
         .join("fixtures/qualification/qwen3.5-0.8b-base-dc7cdfe-transformers-f32.json")
 }
 
+/// `MAGNETAR_QUALIFICATION_PROVIDERS` (default: the two CPU Providers);
+/// `cuda` is skipped without a CUDA Device unless
+/// `MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1`.
 fn providers() -> Vec<(&'static str, Arc<dyn Provider>)> {
     let selection = std::env::var("MAGNETAR_QUALIFICATION_PROVIDERS")
         .unwrap_or_else(|_| "reference-cpu,cpu-native".into());
-    selection
+    let require_cuda = std::env::var("MAGNETAR_QUALIFICATION_REQUIRE_CUDA").as_deref() == Ok("1");
+    let mut providers: Vec<(&'static str, Arc<dyn Provider>)> = Vec::new();
+    for name in selection
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(|name| match name {
-            "reference-cpu" => (
-                "reference-cpu",
-                Arc::new(ReferenceCpuProvider::new()) as Arc<dyn Provider>,
-            ),
+    {
+        match name {
+            "reference-cpu" => {
+                providers.push(("reference-cpu", Arc::new(ReferenceCpuProvider::new())))
+            }
             "cpu-native" => {
                 use magnetar_provider_cpu::native::{NativeCpuExecutor, NativeCpuProvider};
-                (
+                providers.push((
                     "cpu-native",
                     Arc::new(NativeCpuProvider::with_executor(
                         NativeCpuExecutor::with_settings(true, false, 4),
-                    )) as Arc<dyn Provider>,
-                )
+                    )),
+                ))
+            }
+            "cuda" => {
+                let cuda = magnetar_provider_cuda::CudaProvider::new();
+                if cuda.is_available() {
+                    providers.push(("cuda", Arc::new(cuda)));
+                } else {
+                    assert!(
+                        !require_cuda,
+                        "MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1 but no CUDA Device"
+                    );
+                    eprintln!("CUDA comparison skipped: no CUDA-capable Device");
+                }
             }
             other => panic!("MAGNETAR_QUALIFICATION_PROVIDERS names unknown Provider {other:?}"),
-        })
-        .collect()
+        }
+    }
+    providers
 }
 
 #[test]
