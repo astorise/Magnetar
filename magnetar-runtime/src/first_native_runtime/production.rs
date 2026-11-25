@@ -213,7 +213,21 @@ pub(super) fn weight_shapes_for_architecture_config(
         "token_embedding".to_string(),
         vec![config.vocab_size, config.hidden_size],
     );
-    shapes.insert("final_norm".to_string(), vec![config.hidden_size]);
+    // With residual streams (`support-qwen38-flash-next`) the final mix of
+    // the streams replaces the final norm.
+    let hyper = config.decoder_extensions.hyper_connections;
+    match hyper {
+        None => {
+            shapes.insert("final_norm".to_string(), vec![config.hidden_size]);
+        }
+        Some(connections) => insert_hyper_shapes(
+            &mut shapes,
+            "final_hyper",
+            config.hidden_size,
+            connections,
+            false,
+        ),
+    }
     shapes.insert(
         "lm_head".to_string(),
         vec![config.hidden_size, config.vocab_size],
@@ -235,8 +249,25 @@ pub(super) fn weight_shapes_for_architecture_config(
         let own_v = own_kv && spec.is_none_or(|spec| !spec.value_from_key);
         let q_dim = config.num_attention_heads as u64 * head_dim;
         let kv_dim = kv_heads as u64 * head_dim;
-        shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
-        shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
+        match hyper {
+            None => {
+                shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
+                shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
+            }
+            // Each block reads its own mix of the streams and writes back
+            // to every stream.
+            Some(connections) => {
+                for block in ["attn_hyper", "mlp_hyper"] {
+                    insert_hyper_shapes(
+                        &mut shapes,
+                        &format!("{prefix}.{block}"),
+                        config.hidden_size,
+                        connections,
+                        true,
+                    );
+                }
+            }
+        }
         // A gated-delta linear-attention layer (`support-qwen38-flash-next`):
         // the mixer's projections in checkpoint `[out, in]` order.
         if let Some(linear) = config
@@ -295,10 +326,49 @@ pub(super) fn weight_shapes_for_architecture_config(
                 shapes.insert(format!("{prefix}.self_attn.q_norm"), vec![head_dim]);
                 shapes.insert(format!("{prefix}.self_attn.k_norm"), vec![head_dim]);
             }
+            // A token indexer reads the layer's input through one
+            // projection for its queries and its single key head.
+            if let Some(selection) = config.decoder_extensions.token_selection {
+                let width = u64::from(selection.heads + selection.key_heads) * selection.head_dim;
+                shapes.insert(
+                    format!("{prefix}.self_attn.index_qk_proj"),
+                    vec![config.hidden_size, width],
+                );
+                shapes.insert(
+                    format!("{prefix}.self_attn.index_q_norm"),
+                    vec![selection.head_dim],
+                );
+                shapes.insert(
+                    format!("{prefix}.self_attn.index_k_norm"),
+                    vec![selection.head_dim],
+                );
+            }
         }
         insert_mlp_shapes(&mut shapes, &prefix, config, layer, intermediate_size);
     }
     shapes
+}
+
+/// One gated residual's weights, in checkpoint `[out, in]` order: its
+/// norm over the streams, the low-rank input mixer and, for a block's
+/// (not the final mix's), the injection weights.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn insert_hyper_shapes(
+    shapes: &mut BTreeMap<String, Vec<u64>>,
+    prefix: &str,
+    hidden: u64,
+    connections: crate::HyperConnectionConfig,
+    inject: bool,
+) {
+    let streams = u64::from(connections.streams);
+    let width = streams * hidden;
+    let rank = u64::from(connections.lowrank);
+    shapes.insert(format!("{prefix}.norm"), vec![width]);
+    shapes.insert(format!("{prefix}.down"), vec![rank, width]);
+    shapes.insert(format!("{prefix}.up"), vec![width, rank]);
+    if inject {
+        shapes.insert(format!("{prefix}.inject"), vec![streams, width]);
+    }
 }
 
 /// A layer's ordinary query, key, value and output projections (and biases).

@@ -1243,6 +1243,10 @@ pub(super) fn qwen_weight_name_in_layer_range(
     match tensor_name {
         "token_embedding" => start_layer == 0,
         "final_norm" | "lm_head" => end_layer == num_hidden_layers,
+        // Qwen4-Exp's final mix of its residual streams.
+        "final_hyper.norm" | "final_hyper.down" | "final_hyper.up" => {
+            end_layer == num_hidden_layers
+        }
         _ => false,
     }
 }

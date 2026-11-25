@@ -1392,3 +1392,80 @@ fn latent_attention_and_mixed_expert_layers_derive_their_weight_shapes() {
         vec![1536, 16 * 128]
     );
 }
+
+/// `support-qwen38-flash-next`: residual streams replace the decoder's
+/// norms with each block's gated residual (checkpoint `[out, in]` order)
+/// and the final mix, and an indexed attention layer adds its indexer's
+/// projection and norms.
+#[test]
+fn qwen4_exp_residual_streams_and_indexer_derive_their_weight_shapes() {
+    let config = ModelArchitectureConfig {
+        hidden_size: 32,
+        intermediate_size: 12,
+        num_hidden_layers: 2,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 16,
+        vocab_size: 64,
+        linear_attention: Some(crate::LinearAttentionConfig {
+            layers: vec![true, false],
+            key_heads: 2,
+            value_heads: 4,
+            key_head_dim: 8,
+            value_head_dim: 8,
+            conv_kernel: 4,
+        }),
+        attention_output_gate: true,
+        mixture_of_experts: Some(crate::MixtureOfExpertsConfig {
+            experts: 4,
+            experts_per_token: 2,
+            expert_intermediate_size: 12,
+            shared_expert_intermediate_size: Some(12),
+            normalize_top_k: true,
+        }),
+        decoder_extensions: crate::DecoderExtensions {
+            hyper_connections: Some(crate::HyperConnectionConfig {
+                streams: 4,
+                lowrank: 6,
+            }),
+            token_selection: Some(crate::TokenSelectionConfig {
+                heads: 2,
+                key_heads: 1,
+                head_dim: 8,
+                budget: 32,
+                compress_ratio: 4,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let shapes = weight_shapes_for_architecture_config(&config);
+    // No decoder norms: every block has its own gated residual.
+    for name in [
+        "final_norm",
+        "layers.0.input_norm",
+        "layers.1.post_attn_norm",
+    ] {
+        assert!(!shapes.contains_key(name), "{name}");
+    }
+    for block in ["layers.0.attn_hyper", "layers.1.mlp_hyper"] {
+        assert_eq!(shapes[&format!("{block}.norm")], vec![128]);
+        assert_eq!(shapes[&format!("{block}.down")], vec![6, 128]);
+        assert_eq!(shapes[&format!("{block}.up")], vec![128, 6]);
+        assert_eq!(shapes[&format!("{block}.inject")], vec![4, 128]);
+    }
+    // The final mix has no injection.
+    assert_eq!(shapes["final_hyper.down"], vec![6, 128]);
+    assert!(!shapes.contains_key("final_hyper.inject"));
+    // The linear layer keeps no attention weights or indexer.
+    assert!(!shapes.contains_key("layers.0.self_attn.index_qk_proj"));
+    assert_eq!(shapes["layers.0.linear_attn.in_qkv"], vec![64, 32]);
+    // The indexed layer: gated query, indexer projection and norms.
+    assert_eq!(shapes["layers.1.self_attn.q_proj"], vec![32, 64]);
+    assert_eq!(shapes["layers.1.self_attn.index_qk_proj"], vec![32, 24]);
+    assert_eq!(shapes["layers.1.self_attn.index_q_norm"], vec![8]);
+    assert_eq!(shapes["layers.1.self_attn.index_k_norm"], vec![8]);
+    // Every layer is a mixture of experts with a gated shared expert.
+    assert_eq!(shapes["layers.1.moe.router_proj"], vec![32, 4]);
+    assert_eq!(shapes["layers.0.moe.shared_expert_gate"], vec![32, 1]);
+}
