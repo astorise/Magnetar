@@ -91,14 +91,16 @@
   - QSA equals dense attention up to 2,051 visible tokens.
 - [ ] 3.2 QSA attention with its indexer: operator, Reference semantics and fixtures.
   - [x] `qsa_select` Reference semantics (a query's kept tokens: block keys averaged, normalized, rotated at the block start, scored by `relu` sums, top `budget / ratio` blocks plus the incomplete tail). Checked against Transformers' `Qwen4ExpTextQSAIndexer` on 20 queries that prune (`the_qsa_selection_matches_the_pinned_transformers_indexer`). Ties go to the lower block, and the fixture's seed has none at the cut.
-  - [ ] Catalog `qsa-select` (inputs queries, raw index keys, key norm weight; output ascending token positions padded with -1), and an `attention` form that reads them (feature `attention-token-selection`). Dispatch on the first-native Runtime and the Reference CPU.
+  - [x] `qsa-select` is in the catalog (queries, raw index keys and the key norm's weight in; ascending token positions padded with -1 out). The Reference CPU Providers run it, cpu-native included, and the first-native Runtime dispatches it as a graph node (`the_qsa_selection_runs_as_a_graph_node`).
+  - [ ] An `attention` form that reads the selection (feature `attention-token-selection`): Reference CPU first, then cpu-native and CUDA. Until it exists, a graph attends densely, which equals QSA up to 2,051 visible tokens.
   - [ ] The index keys `[T, 128]` as a per-layer cache next to K and V; the pooled block keys of complete blocks never change, so a provider may cache them.
-- [ ] 3.3 Four-stream gated residual (`hc_count` 4, low-rank 320): operator, Reference semantics and fixtures.
+- [x] 3.3 Four-stream gated residual (`hc_count` 4, low-rank 320): operator, Reference semantics and fixtures.
   - [x] `gated_residual`, `gated_residual_inject` and `repeat_features` Reference semantics, checked against `Qwen4ExpTextGatedResidual` and the decoder layer's closing step (`the_gated_residual_matches_the_pinned_transformers_module`).
-  - [ ] Catalog `gated-residual`, `gated-residual-inject` and `repeat-features` with their shape rules and attributes; dispatch.
+  - [x] `gated-residual` (mixed input and write weights), `gated-residual-final` (the final mixer, which has no write weights), `gated-residual-inject` and `repeat-features` are in the catalog and run on the Reference CPU Providers and as first-native graph nodes (`the_gated_residual_operators_run_as_graph_nodes`). The catalog's shape rule is `Any`; the semantics validate every shape.
 - [ ] 3.4 N-gram PLE: hashed row lookup from a disk-resident table, added at layer 2; Reference semantics and fixtures.
   - [x] `ngram_embedding` (hash, EOS-delimited segments, next context) and `ngram_ple` (gate, dilated convolution, history) Reference semantics. The head primes and the hash multipliers equal Transformers' exactly; embeddings and output match on a second PLE layer, and two chunks carrying the context and history equal the whole sequence (`the_ngram_ple_matches_the_pinned_transformers_layer`).
-  - [ ] Catalog `ngram-embedding` (ids and context in, embeddings and next context out; the table is a weight read by row, never admitted whole: 4.4) and `ngram-ple`; dispatch.
+  - [x] `ngram-embedding` (ids and context in, embeddings and next context out) and `ngram-ple` (with its convolution history as an explicit state) are in the catalog and run as first-native graph nodes, carrying both states between two runs (`the_ngram_ple_runs_as_graph_nodes_with_its_states`).
+  - [ ] The table is a weight read by row and never admitted whole (4.4). Today the operator takes it as a dense input.
   - [ ] f32 tensors cannot hold the real table's row numbers (about 320M, past 2^24), so the lookup stays one operator from token ids to rows.
 - [x] 3.5 MoE 512 / top-10 with a gated shared expert on the existing MoE operator.
   - The routing needs no change: Qwen3-Next's router is softmax over every expert, top-k, renormalized, with a tie to the lower expert, which `moe_route` computes with `normalize_top_k`.
