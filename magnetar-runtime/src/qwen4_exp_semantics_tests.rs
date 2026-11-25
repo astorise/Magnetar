@@ -3,9 +3,11 @@
 //! (pinned in design D7) on synthetic weights:
 //! `fixtures/generate-qwen4-exp-reference.py`.
 
+use crate::reference_cpu::attention_scaled;
 use magnetar_provider_api::{
-    GatedResidual, HostTensor, MoeRouting, NgramEmbedding, NgramPle, QsaSelect, gated_residual,
-    gated_residual_inject, moe_experts, ngram_embedding, ngram_ple, qsa_select, repeat_features,
+    GatedResidual, HostTensor, MoeRouting, NgramEmbedding, NgramPle, QsaSelect,
+    attention_over_selection, gated_residual, gated_residual_inject, moe_experts, ngram_embedding,
+    ngram_ple, qsa_select, repeat_features,
 };
 use serde::Deserialize;
 
@@ -95,8 +97,40 @@ pub(crate) struct MoeCase {
     pub(crate) output: Flat,
 }
 
+/// The indexer's inputs, without the mask the module builds.
+#[derive(Deserialize)]
+pub(crate) struct QsaIndexInputs {
+    pub(crate) head_count: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) budget: usize,
+    pub(crate) compress_ratio: usize,
+    pub(crate) rotary_dim: usize,
+    pub(crate) rope_base: f32,
+    pub(crate) key_norm_weight: Flat,
+    pub(crate) queries: Flat,
+    pub(crate) keys: Flat,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct QsaAttentionCase {
+    pub(crate) head_count: u64,
+    pub(crate) kv_head_count: u64,
+    pub(crate) head_dim: u64,
+    pub(crate) scaling: f32,
+    pub(crate) index: QsaIndexInputs,
+    pub(crate) q: Flat,
+    pub(crate) k: Flat,
+    pub(crate) v: Flat,
+    /// The module's attention over the causal mask narrowed by the selection,
+    /// before its output gate and projection.
+    pub(crate) output: Flat,
+    /// The same attention without the selection.
+    pub(crate) dense_output: Flat,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct Fixture {
+    pub(crate) qsa_attention: QsaAttentionCase,
     pub(crate) moe_block: MoeCase,
     pub(crate) hc_count: usize,
     pub(crate) epsilon: f32,
@@ -271,18 +305,19 @@ fn the_ngram_ple_matches_the_pinned_transformers_layer() {
 
     let tokens = case.token_ids.len();
     let ids = HostTensor::new([tokens as u64], case.token_ids.clone()).unwrap();
-    let start = HostTensor::new(
-        [hash.context_len() as u64],
-        vec![case.eos_token_id as f32; hash.context_len()],
-    )
-    .unwrap();
+    // A new sequence's state is all zeros: every earlier token the end token.
+    let start =
+        HostTensor::new([hash.context_len() as u64], vec![0.0; hash.context_len()]).unwrap();
     let [embeddings, context] =
         ngram_embedding(&[ids.clone(), start.clone(), case.table.tensor()], hash).unwrap();
     assert_matches(&embeddings, &case.embeddings, "n-gram embeddings");
     assert_eq!(
         context.data,
-        &case.token_ids[tokens - hash.context_len()..],
-        "the next context is the last tokens"
+        case.token_ids[tokens - hash.context_len()..]
+            .iter()
+            .map(|token| token - case.eos_token_id as f32)
+            .collect::<Vec<_>>(),
+        "the next context is the last tokens, relative to the end token"
     );
 
     let ple = NgramPle {
@@ -465,4 +500,132 @@ fn the_moe_block_matches_through_the_existing_operator() {
     }
     let actual = HostTensor::new(case.output.shape.clone(), out).unwrap();
     assert_matches(&actual, &case.output, "MoE block output");
+}
+
+/// The attention that reads the QSA selection, against the pinned
+/// Transformers attention (its projections, norms and rotary, then the eager
+/// attention over the causal mask narrowed by the indexer). The selection
+/// comes from `qsa_select` on the module's own indexer inputs; the case
+/// prunes, so dense attention differs from it.
+#[test]
+fn the_selected_attention_matches_the_pinned_transformers_module() {
+    let fixture = fixture();
+    let case = &fixture.qsa_attention;
+    let index = &case.index;
+    let config = QsaSelect {
+        head_count: index.head_count,
+        head_dim: index.head_dim,
+        compress_ratio: index.compress_ratio,
+        budget: index.budget,
+        epsilon: fixture.epsilon,
+        weight_offset: 1.0,
+        rope_base: index.rope_base,
+        rotary_dim: index.rotary_dim,
+    };
+    let selection = qsa_select(
+        &[
+            index.queries.tensor(),
+            index.keys.tensor(),
+            index.key_norm_weight.tensor(),
+        ],
+        config,
+    )
+    .unwrap();
+    let (q, k, v) = (case.q.tensor(), case.k.tensor(), case.v.tensor());
+    let selected = attention_over_selection(
+        &q,
+        &k,
+        &v,
+        &selection,
+        case.head_count,
+        case.head_dim,
+        Some(case.kv_head_count),
+        None,
+        true,
+        Some(case.scaling),
+    )
+    .unwrap();
+    assert_matches(&selected, &case.output, "selected attention");
+
+    // Without the selection the attention is the dense one, which differs
+    // where the selection prunes: the fixture would prove nothing otherwise.
+    let dense = attention_scaled(
+        &q,
+        &k,
+        &v,
+        case.head_count,
+        case.head_dim,
+        Some(case.kv_head_count),
+        None,
+        true,
+        Some(case.scaling),
+    )
+    .unwrap();
+    assert_matches(&dense, &case.dense_output, "dense attention");
+    let largest = dense
+        .data
+        .iter()
+        .zip(&selected.data)
+        .map(|(d, s)| (d - s).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        largest > 0.1,
+        "the selection never changes the output ({largest})"
+    );
+
+    // A selection that names every causal key gives the dense attention.
+    let tokens = q.shape[0] as usize;
+    let mut everything = vec![-1.0_f32; tokens * tokens];
+    for query in 0..tokens {
+        for key in 0..=query {
+            everything[query * tokens + key] = key as f32;
+        }
+    }
+    let everything = HostTensor::new([tokens as u64, tokens as u64], everything).unwrap();
+    let all = attention_over_selection(
+        &q,
+        &k,
+        &v,
+        &everything,
+        case.head_count,
+        case.head_dim,
+        Some(case.kv_head_count),
+        None,
+        true,
+        Some(case.scaling),
+    )
+    .unwrap();
+    assert_matches(&all, &case.dense_output, "a selection of every causal key");
+
+    // Malformed selections are refused, not computed.
+    let rows = |data: Vec<f32>| HostTensor::new([tokens as u64, 1], data).unwrap();
+    let call = |selection: &HostTensor| {
+        attention_over_selection(
+            &q,
+            &k,
+            &v,
+            selection,
+            case.head_count,
+            case.head_dim,
+            Some(case.kv_head_count),
+            None,
+            true,
+            Some(case.scaling),
+        )
+    };
+    assert!(call(&rows(vec![-1.0; tokens])).is_err(), "no readable key");
+    assert!(
+        call(&rows(vec![0.5; tokens])).is_err(),
+        "a fractional position"
+    );
+    let short = HostTensor::new([tokens as u64 - 1, 1], vec![0.0; tokens - 1]).unwrap();
+    assert!(call(&short).is_err(), "a row per query");
+    let descending = HostTensor::new([tokens as u64, 2], {
+        let mut data = vec![-1.0; tokens * 2];
+        data[0] = 1.0;
+        data[1] = 0.0;
+        data
+    })
+    .unwrap();
+    assert!(call(&descending).is_err(), "positions out of order");
 }

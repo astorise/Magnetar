@@ -25,6 +25,7 @@ mod ngram_ple;
 mod projected_differential_attention;
 mod qsa_select;
 mod sigmoid_routing;
+mod token_selected_attention;
 mod token_shift;
 pub use differential_attention::{
     DifferentialAttention, differential_attention, differential_attention_from_attributes,
@@ -36,7 +37,7 @@ pub use encoder_ops::{
     affine_layernorm, affine_layernorm_epsilon, gelu_exact, slice_last, slice_last_attributes,
 };
 pub use gated_delta_mixer::{
-    GatedDeltaMixer, gated_delta_mixer, gated_delta_mixer_from_attributes,
+    GatedDeltaMixer, MixerOutputGate, gated_delta_mixer, gated_delta_mixer_from_attributes,
     gated_delta_mixer_from_projections,
 };
 pub use gated_residual::{GatedResidual, gated_residual, gated_residual_inject, repeat_features};
@@ -59,6 +60,7 @@ pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,
 };
+pub use token_selected_attention::attention_over_selection;
 pub use token_shift::token_shift;
 
 /// The optimized CPU Provider (`execute-quantized-weights-on-cpu`): like

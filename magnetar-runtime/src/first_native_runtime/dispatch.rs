@@ -2067,7 +2067,18 @@ pub(super) fn dispatch_rope_node(
 /// sets them (`per-layer-kv-geometry`): a layer's own head geometry, its
 /// sliding window and its score scale. Absent geometry falls back to the
 /// architecture's.
-const ATTENTION_NODE_ATTRIBUTES: [&str; 8] = [
+/// The inputs an attention node carries after q, k and v.
+pub(super) enum AttentionExtraInputs {
+    None,
+    /// The key and value projections of latent K and V
+    /// (`latent_kv_width`, `chunk-latent-prefills`).
+    LatentWeights([NodeValue; 2]),
+    /// The key positions each query reads (`token_selection`,
+    /// `support-qwen38-flash-next`).
+    Selection(NodeValue),
+}
+
+const ATTENTION_NODE_ATTRIBUTES: [&str; 9] = [
     "head_count",
     "kv_head_count",
     "head_dimension",
@@ -2080,6 +2091,8 @@ const ATTENTION_NODE_ATTRIBUTES: [&str; 8] = [
     "value_head_stride",
     // `chunk-latent-prefills`: latent K and V, expanded by two more inputs.
     "latent_kv_width",
+    // `support-qwen38-flash-next`: the keys each query reads, a fourth input.
+    "token_selection",
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -2098,7 +2111,7 @@ pub(super) fn dispatch_qwen_attention(
         ctx,
         operation_id,
         [q, k, v],
-        None,
+        AttentionExtraInputs::None,
         architecture,
         node_attributes,
         output_target,
@@ -2114,7 +2127,7 @@ pub(super) fn dispatch_attention_with_latent_weights(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
     [q, k, v]: [NodeValue; 3],
-    latent_weights: Option<[NodeValue; 2]>,
+    extra_inputs: AttentionExtraInputs,
     architecture: &ModelComponentArchitectureMetadata,
     node_attributes: &BTreeMap<String, OperatorAttributeValue>,
     output_target: Option<OutputTarget>,
@@ -2171,9 +2184,15 @@ pub(super) fn dispatch_attention_with_latent_weights(
         node_input_resource(operation_id, "k", k),
         node_input_resource(operation_id, "v", v),
     ];
-    if let Some([w_k, w_v]) = latent_weights {
-        resources.push(node_input_resource(operation_id, "w_k", w_k));
-        resources.push(node_input_resource(operation_id, "w_v", w_v));
+    match extra_inputs {
+        AttentionExtraInputs::None => {}
+        AttentionExtraInputs::LatentWeights([w_k, w_v]) => {
+            resources.push(node_input_resource(operation_id, "w_k", w_k));
+            resources.push(node_input_resource(operation_id, "w_v", w_v));
+        }
+        AttentionExtraInputs::Selection(selection) => {
+            resources.push(node_input_resource(operation_id, "selection", selection));
+        }
     }
     dispatch_reference_cpu_operator_pre_admitted(
         ctx,

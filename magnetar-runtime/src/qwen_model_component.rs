@@ -398,6 +398,8 @@ pub struct FirstNativeModelConfig {
     pub norm_weight_offset: Option<f64>,
     /// See [`crate::ModelArchitectureConfig::attention_output_gate`].
     pub attention_output_gate: bool,
+    /// See [`crate::ModelArchitectureConfig::decoder_extensions`].
+    pub decoder_extensions: crate::DecoderExtensions,
     /// See [`crate::ModelArchitectureConfig::moe_layers`].
     pub moe_layers: Option<Vec<bool>>,
     /// See [`crate::ModelArchitectureConfig::expert_routing`].
@@ -434,6 +436,7 @@ impl FirstNativeModelConfig {
             linear_attention: None,
             norm_weight_offset: None,
             attention_output_gate: false,
+            decoder_extensions: crate::DecoderExtensions::default(),
             moe_layers: None,
             expert_routing: None,
             require_bos: false,
