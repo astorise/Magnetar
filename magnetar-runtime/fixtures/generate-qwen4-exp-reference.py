@@ -159,5 +159,57 @@ fixture["qsa_indexer"] = {
     "selected": {"shape": list(selected.shape[-2:]),
                  "data": selected[0, 0].flatten().to(torch.float32).tolist()},
 }
+# The hashed n-gram embedding and the PLE layer. Layer index 2 is the second
+# PLE layer (ple_layer_index 1), so the head vocabularies and multipliers are
+# not the first layer's. Token 7 is the EOS: it ends an n-gram segment.
+from transformers.cache_utils import DynamicCache  # noqa: E402
+
+PLE_EMBED, NGRAM_SIZE, HEADS_PER_NGRAM, VOCAB, EOS = 8, 3, 2, 32, 7
+ple_config = Qwen4ExpTextConfig(
+    hidden_size=HIDDEN, hc_count=HC, hc_lowrank=RANK, num_hidden_layers=4,
+    num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+    linear_num_key_heads=2, linear_num_value_heads=4,
+    linear_key_head_dim=4, linear_value_head_dim=4,
+    moe_intermediate_size=6, shared_expert_intermediate_size=6,
+    num_experts=4, num_experts_per_tok=2, vocab_size=VOCAB, rms_norm_eps=1e-6,
+    ple_layer_ids=[1, 2], ple_embed_dim=PLE_EMBED, ple_conv_kernel_size=3,
+    ngram_size=NGRAM_SIZE, heads_per_ngram=HEADS_PER_NGRAM,
+    ngram_vocab_size_base=50, make_ngram_vocab_size_divisible_by=4,
+    seed=1234, eos_token_id=EOS,
+)
+LAYER, PLE_INDEX = 1, 1
+ple = m.Qwen4ExpTextPLELayer(ple_config, LAYER, PLE_INDEX)
+randomize(ple)
+ple.conv1d.weight.data *= 0.5
+PLE_TOKENS = 12
+token_ids = torch.tensor([[3, 9, 7, 12, 12, 30, 5, 7, 7, 21, 4, 18]])
+ple_hidden = torch.randn(1, PLE_TOKENS, HC * HIDDEN)
+with torch.no_grad():
+    embeddings = ple.ple_embedding(token_ids, None)
+    ple_out = ple(ple_hidden, token_ids, None)
+    # The same sequence in two chunks, the cache carrying both states.
+    cache = DynamicCache(config=ple_config)
+    first = ple(ple_hidden[:, :5], token_ids[:, :5], cache)
+    second = ple(ple_hidden[:, 5:], token_ids[:, 5:], cache)
+    chunked = torch.cat([first, second], dim=1)
+table = ple.ple_embedding.ngram_embedding.weight
+fixture["ngram_ple"] = {
+    "ngram_size": NGRAM_SIZE, "heads_per_ngram": HEADS_PER_NGRAM,
+    "vocab_size": VOCAB, "vocab_base": 50, "layer_index": PLE_INDEX,
+    "seed": 1234, "eos_token_id": EOS,
+    "conv_kernel": 3, "conv_dilation": NGRAM_SIZE,
+    "token_ids": [float(t) for t in token_ids[0].tolist()],
+    "table": flat(table),
+    "head_vocab_sizes": [int(v) for v in ple.ple_embedding.head_vocab_sizes],
+    "multipliers": [int(v) for v in ple.ple_embedding.layer_multipliers],
+    "embeddings": flat(embeddings[0]),
+    "hidden": flat(ple_hidden[0]),
+    "key_proj": flat(ple.key_proj.weight), "value_proj": flat(ple.value_proj.weight),
+    "norm_key": flat(ple.norm_key.weight), "norm_query": flat(ple.norm_query.weight),
+    "norm_conv": flat(ple.norm_conv.weight),
+    "conv": flat(ple.conv1d.weight.squeeze(1)),
+    "output": flat(ple_out[0]),
+    "chunked_output": flat(chunked[0]),
+}
 json.dump(fixture, sys.stdout, indent=1)
 print()

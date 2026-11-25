@@ -4,8 +4,8 @@
 //! `fixtures/generate-qwen4-exp-reference.py`.
 
 use magnetar_provider_api::{
-    GatedResidual, HostTensor, QsaSelect, gated_residual, gated_residual_inject, qsa_select,
-    repeat_features,
+    GatedResidual, HostTensor, NgramEmbedding, NgramPle, QsaSelect, gated_residual,
+    gated_residual_inject, ngram_embedding, ngram_ple, qsa_select, repeat_features,
 };
 use serde::Deserialize;
 
@@ -53,11 +53,39 @@ struct QsaCase {
 }
 
 #[derive(Deserialize)]
+struct PleCase {
+    ngram_size: usize,
+    heads_per_ngram: usize,
+    vocab_size: u64,
+    vocab_base: u64,
+    layer_index: u64,
+    seed: u64,
+    eos_token_id: i64,
+    conv_kernel: usize,
+    conv_dilation: usize,
+    token_ids: Vec<f32>,
+    table: Flat,
+    head_vocab_sizes: Vec<u64>,
+    multipliers: Vec<i64>,
+    embeddings: Flat,
+    hidden: Flat,
+    key_proj: Flat,
+    value_proj: Flat,
+    norm_key: Flat,
+    norm_query: Flat,
+    norm_conv: Flat,
+    conv: Flat,
+    output: Flat,
+    chunked_output: Flat,
+}
+
+#[derive(Deserialize)]
 struct Fixture {
     hc_count: usize,
     epsilon: f32,
     gated_residual: GatedResidualCase,
     qsa_indexer: QsaCase,
+    ngram_ple: PleCase,
 }
 
 fn fixture() -> Fixture {
@@ -197,4 +225,127 @@ fn the_qsa_selection_matches_the_pinned_transformers_indexer() {
         )
         .is_err()
     );
+}
+
+/// The hashed n-gram lookup and the PLE layer against the pinned modules,
+/// on a second PLE layer (so its primes and multipliers differ from the
+/// first's) over a sequence with EOS tokens that end n-gram segments; then
+/// the same sequence in two chunks, the context and the convolution history
+/// carried between them.
+#[test]
+fn the_ngram_ple_matches_the_pinned_transformers_layer() {
+    let fixture = fixture();
+    let case = &fixture.ngram_ple;
+    let hash = NgramEmbedding {
+        ngram_size: case.ngram_size,
+        heads_per_ngram: case.heads_per_ngram,
+        vocab_size: case.vocab_size,
+        vocab_base: case.vocab_base,
+        layer_index: case.layer_index,
+        seed: case.seed,
+        eos_token_id: case.eos_token_id,
+    };
+    assert_eq!(
+        hash.head_vocab_sizes(),
+        case.head_vocab_sizes,
+        "head primes"
+    );
+    assert_eq!(hash.multipliers(), case.multipliers, "hash multipliers");
+
+    let tokens = case.token_ids.len();
+    let ids = HostTensor::new([tokens as u64], case.token_ids.clone()).unwrap();
+    let start = HostTensor::new(
+        [hash.context_len() as u64],
+        vec![case.eos_token_id as f32; hash.context_len()],
+    )
+    .unwrap();
+    let [embeddings, context] =
+        ngram_embedding(&[ids.clone(), start.clone(), case.table.tensor()], hash).unwrap();
+    assert_matches(&embeddings, &case.embeddings, "n-gram embeddings");
+    assert_eq!(
+        context.data,
+        &case.token_ids[tokens - hash.context_len()..],
+        "the next context is the last tokens"
+    );
+
+    let ple = NgramPle {
+        hc_count: fixture.hc_count,
+        epsilon: fixture.epsilon,
+        weight_offset: 1.0,
+        conv_kernel: case.conv_kernel,
+        conv_dilation: case.conv_dilation,
+    };
+    let channels = case.hidden.shape[1];
+    let history = || {
+        HostTensor::new(
+            [channels, ple.state_len() as u64],
+            vec![0.0; channels as usize * ple.state_len()],
+        )
+        .unwrap()
+    };
+    let weights = |hidden: HostTensor, embeddings: HostTensor, history: HostTensor| {
+        vec![
+            hidden,
+            embeddings,
+            case.key_proj.tensor(),
+            case.value_proj.tensor(),
+            case.norm_key.tensor(),
+            case.norm_query.tensor(),
+            case.norm_conv.tensor(),
+            case.conv.tensor(),
+            history,
+        ]
+    };
+    let [output, _] = ngram_ple(
+        &weights(case.hidden.tensor(), embeddings.clone(), history()),
+        ple,
+    )
+    .unwrap();
+    assert_matches(&output, &case.output, "PLE output");
+
+    // Two chunks of 5 and 7 tokens, state carried in both layers.
+    let rows = |tensor: &HostTensor, from: usize, to: usize| {
+        let width = tensor.shape[1] as usize;
+        HostTensor::new(
+            [(to - from) as u64, width as u64],
+            tensor.data[from * width..to * width].to_vec(),
+        )
+        .unwrap()
+    };
+    let hidden = case.hidden.tensor();
+    let mut carried_context = start.clone();
+    let mut carried_history = history();
+    let mut chunked = Vec::new();
+    for (from, to) in [(0, 5), (5, tokens)] {
+        let chunk_ids =
+            HostTensor::new([(to - from) as u64], case.token_ids[from..to].to_vec()).unwrap();
+        let [chunk_embeddings, next_context] =
+            ngram_embedding(&[chunk_ids, carried_context, case.table.tensor()], hash).unwrap();
+        let [chunk_output, next_history] = ngram_ple(
+            &weights(rows(&hidden, from, to), chunk_embeddings, carried_history),
+            ple,
+        )
+        .unwrap();
+        chunked.extend(chunk_output.data);
+        carried_context = next_context;
+        carried_history = next_history;
+    }
+    let chunked = HostTensor::new(case.output.shape.clone(), chunked).unwrap();
+    assert_matches(&chunked, &case.chunked_output, "chunked PLE output");
+    assert_matches(&chunked, &case.output, "chunked equals whole");
+
+    // Malformed inputs are refused.
+    assert!(
+        ngram_embedding(
+            &[ids, start, case.table.tensor()],
+            NgramEmbedding {
+                vocab_base: 10_000_000,
+                ..hash
+            }
+        )
+        .is_err()
+    );
+    let mut short = weights(case.hidden.tensor(), embeddings, history());
+    short.pop();
+    assert!(ngram_ple(&short, ple).is_err());
 }

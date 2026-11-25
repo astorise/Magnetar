@@ -20,6 +20,7 @@ mod mamba2_mixer;
 mod mamba3_core;
 mod mamba3_mimo;
 mod mamba3_mixer;
+mod ngram_ple;
 mod projected_differential_attention;
 mod qsa_select;
 mod sigmoid_routing;
@@ -42,6 +43,7 @@ pub use mamba2_mixer::{Mamba2Mixer, mamba2_mixer, mamba2_mixer_from_attributes};
 pub use mamba3_core::Geometry as Mamba3Mimo;
 pub use mamba3_mimo::{mamba3_mimo, mamba3_mimo_from_attributes};
 pub use mamba3_mixer::{Mamba3Mixer, mamba3_mixer, mamba3_mixer_from_attributes};
+pub use ngram_ple::{NgramEmbedding, NgramPle, ngram_embedding, ngram_ple};
 pub use projected_differential_attention::{
     ProjectedDifferentialAttention, projected_differential_attention,
     projected_differential_attention_from_attributes,
