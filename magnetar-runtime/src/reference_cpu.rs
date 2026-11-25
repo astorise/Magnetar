@@ -1524,6 +1524,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         .id
         .features
         .insert(crate::operator::ATTENTION_LATENT_KV_FEATURE.to_string());
+    // Honours `token_selection` (`support-qwen38-flash-next`).
+    attention
+        .id
+        .features
+        .insert(crate::operator::ATTENTION_TOKEN_SELECTION_FEATURE.to_string());
     // Reads TurboQuant stores: they hold f32 values (`turboquant-kv-history`).
     attention
         .id
@@ -1595,7 +1600,12 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
             OperatorFamily::Attention,
         ),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
+        // Honours `output_gate_type` (Qwen4-Exp's sigmoid gate).
+        with_features(
+            "gated-delta-mixer",
+            OperatorFamily::LinearAlgebra,
+            &[crate::operator::GATED_DELTA_SIGMOID_GATE_FEATURE],
+        ),
         baseline_advertisement("gated-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("gated-residual-final", OperatorFamily::LinearAlgebra),
         baseline_advertisement("gated-residual-inject", OperatorFamily::Tensor),
@@ -3400,19 +3410,51 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                attention_with_value_width(
-                    &q,
-                    &k,
-                    &v,
-                    head_count,
-                    head_dimension,
-                    value_head_dimension,
-                    kv_head_count,
-                    window_size,
-                    causal,
-                    Self::attribute_float_opt(&invocation.attributes, "scale"),
-                )
-                .map_err(KernelError::from)?
+                // `support-qwen38-flash-next`: the fourth input lists the
+                // key positions each query reads.
+                if Self::attribute_bool(&invocation.attributes, "token_selection", false) {
+                    for unsupported in [
+                        "latent_kv_width",
+                        "value_head_dimension",
+                        "value_head_stride",
+                    ] {
+                        if invocation.attributes.contains_key(unsupported) {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "token_selection does not combine with {unsupported}"
+                                ),
+                            });
+                        }
+                    }
+                    let selection = self.input_tensor(invocation, 3)?;
+                    crate::operator_semantics::attention_over_selection(
+                        &q,
+                        &k,
+                        &v,
+                        &selection,
+                        head_count,
+                        head_dimension,
+                        kv_head_count,
+                        window_size,
+                        causal,
+                        Self::attribute_float_opt(&invocation.attributes, "scale"),
+                    )
+                    .map_err(KernelError::from)?
+                } else {
+                    attention_with_value_width(
+                        &q,
+                        &k,
+                        &v,
+                        head_count,
+                        head_dimension,
+                        value_head_dimension,
+                        kv_head_count,
+                        window_size,
+                        causal,
+                        Self::attribute_float_opt(&invocation.attributes, "scale"),
+                    )
+                    .map_err(KernelError::from)?
+                }
             }
             "softmax" => {
                 let input = self.input_tensor(invocation, 0)?;

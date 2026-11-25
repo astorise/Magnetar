@@ -10,6 +10,25 @@ use std::{error::Error, fmt};
 
 const MAX_ELEMENTS: usize = 67_108_864;
 
+/// The activation of the gate `z` that scales the normalized recurrence
+/// output: `silu` for Qwen3.5, and `silu` or `sigmoid` for Qwen4-Exp
+/// (`output_gate_type`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MixerOutputGate {
+    #[default]
+    Silu,
+    Sigmoid,
+}
+
+impl MixerOutputGate {
+    fn apply(self, value: f32) -> f32 {
+        match self {
+            Self::Silu => silu(value),
+            Self::Sigmoid => sigmoid(value),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MixerConfig {
     pub hidden: usize,
@@ -19,6 +38,7 @@ pub struct MixerConfig {
     pub value_dim: usize,
     pub conv_kernel: usize,
     pub norm_epsilon: f32,
+    pub output_gate: MixerOutputGate,
 }
 
 /// All matrices are contiguous checkpoint-order [output, input].
@@ -344,7 +364,10 @@ pub fn mixer_recurrence_f32(
             let inverse = (square_mean + config.norm_epsilon).sqrt().recip();
             for column in 0..config.value_dim {
                 normalized.push(
-                    row[column] * inverse * weights.norm[column] * silu(gates[head_start + column]),
+                    row[column]
+                        * inverse
+                        * weights.norm[column]
+                        * config.output_gate.apply(gates[head_start + column]),
                 );
             }
         }

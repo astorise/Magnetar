@@ -13,6 +13,28 @@ const SPLITMIX_M1: u64 = 0xBF58_476D_1CE4_E5B9;
 const SPLITMIX_M2: u64 = 0x94D0_49BB_1331_11EB;
 const PRIME_1: u64 = 10_007;
 
+/// Token ids held relative to `origin` (`id - origin`).
+fn relative_token_ids(
+    tensor: &HostTensor,
+    origin: i64,
+    what: &str,
+) -> Result<Vec<i64>, ReferenceCpuError> {
+    tensor
+        .data
+        .iter()
+        .map(|&value| {
+            let id = origin as f64 + f64::from(value);
+            if value.fract() == 0.0 && (0.0..16_777_216.0).contains(&id) {
+                Ok(id as i64)
+            } else {
+                Err(invalid(format!(
+                    "{what} must hold token ids relative to {origin}, got {value}"
+                )))
+            }
+        })
+        .collect()
+}
+
 /// An `ngram-embedding` node's attributes: the hash of one PLE layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NgramEmbedding {
@@ -195,9 +217,14 @@ fn token_ids(tensor: &HostTensor, what: &str) -> Result<Vec<i64>, ReferenceCpuEr
 }
 
 /// `inputs`: the token ids `[T]`, the `ngram_size - 1` tokens before them
-/// `[context_len]` (the layer's state; `eos_token_id` at a sequence's start)
-/// and the table `[rows, head_dim]`. Returns the embeddings `[T, heads *
-/// head_dim]`, each head's row concatenated, and the next context.
+/// `[context_len]` and the table `[rows, head_dim]`. Returns the embeddings
+/// `[T, heads * head_dim]`, each head's row concatenated, and the next
+/// context.
+///
+/// The context is the layer's state, held as each token's id minus
+/// `eos_token_id`: a new sequence's all-zero state is the `eos_token_id`
+/// fill a sequence starts from, which is what the Runtime gives every
+/// recurrent state.
 pub fn ngram_embedding(
     inputs: &[HostTensor],
     config: NgramEmbedding,
@@ -223,7 +250,7 @@ pub fn ngram_embedding(
     check(context, &[context_len as u64], "ngram-embedding context")?;
     check(table, &[rows, head_dim], "ngram-embedding table")?;
     let tokens_ids = token_ids(ids, "ngram-embedding ids")?;
-    let context_ids = token_ids(context, "ngram-embedding context")?;
+    let context_ids = relative_token_ids(context, config.eos_token_id, "ngram-embedding context")?;
     let heads = config.heads();
     let total: u64 = config.head_vocab_sizes().iter().sum();
     if total > rows {
@@ -244,7 +271,10 @@ pub fn ngram_embedding(
         .chain(&tokens_ids)
         .map(|&token| token as f32)
         .collect();
-    let next = history[history.len() - context_len..].to_vec();
+    let next: Vec<f32> = history[history.len() - context_len..]
+        .iter()
+        .map(|token| token - config.eos_token_id as f32)
+        .collect();
     Ok([
         HostTensor::new([tokens, (heads * head_dim) as u64], out)?,
         HostTensor::new([context_len as u64], next)?,

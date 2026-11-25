@@ -1065,20 +1065,38 @@ pub(super) fn dispatch_first_native_graph_node(
         }
         "attention" => {
             // Five inputs: latent K and V and their key and value
-            // projections (`latent_kv_width`, `chunk-latent-prefills`).
-            if inputs.len() != 3 && inputs.len() != 5 {
+            // projections (`latent_kv_width`, `chunk-latent-prefills`); four
+            // with `token_selection`: the key positions each query reads
+            // (`support-qwen38-flash-next`).
+            let selection_form = matches!(
+                node.attributes.get("token_selection"),
+                Some(OperatorAttributeValue::Boolean(true))
+            );
+            let expected: &[usize] = if selection_form { &[4] } else { &[3, 5] };
+            if !expected.contains(&inputs.len()) {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 3 or 5 attention inputs"),
+                    reason: format!(
+                        "graph node '{node_id}' expects {} attention inputs",
+                        if selection_form {
+                            "4 (with token_selection)"
+                        } else {
+                            "3 or 5"
+                        }
+                    ),
                 });
             }
             let q = inputs.remove(0);
             let k = inputs.remove(0);
             let v = inputs.remove(0);
-            let latent_weights = (inputs.len() == 2).then(|| {
+            let extra = if selection_form {
+                super::dispatch::AttentionExtraInputs::Selection(inputs.remove(0))
+            } else if inputs.len() == 2 {
                 let w_k = inputs.remove(0);
                 let w_v = inputs.remove(0);
-                [w_k, w_v]
-            });
+                super::dispatch::AttentionExtraInputs::LatentWeights([w_k, w_v])
+            } else {
+                super::dispatch::AttentionExtraInputs::None
+            };
             let key_count = node
                 .inputs
                 .get(1)
@@ -1088,7 +1106,7 @@ pub(super) fn dispatch_first_native_graph_node(
                 ctx,
                 node_id,
                 [q, k, v],
-                latent_weights,
+                extra,
                 architecture,
                 &node.attributes,
                 Some(output_target),

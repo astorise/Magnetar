@@ -792,8 +792,92 @@ pub struct ModelArchitectureConfig {
     /// same width, and the attention output is multiplied by the gate's
     /// sigmoid (`decoder-variants`, `1.13.0`).
     pub attention_output_gate: bool,
+    /// Residual streams, n-gram embeddings, token selection and the linear
+    /// layers' gate activation (`model-config` `1.14.0`,
+    /// `support-qwen38-flash-next`). Every form is absent by default.
+    pub decoder_extensions: DecoderExtensions,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
+}
+
+/// The decoder forms of `model-config` `1.14.0` (Qwen4-Exp). Each is a
+/// separate function of the Capability, so a Component that does not read
+/// one a checkpoint declares is refused instead of running without it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DecoderExtensions {
+    /// The decoder carries several residual streams mixed by learned gates
+    /// (`hyper-connections`).
+    pub hyper_connections: Option<HyperConnectionConfig>,
+    /// Hashed n-gram embeddings added in some layers (`ngram-embeddings`).
+    pub ngram_embeddings: Option<NgramEmbeddingConfig>,
+    /// Full-attention layers read the keys a token indexer selects
+    /// (`token-selection`).
+    pub token_selection: Option<TokenSelectionConfig>,
+    /// The linear-attention layers' output gate is `sigmoid` instead of
+    /// `silu` (`linear-attention-gate`).
+    pub sigmoid_linear_gate: bool,
+}
+
+impl DecoderExtensions {
+    /// Whether any form is declared.
+    pub fn is_declared(&self) -> bool {
+        self.hyper_connections.is_some()
+            || self.ngram_embeddings.is_some()
+            || self.token_selection.is_some()
+            || self.sigmoid_linear_gate
+    }
+}
+
+/// `model-config`'s `hyper-connection-config` (`1.14.0`): the embedding is
+/// repeated `streams` times along the feature axis and every block reads a
+/// learned mix of the streams and writes back to each through a gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HyperConnectionConfig {
+    /// Residual streams (`hc_count`).
+    pub streams: u32,
+    /// Rank of the low-rank input mixer.
+    pub lowrank: u32,
+}
+
+/// `model-config`'s `ngram-embedding-config` (`1.14.0`): a per-layer
+/// embedding of hashed token n-grams.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NgramEmbeddingConfig {
+    /// One entry per decoder layer: `true` where the layer adds its
+    /// embedding before its first block.
+    pub layers: Vec<bool>,
+    /// Width of the concatenated heads' embeddings.
+    pub embedding_dim: u64,
+    /// Kernel of the dilated depthwise convolution.
+    pub conv_kernel: u32,
+    /// The largest n-gram order.
+    pub ngram_size: u32,
+    /// Independently hashed heads per n-gram order.
+    pub heads_per_ngram: u32,
+    /// Lower bound of each head's prime vocabulary.
+    pub vocabulary_base: u64,
+    /// The combined vocabulary is padded to a multiple of this.
+    pub vocabulary_multiple: u32,
+    /// Seed of the hash multipliers.
+    pub seed: u64,
+    /// The token that delimits segments.
+    pub eos_token: u32,
+}
+
+/// `model-config`'s `token-selection-config` (`1.14.0`): an indexer picks,
+/// for each query, the blocks of keys a full-attention layer reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenSelectionConfig {
+    /// Indexer query heads.
+    pub heads: u32,
+    /// Indexer key heads (1).
+    pub key_heads: u32,
+    /// Width of an indexer head.
+    pub head_dim: u64,
+    /// Tokens selected from complete blocks.
+    pub budget: u32,
+    /// Tokens averaged into one block.
+    pub compress_ratio: u32,
 }
 
 /// The gated-delta linear attention layers of a hybrid decoder, mirroring
@@ -960,6 +1044,53 @@ pub enum ExpertNormalization {
 }
 
 impl ModelArchitectureConfig {
+    /// The `1.14.0` forms' structural constraints.
+    fn validate_decoder_extensions(&self) -> Result<(), ModelArtifactError> {
+        let invalid = |message: String| ModelArtifactError::InvalidManifest { message };
+        let extensions = &self.decoder_extensions;
+        if let Some(connections) = extensions.hyper_connections
+            && (connections.streams < 2 || connections.lowrank == 0)
+        {
+            return Err(invalid(format!(
+                "hyper-connections need at least two streams and a positive rank, got {} and {}",
+                connections.streams, connections.lowrank
+            )));
+        }
+        if let Some(ngram) = &extensions.ngram_embeddings {
+            let heads =
+                u64::from(ngram.ngram_size.saturating_sub(1)) * u64::from(ngram.heads_per_ngram);
+            if ngram.layers.len() != self.num_hidden_layers as usize
+                || heads == 0
+                || ngram.embedding_dim == 0
+                || ngram.embedding_dim % heads != 0
+                || ngram.conv_kernel == 0
+                || ngram.vocabulary_multiple == 0
+            {
+                return Err(invalid(format!(
+                    "n-gram embeddings need one entry per layer and an embedding width \
+                     divisible by their {heads} heads, got {} entries and width {}",
+                    ngram.layers.len(),
+                    ngram.embedding_dim
+                )));
+            }
+        }
+        if let Some(selection) = extensions.token_selection
+            && (selection.heads == 0
+                || selection.key_heads != 1
+                || selection.head_dim == 0
+                || selection.budget == 0
+                || selection.compress_ratio == 0
+                || selection.budget % selection.compress_ratio != 0)
+        {
+            return Err(invalid(format!(
+                "token selection needs one key head and a budget divisible by the block \
+                 size, got {} key head(s), budget {}, block {}",
+                selection.key_heads, selection.budget, selection.compress_ratio
+            )));
+        }
+        Ok(())
+    }
+
     /// Structural consistency checks independent of any concrete tensor
     /// inventory (Decision 5's "Runtime validates generic structural
     /// constraints"): every count must be non-zero, `num_attention_heads`
@@ -979,6 +1110,7 @@ impl ModelArchitectureConfig {
                 ),
             });
         }
+        self.validate_decoder_extensions()?;
         if let Some(activation) = self.hidden_activation.as_deref()
             && !matches!(activation, "silu" | "gelu" | "gelu_pytorch_tanh" | "relu")
         {
