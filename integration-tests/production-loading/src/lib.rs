@@ -61,6 +61,8 @@ mod tests_qwen3_5_logits;
 #[cfg(test)]
 mod tests_qwen3_5_real_checkpoint;
 #[cfg(test)]
+mod tests_qwen4_exp_logits;
+#[cfg(test)]
 mod tests_real_checkpoint_multi_gpu_segment;
 #[cfg(test)]
 mod tests_real_checkpoint_numerics;

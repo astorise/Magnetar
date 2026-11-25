@@ -327,3 +327,78 @@ fn latent_attention_and_expert_declarations_validate_against_the_architecture() 
         groups.score = ExpertGroupScore::TopTwoSum;
     });
 }
+
+/// `support-qwen38-flash-next`: the `1.14.0` forms validate against the
+/// architecture, and each inconsistent declaration is refused.
+#[test]
+fn decoder_extensions_validate_against_the_architecture() {
+    let valid = ModelArchitectureConfig {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 4,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 16,
+        vocab_size: 100,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+        decoder_extensions: DecoderExtensions {
+            hyper_connections: Some(HyperConnectionConfig {
+                streams: 4,
+                lowrank: 8,
+            }),
+            ngram_embeddings: Some(NgramEmbeddingConfig {
+                layers: vec![false, true, false, false],
+                embedding_dim: 32,
+                conv_kernel: 4,
+                ngram_size: 3,
+                heads_per_ngram: 8,
+                vocabulary_base: 1000,
+                vocabulary_multiple: 128,
+                seed: 1234,
+                eos_token: 2,
+            }),
+            token_selection: Some(TokenSelectionConfig {
+                heads: 2,
+                key_heads: 1,
+                head_dim: 16,
+                budget: 32,
+                compress_ratio: 4,
+            }),
+            sigmoid_linear_gate: true,
+        },
+        ..Default::default()
+    };
+    valid.validate().unwrap();
+    assert!(valid.decoder_extensions.is_declared());
+    assert!(!DecoderExtensions::default().is_declared());
+    let refused = |change: fn(&mut DecoderExtensions)| {
+        let mut config = valid.clone();
+        change(&mut config.decoder_extensions);
+        assert!(
+            config.validate().is_err(),
+            "{:?}",
+            config.decoder_extensions
+        );
+    };
+    // A single stream is no hyper-connection, and the rank is positive.
+    refused(|extensions| extensions.hyper_connections.as_mut().unwrap().streams = 1);
+    refused(|extensions| extensions.hyper_connections.as_mut().unwrap().lowrank = 0);
+    // One entry per layer; the embedding splits evenly over its heads.
+    refused(|extensions| {
+        extensions
+            .ngram_embeddings
+            .as_mut()
+            .unwrap()
+            .layers
+            .pop()
+            .map(drop)
+            .unwrap()
+    });
+    refused(|extensions| extensions.ngram_embeddings.as_mut().unwrap().embedding_dim = 30);
+    refused(|extensions| extensions.ngram_embeddings.as_mut().unwrap().conv_kernel = 0);
+    // The indexer has one key head and a budget of whole blocks.
+    refused(|extensions| extensions.token_selection.as_mut().unwrap().key_heads = 2);
+    refused(|extensions| extensions.token_selection.as_mut().unwrap().budget = 30);
+    refused(|extensions| extensions.token_selection.as_mut().unwrap().compress_ratio = 0);
+}

@@ -368,6 +368,20 @@ pub const ATTENTION_VALUE_HEAD_STRIDE_FEATURE: &str = "attention-value-head-stri
 /// (`chunk-latent-prefills`).
 pub const ATTENTION_LATENT_KV_FEATURE: &str = "attention-latent-kv";
 
+/// Kernel feature an `attention` Kernel advertises when it honours
+/// `token_selection`: a fourth input lists, for each query row, the
+/// ascending key positions the query may read (`-1` pads a row), and the
+/// query reads no other key (`support-qwen38-flash-next`: the token
+/// selection of `qsa-select`).
+pub const ATTENTION_TOKEN_SELECTION_FEATURE: &str = "attention-token-selection";
+
+/// Kernel feature a `gated-delta-mixer` Kernel advertises when it honours
+/// `output_gate_type = "sigmoid"`: the gated normalization multiplies by
+/// `sigmoid(z)` instead of `silu(z)` (Qwen4-Exp's linear-attention layers,
+/// `support-qwen38-flash-next`). A Kernel that ignored it would scale
+/// every mixer output by the wrong gate.
+pub const GATED_DELTA_SIGMOID_GATE_FEATURE: &str = "gated-delta-sigmoid-output-gate";
+
 /// Kernel feature a `concat` Kernel advertises when it honours `axis =
 /// "heads"`: the inputs joined head by head instead of row after row.
 pub const CONCAT_HEADS_FEATURE: &str = "concat-heads";
@@ -414,8 +428,21 @@ pub fn required_kernel_features(
             if present("value_head_stride") {
                 features.push(ATTENTION_VALUE_HEAD_STRIDE_FEATURE);
             }
-            if present("latent_kv_width") || input_count > 3 {
+            // With `token_selection` the fourth input is the selection,
+            // not a latent weight.
+            if present("token_selection") {
+                features.push(ATTENTION_TOKEN_SELECTION_FEATURE);
+            }
+            if present("latent_kv_width") || (input_count > 3 && !present("token_selection")) {
                 features.push(ATTENTION_LATENT_KV_FEATURE);
+            }
+        }
+        "gated-delta-mixer" => {
+            if matches!(
+                attributes.get("output_gate_type"),
+                Some(OperatorAttributeValue::String(kind)) if kind != "silu"
+            ) {
+                features.push(GATED_DELTA_SIGMOID_GATE_FEATURE);
             }
         }
         "concat" => {
@@ -1983,6 +2010,10 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "epsilon",
                 OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "output_gate_type",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
             ),
         "mamba2-mixer" => OperatorAttributeSchema::default()
             .with_rule(
@@ -2129,6 +2160,12 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "latent_kv_width",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // The fourth input lists the key positions each query reads
+            // (`support-qwen38-flash-next`, `qsa-select`).
+            .with_rule(
+                "token_selection",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
             ),
         // `axis = "heads"` joins the inputs head by head (see [`ConcatAxis`]):
         // `head_count` heads, the second input holding `second_head_count`

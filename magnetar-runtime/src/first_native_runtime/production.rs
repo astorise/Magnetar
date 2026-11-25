@@ -40,7 +40,7 @@ pub(super) const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub(super) const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:136e96acfb84b8d8da46461f945c21d0c1a4be161a6e7b0a8a3e104635ae34e8";
+    "sha256:924c12742e3b2044de8461b7093d16db28389efffea4476ab6ee324f2ff0371b";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -213,7 +213,21 @@ pub(super) fn weight_shapes_for_architecture_config(
         "token_embedding".to_string(),
         vec![config.vocab_size, config.hidden_size],
     );
-    shapes.insert("final_norm".to_string(), vec![config.hidden_size]);
+    // With residual streams (`support-qwen38-flash-next`) the final mix of
+    // the streams replaces the final norm.
+    let hyper = config.decoder_extensions.hyper_connections;
+    match hyper {
+        None => {
+            shapes.insert("final_norm".to_string(), vec![config.hidden_size]);
+        }
+        Some(connections) => insert_hyper_shapes(
+            &mut shapes,
+            "final_hyper",
+            config.hidden_size,
+            connections,
+            false,
+        ),
+    }
     shapes.insert(
         "lm_head".to_string(),
         vec![config.hidden_size, config.vocab_size],
@@ -235,8 +249,32 @@ pub(super) fn weight_shapes_for_architecture_config(
         let own_v = own_kv && spec.is_none_or(|spec| !spec.value_from_key);
         let q_dim = config.num_attention_heads as u64 * head_dim;
         let kv_dim = kv_heads as u64 * head_dim;
-        shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
-        shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
+        match hyper {
+            None => {
+                shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
+                shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
+            }
+            // Each block reads its own mix of the streams and writes back
+            // to every stream.
+            Some(connections) => {
+                for block in ["attn_hyper", "mlp_hyper"] {
+                    insert_hyper_shapes(
+                        &mut shapes,
+                        &format!("{prefix}.{block}"),
+                        config.hidden_size,
+                        connections,
+                        true,
+                    );
+                }
+            }
+        }
+        // An n-gram embedding added before the layer's first block.
+        if let (Some(ngram), Some(connections)) =
+            (config.decoder_extensions.ngram_embeddings.as_ref(), hyper)
+            && ngram.layers.get(layer as usize).copied().unwrap_or(false)
+        {
+            insert_ngram_shapes(&mut shapes, &prefix, config, connections, layer);
+        }
         // A gated-delta linear-attention layer (`support-qwen38-flash-next`):
         // the mixer's projections in checkpoint `[out, in]` order.
         if let Some(linear) = config
@@ -295,10 +333,98 @@ pub(super) fn weight_shapes_for_architecture_config(
                 shapes.insert(format!("{prefix}.self_attn.q_norm"), vec![head_dim]);
                 shapes.insert(format!("{prefix}.self_attn.k_norm"), vec![head_dim]);
             }
+            // A token indexer reads the layer's input through one
+            // projection for its queries and its single key head.
+            if let Some(selection) = config.decoder_extensions.token_selection {
+                let width = u64::from(selection.heads + selection.key_heads) * selection.head_dim;
+                shapes.insert(
+                    format!("{prefix}.self_attn.index_qk_proj"),
+                    vec![config.hidden_size, width],
+                );
+                shapes.insert(
+                    format!("{prefix}.self_attn.index_q_norm"),
+                    vec![selection.head_dim],
+                );
+                shapes.insert(
+                    format!("{prefix}.self_attn.index_k_norm"),
+                    vec![selection.head_dim],
+                );
+            }
         }
         insert_mlp_shapes(&mut shapes, &prefix, config, layer, intermediate_size);
     }
     shapes
+}
+
+/// One gated residual's weights, in checkpoint `[out, in]` order: its
+/// norm over the streams, the low-rank input mixer and, for a block's
+/// (not the final mix's), the injection weights.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn insert_hyper_shapes(
+    shapes: &mut BTreeMap<String, Vec<u64>>,
+    prefix: &str,
+    hidden: u64,
+    connections: crate::HyperConnectionConfig,
+    inject: bool,
+) {
+    let streams = u64::from(connections.streams);
+    let width = streams * hidden;
+    let rank = u64::from(connections.lowrank);
+    shapes.insert(format!("{prefix}.norm"), vec![width]);
+    shapes.insert(format!("{prefix}.down"), vec![rank, width]);
+    shapes.insert(format!("{prefix}.up"), vec![width, rank]);
+    if inject {
+        shapes.insert(format!("{prefix}.inject"), vec![streams, width]);
+    }
+}
+
+/// A layer's n-gram embedding: the hashed table (the heads' vocabularies
+/// one after another, padded to the declared multiple), the projections of
+/// the embedding into the streams' gate and the value, the three norms and
+/// the depthwise convolution, in checkpoint `[out, in]` order.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn insert_ngram_shapes(
+    shapes: &mut BTreeMap<String, Vec<u64>>,
+    prefix: &str,
+    config: &ModelArchitectureConfig,
+    connections: crate::HyperConnectionConfig,
+    layer: u32,
+) {
+    let Some(ngram) = config.decoder_extensions.ngram_embeddings.as_ref() else {
+        return;
+    };
+    let hash = crate::operator_semantics::NgramEmbedding {
+        ngram_size: ngram.ngram_size as usize,
+        heads_per_ngram: ngram.heads_per_ngram as usize,
+        vocab_size: config.vocab_size,
+        vocab_base: ngram.vocabulary_base,
+        layer_index: ngram.layers[..layer as usize]
+            .iter()
+            .filter(|layer| **layer)
+            .count() as u64,
+        seed: ngram.seed,
+        eos_token_id: 0,
+    };
+    let heads = hash.heads() as u64;
+    let head_dim = ngram.embedding_dim / heads;
+    let rows = hash
+        .head_vocab_sizes()
+        .iter()
+        .sum::<u64>()
+        .next_multiple_of(u64::from(ngram.vocabulary_multiple));
+    let hidden = config.hidden_size;
+    let width = u64::from(connections.streams) * hidden;
+    for (name, shape) in [
+        ("table", vec![rows, head_dim]),
+        ("key", vec![width, ngram.embedding_dim]),
+        ("value", vec![hidden, ngram.embedding_dim]),
+        ("norm_key", vec![width]),
+        ("norm_query", vec![width]),
+        ("norm_conv", vec![width]),
+        ("conv1d", vec![width, u64::from(ngram.conv_kernel)]),
+    ] {
+        shapes.insert(format!("{prefix}.ple.{name}"), shape);
+    }
 }
 
 /// A layer's ordinary query, key, value and output projections (and biases).
@@ -483,6 +609,7 @@ pub(super) fn architecture_config_from_first_native_model_config(
         linear_attention: config.linear_attention.clone(),
         norm_weight_offset: config.norm_weight_offset,
         attention_output_gate: config.attention_output_gate,
+        decoder_extensions: config.decoder_extensions.clone(),
         moe_layers: config.moe_layers.clone(),
         expert_routing: config.expert_routing,
         bos_token_id: None,
@@ -545,6 +672,7 @@ pub(super) fn first_native_model_config_from_architecture_config(
         linear_attention: config.linear_attention.clone(),
         norm_weight_offset: config.norm_weight_offset,
         attention_output_gate: config.attention_output_gate,
+        decoder_extensions: config.decoder_extensions.clone(),
         moe_layers: config.moe_layers.clone(),
         expert_routing: config.expert_routing,
         require_bos: false,

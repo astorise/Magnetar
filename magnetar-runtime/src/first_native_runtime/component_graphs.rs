@@ -50,15 +50,17 @@ pub(super) fn qwen_real_component_runtime()
     // `rope-scaling` (`1.4.0`). The current Component also verifies the
     // checkpoint activation exposed by `1.8.0`. `1.13.0`
     // (`support-qwen38-flash-next`): Qwen3.5's hybrid decoder, through
-    // `linear-attention`, `decoder-variants` and recurrent resources.
+    // `linear-attention`, `decoder-variants` and recurrent resources;
+    // `1.14.0`: Qwen4-Exp's residual streams, token selection and linear
+    // gate.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.13.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.14.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.13.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.14.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -299,10 +301,11 @@ pub fn register_inference_component_artifact(
     // `1.7.0` (`express-latent-attention-forms`) adds latent attention,
     // mixed expert layers, expert routing and the YaRN RoPE case.
     // `1.13.0` (`support-qwen38-flash-next`) adds `linear-attention` and
-    // `decoder-variants`.
+    // `decoder-variants`; `1.14.0` adds `hyper-connections`,
+    // `ngram-embeddings`, `token-selection` and `linear-attention-gate`.
     for version in [
         "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
-        "1.12.0", "1.13.0",
+        "1.12.0", "1.13.0", "1.14.0",
     ] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
@@ -1242,6 +1245,10 @@ pub(super) fn qwen_weight_name_in_layer_range(
     match tensor_name {
         "token_embedding" => start_layer == 0,
         "final_norm" | "lm_head" => end_layer == num_hidden_layers,
+        // Qwen4-Exp's final mix of its residual streams.
+        "final_hyper.norm" | "final_hyper.down" | "final_hyper.up" => {
+            end_layer == num_hidden_layers
+        }
         _ => false,
     }
 }

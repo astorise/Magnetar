@@ -102,6 +102,7 @@ fn inputs(
 fn graph(
     case: &Case,
     tensors: &[HostTensor],
+    output_gate_type: Option<&str>,
 ) -> (ExecutionGraph, BTreeMap<TensorEdgeId, HostTensor>) {
     let mut graph = ExecutionGraph::new(
         ExecutionGraphId::new("gated-delta-mixer"),
@@ -139,11 +140,25 @@ fn graph(
     for (name, value) in attributes(case) {
         node = node.with_attribute(name, value);
     }
+    if let Some(kind) = output_gate_type {
+        node = node.with_attribute(
+            "output_gate_type",
+            OperatorAttributeValue::String(kind.into()),
+        );
+    }
     (graph.with_node(node), bindings)
 }
 
 fn run(case: &Case, tensors: Vec<HostTensor>) -> [HostTensor; 3] {
-    let (graph, bindings) = graph(case, &tensors);
+    run_with_gate(case, tensors, None)
+}
+
+fn run_with_gate(
+    case: &Case,
+    tensors: Vec<HostTensor>,
+    output_gate_type: Option<&str>,
+) -> [HostTensor; 3] {
+    let (graph, bindings) = graph(case, &tensors, output_gate_type);
     graph.validate(&initial_operator_catalog()).unwrap();
     let fixture = e2e_fixture().unwrap();
     let mut runtime = build_runtime_trusting_fixture(&fixture);
@@ -246,7 +261,7 @@ fn recurrent_graph(
     case: &Case,
     tensors: &[HostTensor],
 ) -> (ExecutionGraph, BTreeMap<TensorEdgeId, HostTensor>) {
-    let (mut graph, mut bindings) = graph(case, tensors);
+    let (mut graph, mut bindings) = graph(case, tensors, None);
     for (slot, input, output) in [
         ("conv", "input.1", "output.convolution"),
         ("delta", "input.2", "output.recurrent"),
@@ -377,7 +392,7 @@ fn gated_delta_state_lives_in_the_runtime_across_steps() {
 fn gated_delta_rejects_bad_shapes_and_mask() {
     let case = cases().remove(0);
     let tensors = inputs(&case, 0, 1, None);
-    let (graph, _) = graph(&case, &tensors);
+    let (graph, _) = graph(&case, &tensors, None);
     graph.validate(&initial_operator_catalog()).unwrap();
     let mut invalid = graph.clone();
     invalid
@@ -428,7 +443,7 @@ fn gated_delta_rejects_bad_shapes_and_mask() {
 fn gated_delta_graph_rejects_live_state_alias() {
     let case = cases().remove(0);
     let tensors = inputs(&case, 0, 1, None);
-    let (mut graph, mut bindings) = graph(&case, &tensors);
+    let (mut graph, mut bindings) = graph(&case, &tensors, None);
     let original = TensorEdgeId::new("input.2");
     let colliding = TensorEdgeId::new("edge.output.recurrent");
     let mut edge = graph.edges.remove(&original).unwrap();
@@ -498,7 +513,7 @@ fn gated_delta_graph_failure_releases_all_three_outputs() {
     let case = cases().remove(0);
     let mut tensors = inputs(&case, 0, 1, None);
     tensors[12].data[0] = 2.0;
-    let (graph, bindings) = graph(&case, &tensors);
+    let (graph, bindings) = graph(&case, &tensors, None);
     graph.validate(&initial_operator_catalog()).unwrap();
     let fixture = e2e_fixture().unwrap();
     let mut runtime = build_runtime_trusting_fixture(&fixture);
@@ -716,4 +731,46 @@ fn gated_delta_mask_is_optional() {
             assert_eq!(a.data, b.data);
         }
     }
+}
+
+/// `output_gate_type` reaches the Reference CPU Provider through the
+/// graph: `silu` is the default, `sigmoid` gives the shared semantics'
+/// values, and another activation fails the node
+/// (`support-qwen38-flash-next`, Qwen4-Exp's linear attention).
+#[test]
+fn gated_delta_graph_honours_the_output_gate_type() {
+    use crate::operator_semantics::{GatedDeltaMixer, MixerOutputGate, gated_delta_mixer};
+    let case = cases().into_iter().next().unwrap();
+    let tensors = inputs(&case, 0, 2, None);
+    let default = run(&case, tensors.clone());
+    let silu = run_with_gate(&case, tensors.clone(), Some("silu"));
+    for (a, b) in default.iter().zip(&silu) {
+        assert_eq!(a.data, b.data, "silu is the default gate");
+    }
+    let sigmoid = run_with_gate(&case, tensors.clone(), Some("sigmoid"));
+    let expected = gated_delta_mixer(
+        &tensors,
+        GatedDeltaMixer {
+            key_heads: case.key_heads,
+            value_heads: case.value_heads,
+            key_dim: case.key_dim,
+            value_dim: case.value_dim,
+            conv_kernel: case.kernel,
+            epsilon: case.epsilon as f32,
+            output_gate: MixerOutputGate::Sigmoid,
+        },
+    )
+    .unwrap();
+    for (name, (actual, expected)) in ["activation", "convolution", "recurrent"]
+        .into_iter()
+        .zip(sigmoid.iter().zip(&expected))
+    {
+        assert_eq!(actual.data, expected.data, "sigmoid gate, {name}");
+    }
+    assert_ne!(
+        sigmoid[0].data, silu[0].data,
+        "the two gates give different activations"
+    );
+    assert_eq!(sigmoid[1].data, silu[1].data, "the convolution state");
+    assert_eq!(sigmoid[2].data, silu[2].data, "the recurrent state");
 }

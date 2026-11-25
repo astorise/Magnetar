@@ -19,8 +19,9 @@ use std::sync::Mutex;
 use crate::component::{ComponentError, ComponentValue, HostCapability};
 use crate::{
     ExpertGroupScore, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
-    LatentAttentionConfig, LayerSpec, LinearAttentionConfig, MixtureOfExpertsConfig,
-    ModelArchitectureConfig, RopeFrequencyScaling,
+    HyperConnectionConfig, LatentAttentionConfig, LayerSpec, LinearAttentionConfig,
+    MixtureOfExpertsConfig, ModelArchitectureConfig, NgramEmbeddingConfig, RopeFrequencyScaling,
+    TokenSelectionConfig,
 };
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
@@ -67,9 +68,13 @@ pub struct ModelConfigCapability {
 /// when the bound configuration declares one, a Component must have read
 /// it before its graph is accepted. Activation must always be read, so a
 /// Component can distinguish an unknown activation from a supported one.
-const FEATURE_FUNCTIONS: [&str; 12] = [
+const FEATURE_FUNCTIONS: [&str; 16] = [
     "linear-attention",
     "decoder-variants",
+    "hyper-connections",
+    "ngram-embeddings",
+    "token-selection",
+    "linear-attention-gate",
     "layer-layout",
     "options",
     "multi-head-latent-attention",
@@ -203,6 +208,10 @@ impl ModelConfigCapability {
                     "encoder-config" => entry.encoder.is_some(),
                     "linear-attention" => config.linear_attention.is_some(),
                     "decoder-variants" => decoder_variants_declared(config),
+                    "hyper-connections" => config.decoder_extensions.hyper_connections.is_some(),
+                    "ngram-embeddings" => config.decoder_extensions.ngram_embeddings.is_some(),
+                    "token-selection" => config.decoder_extensions.token_selection.is_some(),
+                    "linear-attention-gate" => config.decoder_extensions.sigmoid_linear_gate,
                     // Even an absent activation is meaningful: a fixed-activation
                     // decoder must see and reject it instead of guessing.
                     "hidden-activation" => true,
@@ -398,6 +407,76 @@ fn encode_decoder_variants(config: &ModelArchitectureConfig) -> ComponentValue {
             field(
                 "attention-output-gate",
                 ComponentValue::Bool(config.attention_output_gate),
+            ),
+        ]))
+    }))
+}
+
+/// `option<hyper-connection-config>` (`1.14.0`).
+fn encode_hyper_connections(connections: Option<HyperConnectionConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(connections.map(|connections| {
+        Box::new(ComponentValue::Record(vec![
+            field("streams", ComponentValue::U32(connections.streams)),
+            field("lowrank", ComponentValue::U32(connections.lowrank)),
+        ]))
+    }))
+}
+
+/// `option<ngram-embedding-config>` (`1.14.0`).
+fn encode_ngram_embeddings(ngram: Option<&NgramEmbeddingConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(ngram.map(|ngram| {
+        Box::new(ComponentValue::Record(vec![
+            field(
+                "layers",
+                ComponentValue::List(
+                    ngram
+                        .layers
+                        .iter()
+                        .map(|&layer| ComponentValue::Bool(layer))
+                        .collect(),
+                ),
+            ),
+            field(
+                "embedding-dim",
+                ComponentValue::S64(ngram.embedding_dim as i64),
+            ),
+            field("conv-kernel", ComponentValue::U32(ngram.conv_kernel)),
+            field("ngram-size", ComponentValue::U32(ngram.ngram_size)),
+            field(
+                "heads-per-ngram",
+                ComponentValue::U32(ngram.heads_per_ngram),
+            ),
+            field(
+                "vocabulary-base",
+                ComponentValue::S64(ngram.vocabulary_base as i64),
+            ),
+            field(
+                "vocabulary-multiple",
+                ComponentValue::U32(ngram.vocabulary_multiple),
+            ),
+            field("seed", ComponentValue::S64(ngram.seed as i64)),
+            field("eos-token", ComponentValue::U32(ngram.eos_token)),
+        ]))
+    }))
+}
+
+/// `option<token-selection-config>` (`1.14.0`).
+fn encode_token_selection(selection: Option<TokenSelectionConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(selection.map(|selection| {
+        Box::new(ComponentValue::Record(vec![
+            field("heads", ComponentValue::U32(selection.heads)),
+            field("key-heads", ComponentValue::U32(selection.key_heads)),
+            field(
+                "head-dimension",
+                ComponentValue::S64(selection.head_dim as i64),
+            ),
+            field("budget", ComponentValue::U32(selection.budget)),
+            field(
+                "compress-ratio",
+                ComponentValue::U32(selection.compress_ratio),
             ),
         ]))
     }))
@@ -639,6 +718,10 @@ impl HostCapability for ModelConfigCapability {
             | "encoder-config"
             | "linear-attention"
             | "decoder-variants"
+            | "hyper-connections"
+            | "ngram-embeddings"
+            | "token-selection"
+            | "linear-attention-gate"
             | "rope-layers"
             | "hidden-activation" => {
                 if !arguments.is_empty() {
@@ -668,6 +751,21 @@ impl HostCapability for ModelConfigCapability {
                     "encoder-config" => encode_encoder_config(entry.encoder.as_ref()),
                     "linear-attention" => encode_linear_attention(config.linear_attention.as_ref()),
                     "decoder-variants" => encode_decoder_variants(config),
+                    "hyper-connections" => {
+                        encode_hyper_connections(config.decoder_extensions.hyper_connections)
+                    }
+                    "ngram-embeddings" => {
+                        encode_ngram_embeddings(config.decoder_extensions.ngram_embeddings.as_ref())
+                    }
+                    "token-selection" => {
+                        encode_token_selection(config.decoder_extensions.token_selection)
+                    }
+                    "linear-attention-gate" => ComponentValue::Option(
+                        config
+                            .decoder_extensions
+                            .sigmoid_linear_gate
+                            .then(|| Box::new(ComponentValue::Enum("sigmoid".into()))),
+                    ),
                     "multi-head-latent-attention" => {
                         encode_latent_attention(config.latent_attention.as_ref())
                     }

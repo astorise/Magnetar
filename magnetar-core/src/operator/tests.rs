@@ -715,6 +715,39 @@ fn required_kernel_features_name_only_non_baseline_forms() {
         ),
         vec![ATTENTION_SCALE_FEATURE]
     );
+    // A fourth input is a latent weight, unless it is the token selection.
+    assert_eq!(
+        required_kernel_features("attention", &none, 5),
+        vec![ATTENTION_LATENT_KV_FEATURE]
+    );
+    assert_eq!(
+        required_kernel_features(
+            "attention",
+            &attributes(&[("token_selection", OperatorAttributeValue::Boolean(true))]),
+            4
+        ),
+        vec![ATTENTION_TOKEN_SELECTION_FEATURE]
+    );
+    // The mixer's output gate is `silu` unless it says otherwise.
+    for (kind, expected) in [
+        (None, Vec::new()),
+        (Some("silu"), Vec::new()),
+        (Some("sigmoid"), vec![GATED_DELTA_SIGMOID_GATE_FEATURE]),
+    ] {
+        let given = kind
+            .map(|kind| {
+                attributes(&[(
+                    "output_gate_type",
+                    OperatorAttributeValue::String(kind.into()),
+                )])
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            required_kernel_features("gated-delta-mixer", &given, 12),
+            expected,
+            "output gate {kind:?}"
+        );
+    }
     assert_eq!(
         required_kernel_features(
             "embedding",
