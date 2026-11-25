@@ -1643,6 +1643,55 @@ fn linear_attention_layers_keep_no_kv_rows() {
     assert_eq!(config.kv_value_row_widths(), expected);
 }
 
+/// `support-qwen38-flash-next`: each full-attention layer of a model with a
+/// token indexer keeps its raw index keys in a KV store of its own, numbered
+/// after the decoder layers, holding keys of the indexer's head width and no
+/// values.
+#[test]
+fn indexed_layers_keep_their_index_keys_in_stores_after_the_decoder_layers() {
+    let mut config = small_config();
+    let layers = config.architecture.layer_count as usize;
+    let uniform = config.architecture.kv_head_count * config.architecture.head_dimension;
+    // No indexer: no stores.
+    assert_eq!(config.kv_layer_count(), layers);
+    assert!(config.indexed_layers().is_empty());
+    config.linear_attention = Some(crate::LinearAttentionConfig {
+        layers: (0..layers).map(|layer| layer % 2 == 0).collect(),
+        key_heads: 1,
+        value_heads: 1,
+        key_head_dim: 2,
+        value_head_dim: 2,
+        conv_kernel: 2,
+    });
+    config.decoder_extensions.token_selection = Some(crate::TokenSelectionConfig {
+        heads: 2,
+        key_heads: 1,
+        head_dim: 8,
+        budget: 8,
+        compress_ratio: 2,
+    });
+    // The odd layers are full attention.
+    let indexed: Vec<usize> = (0..layers).filter(|layer| layer % 2 == 1).collect();
+    assert_eq!(config.indexed_layers(), indexed);
+    assert_eq!(config.kv_layer_count(), layers + indexed.len());
+    let mut keys: Vec<Option<u64>> = (0..layers)
+        .map(|layer| (layer % 2 == 1).then_some(uniform))
+        .collect();
+    let mut values = keys.clone();
+    keys.extend(indexed.iter().map(|_| Some(8)));
+    values.extend(indexed.iter().map(|_| Some(0)));
+    assert_eq!(config.kv_row_widths(), keys);
+    assert_eq!(config.kv_value_row_widths(), values);
+    // One key head each.
+    let dimensions = config.kv_head_dimensions();
+    assert_eq!(dimensions.len(), config.kv_layer_count());
+    assert!(
+        dimensions[layers..]
+            .iter()
+            .all(|dims| *dims == Some((8, 0)))
+    );
+}
+
 /// `per-layer-kv-geometry`: a layered artifact's tensor inventory and shapes
 /// are checked against each layer's own geometry. A layer reusing an earlier
 /// layer's K/V has no K/V projections and one deriving V from K no V

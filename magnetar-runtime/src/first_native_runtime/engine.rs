@@ -1104,7 +1104,7 @@ impl E2eRuntimeModelExecutionEngine {
             },
             compatibility.clone(),
             KvCacheLayoutMetadata::contiguous(
-                self.fixture.config.architecture.layer_count as u32,
+                self.fixture.config.kv_layer_count() as u32,
                 self.fixture.config.architecture.kv_head_count as u32,
                 self.fixture.config.architecture.head_dimension as u32,
                 request
@@ -1957,7 +1957,7 @@ impl E2eRuntimeModelExecutionEngine {
                 .provider
                 .unwrap_or_else(|| ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
             if let Ok(provider) = resolve_kernel_execution_provider(runtime, &binding) {
-                for layer in 0..self.fixture.config.architecture.layer_count {
+                for layer in 0..self.fixture.config.kv_layer_count() as u64 {
                     for role in ["k", "v"] {
                         for suffix in if prefill {
                             &["pending", "store"][..]

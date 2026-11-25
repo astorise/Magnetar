@@ -1802,7 +1802,9 @@ pub(super) fn execute_first_native_graph_nodes(
         bounded_kv_edges: BTreeMap::new(),
         node_events,
     };
-    let layer_count = fixture.config.architecture.layer_count as usize;
+    // KV stores: the decoder layers, then one index store per indexed layer.
+    let layer_count = fixture.config.kv_layer_count();
+    let decoder_layer_count = fixture.config.architecture.layer_count as usize;
     // Resource-based intermediates (Correctif 5): `bindings` never itself
     // holds tensor bytes. Every graph edge's live value lives exclusively in
     // the registered Provider's storage, keyed by `TensorResourceId`; this
@@ -2633,10 +2635,13 @@ pub(super) fn execute_first_native_graph_nodes(
                 reason: format!("first-native graph produced no K state for layer {layer}"),
             })?;
         // A latent history's rows hold the values too: its layer writes K
-        // only (`cache-latent-attention-history`).
+        // only (`cache-latent-attention-history`); so does an index store,
+        // which keeps keys alone.
         let v = match layer_v[layer].take() {
             Some(v) => v,
-            None if fixture.config.latent_attention.is_some() => k.clone(),
+            None if fixture.config.latent_attention.is_some() || layer >= decoder_layer_count => {
+                k.clone()
+            }
             None => {
                 return Err(InferenceApiError::KvCacheUnavailable {
                     reason: format!("first-native graph produced no V state for layer {layer}"),

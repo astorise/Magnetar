@@ -1458,11 +1458,12 @@ fn qwen4_exp_residual_streams_and_indexer_derive_their_weight_shapes() {
     assert_eq!(shapes["final_hyper.down"], vec![6, 128]);
     assert!(!shapes.contains_key("final_hyper.inject"));
     // The linear layer keeps no attention weights or indexer.
-    assert!(!shapes.contains_key("layers.0.self_attn.index_qk_proj"));
+    assert!(!shapes.contains_key("layers.0.self_attn.index_q_proj"));
     assert_eq!(shapes["layers.0.linear_attn.in_qkv"], vec![64, 32]);
     // The indexed layer: gated query, indexer projection and norms.
     assert_eq!(shapes["layers.1.self_attn.q_proj"], vec![32, 64]);
-    assert_eq!(shapes["layers.1.self_attn.index_qk_proj"], vec![32, 24]);
+    assert_eq!(shapes["layers.1.self_attn.index_q_proj"], vec![32, 16]);
+    assert_eq!(shapes["layers.1.self_attn.index_k_proj"], vec![32, 8]);
     assert_eq!(shapes["layers.1.self_attn.index_q_norm"], vec![8]);
     assert_eq!(shapes["layers.1.self_attn.index_k_norm"], vec![8]);
     // Every layer is a mixture of experts with a gated shared expert.

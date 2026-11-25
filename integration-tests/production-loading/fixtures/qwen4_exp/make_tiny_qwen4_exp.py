@@ -5,6 +5,9 @@ Variants:
           (`output_gate_type`), and other weights.
   ple     The `dense` bundle with an n-gram embedding in layer 0 (`ple_layer_ids`
           [1]: 16 hashed heads of 2 values, convolution kernel 4 and dilation 3).
+  prune   The `dense` bundle with an indexer that prunes (budget 8 in blocks of
+          2: a query keeps at most 9 tokens, so attention is sparse from the
+          10th visible token), and other weights.
   dense   4 layers: linear, indexed, linear, indexed attention. Gated-delta
           mixers with 2 key heads and 4 value heads of 8 (kernel 4), gated
           attention with 2 query heads and 1 KV head of 16, a quarter of each
@@ -22,7 +25,7 @@ VOCAB = 64
 
 
 def config(variant):
-    if variant not in ("dense", "sigmoid", "ple"):
+    if variant not in ("dense", "sigmoid", "ple", "prune"):
         raise SystemExit(f"unknown variant {variant}")
     ple = {"ple_layer_ids": [1], "ple_embed_dim": 32, "ple_conv_kernel_size": 4,
            "ngram_size": 3, "heads_per_ngram": 8, "ngram_vocab_size_base": 40,
@@ -40,7 +43,8 @@ def config(variant):
         num_experts=4, num_experts_per_tok=2,
         hc_count=4, hc_lowrank=6,
         indexer_n_heads=2, indexer_kv_heads=1, indexer_head_dim=8,
-        indexer_budget=32, indexer_compress_ratio=4,
+        indexer_budget=8 if variant == "prune" else 32,
+        indexer_compress_ratio=2 if variant == "prune" else 4,
         rope_parameters={"rope_type": "default", "rope_theta": 100.0,
                          "partial_rotary_factor": 0.25, "mrope_section": [1, 1, 0]},
         max_position_embeddings=256, rms_norm_eps=1e-6, tie_word_embeddings=False,
@@ -77,7 +81,7 @@ def main():
     out, variant = sys.argv[1], sys.argv[2]
     torch.manual_seed(0)
     model = Qwen4ExpForCausalLM(config(variant)).float().eval()
-    scaled_init(model, {"dense": 1, "sigmoid": 2, "ple": 3}[variant])
+    scaled_init(model, {"dense": 1, "sigmoid": 2, "ple": 3, "prune": 4}[variant])
     model.save_pretrained(out, safe_serialization=True)
     vocab = {f"t{i}": i for i in range(VOCAB)}
     tokenizer = {

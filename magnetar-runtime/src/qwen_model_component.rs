@@ -450,11 +450,43 @@ impl FirstNativeModelConfig {
     /// under multi-head latent attention, whose layers keep no V rows: the
     /// latent history's rows hold the values (`cache-latent-attention-history`).
     pub fn kv_value_row_widths(&self) -> Vec<Option<u64>> {
-        let widths = self.kv_row_widths();
-        match &self.latent_attention {
-            Some(_) => widths.into_iter().map(|width| width.map(|_| 0)).collect(),
-            None => widths,
+        let mut widths = self.kv_row_widths();
+        if self.latent_attention.is_some() {
+            widths = widths.into_iter().map(|width| width.map(|_| 0)).collect();
         }
+        // An index store holds keys only.
+        for width in widths
+            .iter_mut()
+            .skip(self.architecture.layer_count as usize)
+        {
+            *width = width.map(|_| 0);
+        }
+        widths
+    }
+
+    /// The full-attention layers whose token indexer keeps a key history, in
+    /// order (`support-qwen38-flash-next`): every full-attention layer when
+    /// the model declares a token selection, none otherwise.
+    pub fn indexed_layers(&self) -> Vec<usize> {
+        if self.decoder_extensions.token_selection.is_none() {
+            return Vec::new();
+        }
+        (0..self.architecture.layer_count as usize)
+            .filter(|&layer| {
+                !self
+                    .linear_attention
+                    .as_ref()
+                    .is_some_and(|linear| linear.is_linear(layer))
+            })
+            .collect()
+    }
+
+    /// How many KV layers a cache holds: the decoder layers, then one index
+    /// store per indexed layer (`support-qwen38-flash-next`). The stores
+    /// are numbered after the decoder layers, in [`Self::indexed_layers`]
+    /// order, and keep keys of the indexer's head width and no values.
+    pub fn kv_layer_count(&self) -> usize {
+        self.architecture.layer_count as usize + self.indexed_layers().len()
     }
 
     /// The groups a quantized latent history is stored in
@@ -495,13 +527,15 @@ impl FirstNativeModelConfig {
                 .map(|row| row.map(|_| (group, group)))
                 .collect();
         }
-        let heads: Vec<u64> = match &self.layer_layout {
+        let mut heads: Vec<u64> = match &self.layer_layout {
             Some(layout) => layout
                 .iter()
                 .map(|layer| layer.num_key_value_heads as u64)
                 .collect(),
             None => vec![self.architecture.kv_head_count; self.architecture.layer_count as usize],
         };
+        // An index store is one key head.
+        heads.resize(self.kv_layer_count(), 1);
         self.kv_row_widths()
             .into_iter()
             .zip(self.kv_value_row_widths())
@@ -529,6 +563,14 @@ impl FirstNativeModelConfig {
                     *width = None;
                 }
             }
+        }
+        // The index stores follow the decoder layers.
+        if let Some(selection) = self.decoder_extensions.token_selection {
+            widths.extend(
+                self.indexed_layers()
+                    .iter()
+                    .map(|_| Some(selection.head_dim)),
+            );
         }
         widths
     }

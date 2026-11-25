@@ -40,7 +40,7 @@ pub(super) const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub(super) const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:924c12742e3b2044de8461b7093d16db28389efffea4476ab6ee324f2ff0371b";
+    "sha256:321b42b83773544e1ba553cc7196d3d742cd9ef1e2af3f04da72b66e402a730f";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -334,12 +334,22 @@ pub(super) fn weight_shapes_for_architecture_config(
                 shapes.insert(format!("{prefix}.self_attn.k_norm"), vec![head_dim]);
             }
             // A token indexer reads the layer's input through one
-            // projection for its queries and its single key head.
+            // projection for its queries and one for its single key head
+            // (the loaders split the checkpoint's fused `index_qk_proj`).
             if let Some(selection) = config.decoder_extensions.token_selection {
-                let width = u64::from(selection.heads + selection.key_heads) * selection.head_dim;
                 shapes.insert(
-                    format!("{prefix}.self_attn.index_qk_proj"),
-                    vec![config.hidden_size, width],
+                    format!("{prefix}.self_attn.index_q_proj"),
+                    vec![
+                        config.hidden_size,
+                        u64::from(selection.heads) * selection.head_dim,
+                    ],
+                );
+                shapes.insert(
+                    format!("{prefix}.self_attn.index_k_proj"),
+                    vec![
+                        config.hidden_size,
+                        u64::from(selection.key_heads) * selection.head_dim,
+                    ],
                 );
                 shapes.insert(
                     format!("{prefix}.self_attn.index_q_norm"),

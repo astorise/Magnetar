@@ -52,3 +52,16 @@ Each SHALL be `none` when the checkpoint does not declare it. When the bound con
 - **WHEN** a configuration declares an indexer with two key heads or a budget of 30 tokens in blocks of 4
 - **THEN** the Runtime refuses the configuration before any graph is built
 
+### Requirement: Token-selection layers keep their index keys in KV stores
+
+When the bound configuration declares token selection, the first-native Runtime SHALL give each full-attention layer a KV store for its indexer's raw keys. The stores SHALL be numbered after the decoder layers, in layer order, and SHALL have K rows of the indexer's head width and no V rows. A Component SHALL name a store through `kv-resource` with that layer number, and a node it attaches to the store SHALL see every key so far, as for a layer's own K.
+
+#### Scenario: KV geometry of an indexed decoder
+
+- **WHEN** a hybrid decoder of four layers declares token selection and layers 1 and 3 are full attention
+- **THEN** the cache has six KV layers, and layers 4 and 5 are index stores with K rows of the indexer's head width and no V rows
+
+#### Scenario: Index keys across decode steps
+
+- **WHEN** a decode step's indexer reads the keys of every earlier token
+- **THEN** it sees the keys the prefill and the earlier steps appended, so its selection equals the one computed over the whole sequence
