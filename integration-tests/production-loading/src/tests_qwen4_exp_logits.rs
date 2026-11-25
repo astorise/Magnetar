@@ -52,6 +52,25 @@ fn a_qwen4_exp_ngram_embedding_bundle_matches_transformers() {
     }
 }
 
+/// An indexer that prunes: a query keeps at most 9 tokens (budget 8 in
+/// blocks of 2), so from the tenth visible token attention is sparse in the
+/// prefill and in every decode step. Each indexed layer keeps its raw index
+/// keys as a KV store of its own.
+#[test]
+fn a_qwen4_exp_pruning_indexer_bundle_matches_transformers() {
+    for (provider, label) in cpu_providers() {
+        let difference = compare_on(
+            provider,
+            label,
+            "qwen4_exp",
+            "prune",
+            Format::HuggingFace,
+            "qwen4_exp_text",
+        );
+        eprintln!("pruning indexer, {label}: max |logit difference| {difference:.3e}");
+    }
+}
+
 /// The same checkpoint on `providers/cpu`'s Reference CPU Provider and its
 /// optimized CPU Provider.
 #[test]

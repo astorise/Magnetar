@@ -369,7 +369,7 @@ fn modernbert_component_graph_matches_pinned_transformers() {
         "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
     )
     .replace(
-        "sha256:924c12742e3b2044de8461b7093d16db28389efffea4476ab6ee324f2ff0371b",
+        "sha256:321b42b83773544e1ba553cc7196d3d742cd9ef1e2af3f04da72b66e402a730f",
         &digest.value,
     )
     .replace("magnetar.qwen.real", "magnetar.modernbert.test")
