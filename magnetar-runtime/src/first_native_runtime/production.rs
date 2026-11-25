@@ -862,14 +862,36 @@ pub fn load_production_model_instance_for_provider(
         architecture_implementation,
         ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding.clone()),
     )?;
-    stream_materialize_model_instance_weights(
+    stream_materialize_model_instance_weights_with_row_tables(
         runtime,
         &instance,
         manifest.id.name.as_str(),
         &manifest.tensors,
         payload_source,
+        &row_addressed_tables(manifest.architecture_config.as_ref()),
     )?;
     Ok(instance)
+}
+
+/// The tensors a model's artifact keeps and reads by row instead of
+/// staging (`support-qwen38-flash-next`, design D8): the n-gram embedding
+/// table of every layer that declares one. A source that cannot map a table
+/// still stages it whole; only a source that maps (`map_payload`) makes it
+/// a row table.
+pub fn row_addressed_tables(
+    config: Option<&crate::ModelArchitectureConfig>,
+) -> std::collections::BTreeSet<String> {
+    let Some(ngram) = config.and_then(|config| config.decoder_extensions.ngram_embeddings.as_ref())
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    ngram
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, has_embedding)| **has_embedding)
+        .map(|(layer, _)| format!("layers.{layer}.ple.table"))
+        .collect()
 }
 
 /// [`load_production_model_instance_for_provider`], restricted to decoder
@@ -932,12 +954,13 @@ pub fn load_production_model_instance_segment_for_provider(
         architecture_implementation,
         ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding.clone()),
     )?;
-    stream_materialize_model_instance_weights(
+    stream_materialize_model_instance_weights_with_row_tables(
         runtime,
         &instance,
         segment_manifest.id.name.as_str(),
         &segment_manifest.tensors,
         payload_source,
+        &row_addressed_tables(segment_manifest.architecture_config.as_ref()),
     )?;
     Ok(instance)
 }

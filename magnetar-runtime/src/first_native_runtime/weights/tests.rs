@@ -25,6 +25,7 @@ fn stage_weight_propagates_and_rolls_back_on_provider_write_failure() {
         provider_binding: ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
         executor,
         staged: Vec::new(),
+        row_tables: Vec::new(),
     };
     let tensor = HostTensor::new([4, 8], vec![0.0; 32]).unwrap();
     let error = transaction

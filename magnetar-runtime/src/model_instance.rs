@@ -348,6 +348,12 @@ pub struct ModelInstanceResourceBindings {
     /// through this Model Instance rather than a private side-channel
     /// keeping its own copy of tensor bytes.
     pub(crate) weights: BTreeMap<String, TensorResourceId>,
+    /// Tables read by row and never staged (`support-qwen38-flash-next`,
+    /// design D8), by canonical tensor name: Qwen4-Exp's n-gram embedding
+    /// tables. They are not weight resources, hold no Memory Manager
+    /// allocation and have no Provider copy; the first-native executor reads
+    /// the rows a step names from them.
+    pub(crate) row_tables: BTreeMap<String, crate::RowTableHandle>,
     pub(crate) memory_allocations: BTreeSet<MemoryAllocationId>,
     pub(crate) released_memory_allocations: BTreeSet<MemoryAllocationId>,
     pub(crate) released_provider_resources: BTreeSet<ProviderBinding>,
@@ -671,6 +677,16 @@ impl ModelInstance {
             .resource_bindings
             .memory_allocations
             .insert(allocation);
+    }
+
+    /// The table `name` read by row instead of staged, if this instance has
+    /// one (`support-qwen38-flash-next`, design D8).
+    pub fn row_table(&self, name: &str) -> Option<&std::sync::Arc<crate::RowTable>> {
+        self.definition
+            .resource_bindings
+            .row_tables
+            .get(name)
+            .map(|handle| &handle.0)
     }
 
     /// Current readiness state. Read-only: see the struct-level doc comment
