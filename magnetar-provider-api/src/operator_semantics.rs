@@ -33,6 +33,7 @@ pub use encoder_ops::{
 };
 pub use gated_delta_mixer::{
     GatedDeltaMixer, gated_delta_mixer, gated_delta_mixer_from_attributes,
+    gated_delta_mixer_from_projections,
 };
 pub use mamba2_mixer::{Mamba2Mixer, mamba2_mixer, mamba2_mixer_from_attributes};
 pub use mamba3_core::Geometry as Mamba3Mimo;
