@@ -1624,10 +1624,10 @@ jobs:
         # read-unified-text-decoder 2.3: the 12B's layout on real weights
         # (five sliding layers to one full layer, one K/V head of width 512
         # on the full layers, a quarter of each full head rotated) through
-        # the Gemma 4 Component. The first run (45570555856) loaded and ran
-        # on one GPU but generated "0111...": every variant below runs and
-        # reports, to say whether the fault is in a CUDA Kernel (Tensor
-        # Cores, int8 activations) or in what the Providers share.
+        # the Gemma 4 Component, on one GPU and on the optimized CPU
+        # Provider. The model answers inside its chat template; the bare
+        # prompt of the other checkpoints makes it continue with digits
+        # (run 45572734242), on every Provider alike.
         if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' && env.MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 60
         env:
@@ -1640,15 +1640,13 @@ jobs:
           mkdir -p "$dir"
           status=0
           run_variant() {
-            local label="$1" test="$2"; shift 2
-            env "$@" cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml "$test" -- --include-ignored --test-threads=1 --nocapture > "$dir/$label.log" 2>&1 || echo "::warning::Gemma 4 12B $label: the test failed"
+            local label="$1" test="$2"
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml "$test" -- --include-ignored --test-threads=1 --nocapture > "$dir/$label.log" 2>&1 || echo "::warning::Gemma 4 12B $label: the test failed"
             grep -h 'generated text\|warm TTFT' "$dir/$label.log" | sed "s/^/$label: /" || true
-            grep -Eq 'generated text " ?Paris' "$dir/$label.log"
+            grep -Eq 'generated text ".*Paris' "$dir/$label.log" || { echo "::error::Gemma 4 12B Q4_0 on $label: the answer to 'What is the capital of France?' does not name Paris"; status=1; }
           }
-          run_variant cuda real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda X=1 || { echo "::error::Gemma 4 12B Q4_0 on CUDA: the greedy continuation of 'The capital of France is' does not start with 'Paris'"; status=1; }
-          run_variant cuda-no-tensor-cores real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_CUDA_TENSOR_CORES=0 || echo "::warning::Gemma 4 12B without Tensor Cores: not Paris"
-          run_variant cuda-f32-activations real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda MAGNETAR_CUDA_INT8_ACTIVATIONS=0 || echo "::warning::Gemma 4 12B with f32 activations: not Paris"
-          run_variant cpu-native real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_native_cpu X=1 || echo "::warning::Gemma 4 12B on the optimized CPU: not Paris"
+          run_variant cuda real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda
+          run_variant cpu-native real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_native_cpu
           exit "$status"
       - name: TurboQuant KV stores on real checkpoints against f32
         # turboquant-kv-history: each checkpoint generates on one GPU with
