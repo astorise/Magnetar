@@ -4,8 +4,8 @@
 //! `fixtures/generate-qwen4-exp-reference.py`.
 
 use magnetar_provider_api::{
-    GatedResidual, HostTensor, NgramEmbedding, NgramPle, QsaSelect, gated_residual,
-    gated_residual_inject, ngram_embedding, ngram_ple, qsa_select, repeat_features,
+    GatedResidual, HostTensor, MoeRouting, NgramEmbedding, NgramPle, QsaSelect, gated_residual,
+    gated_residual_inject, moe_experts, ngram_embedding, ngram_ple, qsa_select, repeat_features,
 };
 use serde::Deserialize;
 
@@ -80,7 +80,24 @@ struct PleCase {
 }
 
 #[derive(Deserialize)]
+struct MoeCase {
+    experts: u64,
+    top_k: u64,
+    norm_topk_prob: bool,
+    input: Flat,
+    router: Flat,
+    gate_up_proj: Flat,
+    down_proj: Flat,
+    shared_gate_proj: Flat,
+    shared_up_proj: Flat,
+    shared_down_proj: Flat,
+    shared_expert_gate: Flat,
+    output: Flat,
+}
+
+#[derive(Deserialize)]
 struct Fixture {
+    moe_block: MoeCase,
     hc_count: usize,
     epsilon: f32,
     gated_residual: GatedResidualCase,
@@ -348,4 +365,104 @@ fn the_ngram_ple_matches_the_pinned_transformers_layer() {
     let mut short = weights(case.hidden.tensor(), embeddings, history());
     short.pop();
     assert!(ngram_ple(&short, ple).is_err());
+}
+
+/// `x [rows, in] · weightᵀ` for a checkpoint `[out, in]` weight.
+fn linear(x: &[f32], width: usize, weight: &Flat) -> Vec<f32> {
+    let out = weight.shape[0] as usize;
+    x.chunks_exact(width)
+        .flat_map(|row| {
+            (0..out).map(move |o| {
+                weight.data[o * width..(o + 1) * width]
+                    .iter()
+                    .zip(row)
+                    .map(|(w, x)| w * x)
+                    .sum::<f32>()
+            })
+        })
+        .collect()
+}
+
+/// Qwen4-Exp's MoE block needs no new operator: the existing `moe-experts`
+/// routing (softmax over every expert, top-k, renormalized, a tie to the
+/// lower expert) and combination, plus a shared expert behind a sigmoid
+/// gate, equal the pinned `Qwen4ExpTextSparseMoeBlock`. The checkpoint's
+/// stacked `gate_up_proj [E, 2I, H]` and `down_proj [E, H, I]` map onto the
+/// operator's `gate`/`up [H, E*I]` and `down [I, E*H]`.
+#[test]
+fn the_moe_block_matches_through_the_existing_operator() {
+    let case = fixture().moe_block;
+    assert!(case.norm_topk_prob, "Qwen4-Exp renormalizes its top-k");
+    let (experts, top_k) = (case.experts as usize, case.top_k as usize);
+    let (tokens, hidden) = (case.input.shape[0] as usize, case.input.shape[1] as usize);
+    let inter = case.gate_up_proj.shape[1] as usize / 2;
+    let (mut gate, mut up) = (
+        vec![0.0; hidden * experts * inter],
+        vec![0.0; hidden * experts * inter],
+    );
+    let mut down = vec![0.0; inter * experts * hidden];
+    for e in 0..experts {
+        for i in 0..inter {
+            for h in 0..hidden {
+                gate[h * experts * inter + e * inter + i] =
+                    case.gate_up_proj.data[(e * 2 * inter + i) * hidden + h];
+                up[h * experts * inter + e * inter + i] =
+                    case.gate_up_proj.data[(e * 2 * inter + inter + i) * hidden + h];
+            }
+        }
+        for h in 0..hidden {
+            for i in 0..inter {
+                down[i * experts * hidden + e * hidden + h] =
+                    case.down_proj.data[(e * hidden + h) * inter + i];
+            }
+        }
+    }
+    let tensor = |shape: [usize; 2], data: Vec<f32>| {
+        HostTensor::new([shape[0] as u64, shape[1] as u64], data).unwrap()
+    };
+    let input = case.input.tensor();
+    let logits = tensor(
+        [tokens, experts],
+        linear(&case.input.data, hidden, &case.router),
+    );
+    let routed = moe_experts(
+        &input,
+        &logits,
+        [
+            &tensor([hidden, experts * inter], gate),
+            &tensor([hidden, experts * inter], up),
+            &tensor([inter, experts * hidden], down),
+        ],
+        MoeRouting {
+            experts: case.experts,
+            top_k: case.top_k,
+            normalize: case.norm_topk_prob,
+        },
+    )
+    .unwrap();
+    assert_eq!(top_k, 2, "the fixture routes to two of four experts");
+
+    // The shared expert: silu(gate) * up, down, scaled by sigmoid(gate_w · x).
+    let shared_gate = linear(&case.input.data, hidden, &case.shared_gate_proj);
+    let shared_up = linear(&case.input.data, hidden, &case.shared_up_proj);
+    let activated: Vec<f32> = shared_gate
+        .iter()
+        .zip(&shared_up)
+        .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+        .collect();
+    let shared = linear(
+        &activated,
+        case.shared_gate_proj.shape[0] as usize,
+        &case.shared_down_proj,
+    );
+    let scale = linear(&case.input.data, hidden, &case.shared_expert_gate);
+    let mut out = routed.data.clone();
+    for (token, row) in out.chunks_exact_mut(hidden).enumerate() {
+        let gate = 1.0 / (1.0 + (-scale[token]).exp());
+        for (feature, value) in row.iter_mut().enumerate() {
+            *value += gate * shared[token * hidden + feature];
+        }
+    }
+    let actual = HostTensor::new(case.output.shape.clone(), out).unwrap();
+    assert_matches(&actual, &case.output, "MoE block output");
 }

@@ -90,10 +90,22 @@
   - Transformers' `models/qwen4_exp` (Apache-2.0), pinned in design D7 by file SHA-256: the installed 5.23.0 is the executable reference, and 5.24.1 differs only in API names. D7 records the semantics.
   - QSA equals dense attention up to 2,051 visible tokens.
 - [ ] 3.2 QSA attention with its indexer: operator, Reference semantics and fixtures.
+  - [x] `qsa_select` Reference semantics (a query's kept tokens: block keys averaged, normalized, rotated at the block start, scored by `relu` sums, top `budget / ratio` blocks plus the incomplete tail). Checked against Transformers' `Qwen4ExpTextQSAIndexer` on 20 queries that prune (`the_qsa_selection_matches_the_pinned_transformers_indexer`). Ties go to the lower block, and the fixture's seed has none at the cut.
+  - [ ] Catalog `qsa-select` (inputs queries, raw index keys, key norm weight; output ascending token positions padded with -1), and an `attention` form that reads them (feature `attention-token-selection`). Dispatch on the first-native Runtime and the Reference CPU.
+  - [ ] The index keys `[T, 128]` as a per-layer cache next to K and V; the pooled block keys of complete blocks never change, so a provider may cache them.
 - [ ] 3.3 Four-stream gated residual (`hc_count` 4, low-rank 320): operator, Reference semantics and fixtures.
+  - [x] `gated_residual`, `gated_residual_inject` and `repeat_features` Reference semantics, checked against `Qwen4ExpTextGatedResidual` and the decoder layer's closing step (`the_gated_residual_matches_the_pinned_transformers_module`).
+  - [ ] Catalog `gated-residual`, `gated-residual-inject` and `repeat-features` with their shape rules and attributes; dispatch.
 - [ ] 3.4 N-gram PLE: hashed row lookup from a disk-resident table, added at layer 2; Reference semantics and fixtures.
-- [ ] 3.5 MoE 512 / top-10 with a gated shared expert on the existing MoE operator; check the routing normalization.
+  - [x] `ngram_embedding` (hash, EOS-delimited segments, next context) and `ngram_ple` (gate, dilated convolution, history) Reference semantics. The head primes and the hash multipliers equal Transformers' exactly; embeddings and output match on a second PLE layer, and two chunks carrying the context and history equal the whole sequence (`the_ngram_ple_matches_the_pinned_transformers_layer`).
+  - [ ] Catalog `ngram-embedding` (ids and context in, embeddings and next context out; the table is a weight read by row, never admitted whole: 4.4) and `ngram-ple`; dispatch.
+  - [ ] f32 tensors cannot hold the real table's row numbers (about 320M, past 2^24), so the lookup stays one operator from token ids to rows.
+- [x] 3.5 MoE 512 / top-10 with a gated shared expert on the existing MoE operator.
+  - The routing needs no change: Qwen3-Next's router is softmax over every expert, top-k, renormalized, with a tie to the lower expert, which `moe_route` computes with `normalize_top_k`.
+  - `the_moe_block_matches_through_the_existing_operator` runs `Qwen4ExpTextSparseMoeBlock` against `moe-experts` plus a sigmoid-gated shared expert. The stacked `gate_up_proj [E, 2I, H]` and `down_proj [E, H, I]` map onto the operator's `gate`/`up [H, E*I]` and `down [I, E*H]`; the loaders do that mapping.
 - [ ] 3.6 Qwen Component: recognize `qwen4_exp` and emit its graph; refuse it explicitly until 3.2–3.5 are qualified.
+  - [ ] The gated-delta mixer's output gate takes `output_gate_type` (`silu` or `sigmoid`).
+  - [ ] Tiny `qwen4_exp` bundle against Transformers on the Reference CPU: layers, residual streams, the PLE layer and an indexer that prunes.
 
 ## 4. Expert and table residency
 

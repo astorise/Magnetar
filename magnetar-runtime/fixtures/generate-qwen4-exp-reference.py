@@ -211,5 +211,31 @@ fixture["ngram_ple"] = {
     "output": flat(ple_out[0]),
     "chunked_output": flat(chunked[0]),
 }
+# The sparse MoE block: Qwen3-Next's router (softmax over every expert, top-k,
+# renormalized) with a shared expert behind a sigmoid gate. 4 experts, top 2.
+moe = m.Qwen4ExpTextSparseMoeBlock(config)
+randomize(moe)
+MOE_TOKENS = 5
+moe_input = torch.randn(1, MOE_TOKENS, HIDDEN)
+with torch.no_grad():
+    moe_output = moe(moe_input)
+    router_logits = moe.gate(moe_input.reshape(-1, HIDDEN))[0]
+    chosen = torch.topk(torch.softmax(router_logits, -1), config.num_experts_per_tok).values
+    margin = (chosen[:, -1] - torch.softmax(router_logits, -1).sort(-1, descending=True).values[:, config.num_experts_per_tok]).min().item()
+if margin < 1e-4:
+    sys.exit("a routing tie at the top-k cut; change the seed")
+fixture["moe_block"] = {
+    "experts": config.num_experts, "top_k": config.num_experts_per_tok,
+    "norm_topk_prob": bool(config.norm_topk_prob),
+    "input": flat(moe_input[0]),
+    "router": flat(moe.gate.weight),
+    "gate_up_proj": flat(moe.experts.gate_up_proj),
+    "down_proj": flat(moe.experts.down_proj),
+    "shared_gate_proj": flat(moe.shared_expert.gate_proj.weight),
+    "shared_up_proj": flat(moe.shared_expert.up_proj.weight),
+    "shared_down_proj": flat(moe.shared_expert.down_proj.weight),
+    "shared_expert_gate": flat(moe.shared_expert_gate.weight),
+    "output": flat(moe_output[0]),
+}
 json.dump(fixture, sys.stdout, indent=1)
 print()
