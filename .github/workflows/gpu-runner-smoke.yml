@@ -1595,6 +1595,41 @@ jobs:
             echo "::error::Gemma 4 E2B QAT Q4_0 on the optimized CPU: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Download the pinned real Gemma 4 12B instruct Q4_0 GGUF checkpoint
+        # read-unified-text-decoder 2.3: 7.2 GB, public, pinned by its
+        # sha256, which the test verifies. The E2B export is removed first.
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' }}
+        env:
+          REVISION: 501d13dba70e3c02b1b12c78fd9e6b08ad413960
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/gemma-4-e2b-it-qat-q4_0-gguf-*
+          df -h "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/gemma-4-12b-it-q4_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/$REVISION/gemma-4-12B-it-Q4_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Gemma 4 12B instruct Q4_0 GGUF on CUDA
+        # read-unified-text-decoder 2.3: the 12B's layout on real weights
+        # (five sliding layers to one full layer, one K/V head of width 512
+        # on the full layers, a quarter of each full head rotated) through
+        # the Gemma 4 Component on one GPU.
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' && env.MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 45
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          trap 'rm -rf "$MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR"' EXIT
+          dir="$RUNNER_TEMP/qualification-reports/gemma-4-12b-q4_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/one-gpu.log"
+          grep -Eq 'generated text " ?Paris' "$dir/one-gpu.log" || {
+            echo "::error::Gemma 4 12B Q4_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
       - name: TurboQuant KV stores on real checkpoints against f32
         # turboquant-kv-history: each checkpoint generates on one GPU with
         # f32, tq4 and tq3 KV stores (MAGNETAR_KV_PRECISION); the greedy

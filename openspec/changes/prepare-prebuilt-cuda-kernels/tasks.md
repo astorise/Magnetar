@@ -42,3 +42,7 @@ Status: **Proposed (RFC lot 1).** No task is implemented yet. Requires lot 0.
 - [ ] 6.1 `docs/architecture/kernel-artifact-sources.md`: preparation, the launch descriptor, the experiment's evidence.
 - [ ] 6.2 The CUDA Provider README: precompiled kernel preparation, its limits (CUBIN only, declarative launches) and the execution permission it requires.
 - [ ] 6.3 RFC acceptance criteria 4, 5 and 9 (section 13), checked against the recorded evidence.
+
+## 7. Inherited items
+
+- [ ] 7.1 The absorbed latent decode's TPOT at least the expanded form's after a short prompt (inherited from `cache-latent-attention-history` 5.3, closed there on 2026-11-25 with the gap accepted). Run 44195880740: 13.02 ms with the f32 latent history and 13.45 ms with the tq4 one, against 12.25 ms expanded; of the 13 ms per step, the replay takes 7.1 ms and the logits' materialization 4.9 ms. A candidate workload for the first kernel this change prepares: measure it before and after on the GPU runner.

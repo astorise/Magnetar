@@ -1025,6 +1025,34 @@ fn real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda() {
     });
 }
 
+/// `ggml-org/gemma-4-12B-it-GGUF`'s exact pinned commit: llama.cpp's
+/// exports of `google/gemma-4-12B-it`, whose Hugging Face bundle declares
+/// `gemma4_unified` (`read-unified-text-decoder`). The GGUF files declare
+/// `gemma4` and leave the vision embedder to the `mmproj` file.
+const GEMMA4_12B_REVISION: &str = "501d13dba70e3c02b1b12c78fd9e6b08ad413960";
+/// `gemma-4-12B-it-Q4_0.gguf`'s sha256 (7,219,673,216 bytes) at
+/// [`GEMMA4_12B_REVISION`], as Hugging Face declares it.
+const GEMMA4_12B_Q4_0_SHA256: &str =
+    "sha256:3712b9bd32cae83a22f67ee7a4466d8d7a4f21646ac8a07d19bf9418e8767a70";
+
+/// Gemma 4 12B instruct (`Q4_0`) on CUDA, through the Gemma 4 Model
+/// Component: five sliding-window layers to each full one, full layers with
+/// one K/V head of width 512 that derives V from K, a quarter of each full
+/// head rotated through `rope_freqs`, no per-layer inputs and no experts.
+/// 7.2 GB packed: one 12 GB GPU holds it.
+#[test]
+#[ignore = "downloads/holds a 7.2GB real quantized checkpoint"]
+fn real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda gemma-4-12b-it q4_0 gguf",
+        dir_env: "MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR",
+        repository: "ggml-org/gemma-4-12B-it-GGUF",
+        revision: GEMMA4_12B_REVISION,
+        file: "gemma-4-12B-it-Q4_0.gguf",
+        sha256: GEMMA4_12B_Q4_0_SHA256,
+    });
+}
+
 /// The same Gemma 4 E2B checkpoint on the optimized CPU Provider, its
 /// packed `Q4_0`, `Q6_K` and `F16` weights read in their checkpoint
 /// encoding.
