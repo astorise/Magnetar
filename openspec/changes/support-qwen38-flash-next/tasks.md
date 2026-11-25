@@ -55,6 +55,17 @@
   - 16 greedy tokens equal;
   - evidence recorded here.
 
+  - [x] Reference corpus: `tools/qualification/qwen3_5_reference_logits.py` runs `transformers` 5.23.0's `Qwen3_5ForConditionalGeneration` in f32, greedy, recomputing the whole sequence at each step. Prompt: "The capital of France is", 16 tokens. Output: `fixtures/qualification/qwen3.5-0.8b-base-dc7cdfe-transformers-f32.json`, bound to the weights digest `sha256:c2b1e5a1…`. The narrowest step-1 top-2 margin is 0.011.
+  - [x] Reference CPU and cpu-native: `tests_qwen3_5_real_checkpoint` (ignored; `MAGNETAR_QWEN35_REAL_CHECKPOINT_DIR`, profile `f32_cross_provider`). One prefill, then 15 decode steps that carry the 18 mixers' recurrent states and the 6 attention layers' KV:
+
+    | Provider | max \|logit diff\| | Tokens | Time (16 tokens) |
+    |---|---|---|---|
+    | Reference CPU | 3.2e-5 | 16/16 equal | 74.6 s |
+    | cpu-native (4 threads) | 2.8e-5 | 16/16 equal | 22.6 s |
+
+    Output: `[11751, 13, 561, 6511, 314, 31868, 369, 35938, 13, 561, 6511, 314, 279, 24844, 369, 36492]` (2026-11-25, x86-64 container).
+  - [ ] CUDA, on the GPU runner (after 2.6).
+
 ## 3. Qwen3.8-Flash-Next blocks
 
 - [ ] 3.1 Pin a reviewable upstream modeling source for `qwen4_exp` (QSA, gated residual, n-gram PLE, MoE gate), or keep this lot design-only.
