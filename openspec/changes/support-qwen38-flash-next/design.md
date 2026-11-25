@@ -109,6 +109,28 @@ No path silently runs with stale or shared state.
   - an adaptive GPU cache sized to free VRAM;
   - misses computed by the CPU Provider in place, rather than uploaded.
 
+### D8. The n-gram table is read by row and never admitted (task 4.4)
+
+**What the code does today.** Three things stop a table of about 320 million rows from running:
+- Model Loading reads each tensor whole into a `HostTensor` (`stream_stage_tensor`) and stages it as a Provider resource. Peak host memory is one tensor, which for this table is over 100 GB in `f32`.
+- `ngram-embedding` takes the table as a dense input, and its Reference semantics cap every tensor at 67,108,864 elements.
+- The payload source is only borrowed (`&dyn ProductionArtifactPayloadSource`) for the duration of the load, so nothing could read a row later.
+
+**Options.**
+- *A. A row-addressed resource in every Provider* (a new `TensorValue` or resource kind). Each Provider implements it, and a GPU Provider keeps host mapping logic of its own. Rejected for now: the largest blast radius for a weight read a few dozen times per token.
+- *B. A Runtime-side gather (chosen).* The table stays in the artifact. The Runtime keeps a `RowTable` per Model Instance (a retained handle to the payload source, the tensor's byte range, rows, columns and storage type) and uploads nothing. When the first-native executor dispatches an `ngram-embedding` node whose table edge is a row table, it computes the row ids with the operator's own shared semantics (`NgramEmbedding::row_ids`, from the token ids, which are a host graph input, and the layer's context state, `ngram_size - 1` values read back from the Provider), reads exactly those `T x heads` rows, and dispatches the operator in its *gathered* form.
+- *C. Prefetching the whole table into RAM.* Rejected: the table does not fit, which is the reason for the task.
+
+**The gathered form.** `ngram-embedding` gets an optional boolean attribute `gathered_rows`. When set, its third input is the rows already read, `[T * heads, head_dim]` in (token, head) order, and the operator does no lookup: it reshapes them to `[T, heads * head_dim]` and computes the next context as before. The Kernel feature `ngram-embedding-gathered-rows` is required only then. The result is byte-for-byte the dense form's, since no arithmetic touches the rows. The hash stays in one place, the shared semantics, used by both the dense operator and the Runtime's gather, and a test checks that they name the same rows.
+
+**Loading.** The Runtime derives the row-addressed set from the architecture (`layers.{L}.ple.table` of each layer that declares an n-gram embedding) and `stream_stage_tensor` registers those instead of staging them. The loaded model retains the payload source as an `Arc` (today's `&dyn` call sites change to share it). The table's digest is checked while streaming it once in bounded chunks, so the integrity check keeps its guarantee without holding the table. A table counts in the residency budget as streamed bytes, never as resident weight.
+
+**Cost.** A decode step reads `heads` rows per layer that has an n-gram embedding, a few hundred bytes each, from the page cache. A prefill chunk reads `chunk * heads` rows, sorted by offset and coalesced where adjacent. Both are bounded by the chunk size; the Runtime has no row cache of its own until a measurement asks for one. A read that fails fails the step, with nothing partially written.
+
+**Out of scope.** The GGUF export keeps its n-gram table in a separate file (task 5.1) and gets its own `RowTable` reader. CUDA does not advertise `ngram-embedding` at all yet; the gathered form needs only the host read and a small upload, so it adds nothing to that gap.
+
+**Tests.** The `ple` bundle matches `transformers` with its table row-addressed. The model instance holds no resource for the table. The source sees at most `T * heads` row reads per step and none of the rest. A synthetic table with more elements than the operator's cap runs through the gathered form.
+
 ### D7. The pinned `qwen4_exp` source and what it defines
 
 The reference is Transformers' own `models/qwen4_exp` (Apache-2.0, "Copyright 2026 The Qwen Team and The HuggingFace Inc. team"), not Strata's engine. Transformers 5.23.0 and 5.24.1 both ship it. The executable reference is the installed 5.23.0:

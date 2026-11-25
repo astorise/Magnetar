@@ -65,3 +65,18 @@ When the bound configuration declares token selection, the first-native Runtime 
 
 - **WHEN** a decode step's indexer reads the keys of every earlier token
 - **THEN** it sees the keys the prefill and the earlier steps appended, so its selection equals the one computed over the whole sequence
+
+### Requirement: N-gram tables are read by row and never admitted
+
+The first-native Runtime SHALL NOT stage the n-gram embedding table of a layer as a Provider resource, and SHALL NOT count it as a resident weight. It SHALL keep the table in its artifact, verify its digest while streaming it once in bounded chunks, and read for each `ngram-embedding` dispatch only the rows that dispatch names, passing them to the operator in its gathered form. A read that fails SHALL fail the step without writing anything.
+
+#### Scenario: A table larger than any tensor the operator accepts
+
+- **WHEN** a model's n-gram table has more elements than the operator's tensor limit
+- **THEN** the model loads and generates, reading at most `T * heads` rows per step and none of the others
+
+#### Scenario: A failed row read
+
+- **WHEN** the artifact cannot be read for a step's rows
+- **THEN** the step fails and no state is committed
+
