@@ -285,7 +285,10 @@ fn the_qsa_selection_matches_the_pinned_transformers_indexer() {
 #[test]
 fn the_head_row_counts_are_the_primes_a_direct_search_finds() {
     fn is_prime(value: u64) -> bool {
-        value >= 2 && (2..).take_while(|d| d * d <= value).all(|d| value % d != 0)
+        value >= 2
+            && (2..)
+                .take_while(|d| d * d <= value)
+                .all(|d| !value.is_multiple_of(d))
     }
     fn nth_prime_after(start: u64, count: u64) -> u64 {
         let mut prime = start;

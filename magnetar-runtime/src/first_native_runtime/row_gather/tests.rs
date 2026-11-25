@@ -239,8 +239,7 @@ fn a_context_of_the_wrong_length_is_refused() {
     let (tables, _) = row_table(case);
     let graph = graph_reading(case, &format!("weight.{TABLE_NAME}"));
     let error = RowGather::plan(&graph, &tables, |_, _| Ok(step_of(case, vec![0])))
-        .err()
-        .expect("the context is too short");
+        .expect_err("the context is too short");
     assert!(
         matches!(error, InferenceApiError::GraphPlanningFailed { ref reason } if reason.contains("tokens of context")),
         "{error:?}"
@@ -269,8 +268,7 @@ fn a_table_shorter_than_the_hash_needs_fails_the_read() {
     gather.prefetch();
     let error = gather
         .gather(&ExecutionNodeId::new("ngram"))
-        .err()
-        .expect("the rows are past the table");
+        .expect_err("the rows are past the table");
     assert!(
         matches!(error, InferenceApiError::GenerationFailed { ref reason } if reason.contains("past the table")),
         "{error:?}"
@@ -307,8 +305,7 @@ fn a_steps_tokens_and_context_come_from_its_host_inputs() {
         HostTensor::new([2], vec![0.0, 0.0]).unwrap(),
     )]);
     let error = step_tokens(node, &hash, &only_state, &BTreeMap::new(), &provider)
-        .err()
-        .expect("the ids are not on the host");
+        .expect_err("the ids are not on the host");
     assert!(
         matches!(error, InferenceApiError::GraphPlanningFailed { ref reason } if reason.contains("token ids on the host")),
         "{error:?}"

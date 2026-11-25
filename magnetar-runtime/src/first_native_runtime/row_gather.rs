@@ -25,6 +25,7 @@ use magnetar_provider_api::NgramEmbedding;
 const GATHERED_ROWS: &str = "gathered_rows";
 
 /// What one `ngram-embedding` node reads this step.
+#[derive(Debug)]
 struct NodeRows {
     table: Arc<RowTable>,
     /// The table rows, `[tokens][heads]` flattened: the gathered input's
@@ -34,11 +35,13 @@ struct NodeRows {
 }
 
 /// The rows of every row-table read of one step, by node.
+#[derive(Debug)]
 pub(super) struct RowGather {
     nodes: BTreeMap<ExecutionNodeId, NodeRows>,
 }
 
 /// A step's tokens and the tokens before them that its n-grams reach back to.
+#[derive(Debug)]
 pub(super) struct StepTokens {
     /// The step's token ids, in order.
     pub(super) tokens: Vec<i64>,
