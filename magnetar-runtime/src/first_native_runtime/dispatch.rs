@@ -1458,6 +1458,7 @@ pub(super) fn dispatch_qwen_split(
     operation_id: &str,
     input: NodeValue,
     output_targets: [Option<OutputTarget>; 2],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     let (rows, cols) = input.rows_cols()?;
     if cols % 2 != 0 || cols == 0 {
@@ -1503,7 +1504,8 @@ pub(super) fn dispatch_qwen_split(
         dispatch_operator_id("split", OperatorFamily::Tensor),
         vec![node_input_resource(operation_id, "input", input)],
         vec![left_output, right_output],
-        BTreeMap::new(),
+        // `head_count` splits each head's block (`split-per-head`).
+        attributes,
     );
     if result.is_err() {
         if left_pre_admitted {
@@ -1557,6 +1559,76 @@ pub(super) fn dispatch_three_output_mixer(
             ctx,
             &format!("{operation_id}.output{index}"),
             descriptor,
+            Some(target),
+        ) {
+            Ok(output) => outputs.push(output),
+            Err(error) => {
+                for (id, _) in &outputs {
+                    rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), id);
+                }
+                return Err(error);
+            }
+        }
+    }
+    let admitted: Vec<_> = outputs.iter().map(|(id, _)| id.clone()).collect();
+    let result = dispatch_reference_cpu_operator_multi(
+        ctx,
+        operation_id,
+        operator,
+        resources,
+        outputs,
+        attributes,
+    );
+    if result.is_err() {
+        for id in &admitted {
+            rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), id);
+        }
+    }
+    result
+}
+
+/// Admit every output of a pure operator whose output shapes are known up
+/// front (`support-qwen38-flash-next` lot 3), submit it, and release every
+/// admitted resource if admission or execution fails.
+pub(super) fn dispatch_pure_operator_outputs(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
+    inputs: Vec<NodeValue>,
+    targets: Vec<OutputTarget>,
+    shapes: &[Vec<u64>],
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
+    if targets.len() != shapes.len() {
+        return Err(InferenceApiError::GraphPlanningFailed {
+            reason: format!("graph node '{operation_id}' has mismatched output targets"),
+        });
+    }
+    let resources: Vec<_> = inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| node_input_resource(operation_id, &format!("input{index}"), value))
+        .collect();
+    for (index, target) in targets.iter().enumerate() {
+        let aliases_input = resources.iter().any(|resource| match resource {
+            NodeInputResource::Fresh(id, ..) | NodeInputResource::Resident(id, ..) => {
+                id == &target.0
+            }
+        });
+        if aliases_input || targets[..index].iter().any(|other| other.0 == target.0) {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: format!(
+                    "graph node '{operation_id}' aliases an output with an input or another output"
+                ),
+            });
+        }
+    }
+    let mut outputs = Vec::with_capacity(targets.len());
+    for (index, (target, shape)) in targets.into_iter().zip(shapes).enumerate() {
+        match resolve_output_target(
+            ctx,
+            &format!("{operation_id}.output{index}"),
+            f32_tensor_descriptor_from_shape(shape),
             Some(target),
         ) {
             Ok(output) => outputs.push(output),
@@ -1820,9 +1892,14 @@ pub(super) fn dispatch_qwen_rmsnorm(
 }
 
 /// The `rmsnorm` node attributes forwarded to the Kernel when the graph sets
-/// them (`dispatch-layered-model-forms`): per-head normalization and a
-/// scale-less RMSNorm.
-const RMSNORM_NODE_ATTRIBUTES: [&str; 3] = ["head_count", "head_dimension", "with_scale"];
+/// them (`dispatch-layered-model-forms`): per-head normalization, a
+/// scale-less RMSNorm and a zero-centered weight (`support-qwen38-flash-next`).
+const RMSNORM_NODE_ATTRIBUTES: [&str; 4] = [
+    "head_count",
+    "head_dimension",
+    "with_scale",
+    "weight_offset",
+];
 
 /// [`dispatch_qwen_rmsnorm`] for a graph node: no weight for a scale-less
 /// RMSNorm, and the node's per-head attributes.

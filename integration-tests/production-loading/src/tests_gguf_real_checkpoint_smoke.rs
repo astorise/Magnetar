@@ -334,7 +334,21 @@ struct CudaQ8Checkpoint {
     revision: &'static str,
     file: &'static str,
     sha256: &'static str,
+    /// The plain-text prompt, which the Runtime tokenizes with the
+    /// beginning-of-sequence token the file declares.
+    prompt: &'static str,
 }
+
+/// A completion prompt: the checkpoints that continue raw text answer it
+/// with " Paris".
+const DEFAULT_PROMPT: &str = "The capital of France is";
+
+/// Gemma 4 12B instruct only answers inside its chat template (the file's
+/// own `tokenizer.chat_template`: a user turn, then the model's, with the
+/// empty thought channel of a request that does not think). The bare
+/// prompt makes it continue with digits (`0111...`), on CUDA and on the
+/// optimized CPU Provider alike; run 45572734242.
+const GEMMA4_12B_PROMPT: &str = "<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
 
 /// `execute-direct-quantized-weights` (B03): a real `Q8_0` export on CUDA,
 /// its quantized matrices stored packed and read packed by the decode
@@ -496,7 +510,7 @@ fn generate_gguf_with(
     }
     let load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
     let request = |max_new_tokens| ProductionGenerationRequest {
-        prompt: PromptInput::PlainText("The capital of France is".into()),
+        prompt: PromptInput::PlainText(checkpoint.prompt.into()),
         parameters: GenerationParameters::greedy(),
         stop_conditions: StopConditions::default(),
         max_new_tokens: Some(max_new_tokens),
@@ -612,6 +626,7 @@ fn real_public_q8_0_gguf_checkpoint_generates_on_native_cpu() {
         revision: CHECKPOINT_REVISION,
         file: "qwen2.5-0.5b-instruct-q8_0.gguf",
         sha256: Q8_0_CHECKPOINT_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -627,6 +642,7 @@ fn real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_native_cpu() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
         sha256: MISTRAL_7B_Q4_K_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -641,6 +657,7 @@ fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
         revision: CHECKPOINT_REVISION,
         file: "qwen2.5-0.5b-instruct-q8_0.gguf",
         sha256: Q8_0_CHECKPOINT_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -667,6 +684,7 @@ fn real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-Q8_0.gguf",
         sha256: MISTRAL_7B_Q8_0_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -689,6 +707,7 @@ fn real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
         sha256: MISTRAL_7B_Q4_K_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -710,6 +729,7 @@ fn real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-Q3_K_M.gguf",
         sha256: MISTRAL_7B_Q3_K_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -725,6 +745,7 @@ fn real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_native_cpu() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-Q3_K_M.gguf",
         sha256: MISTRAL_7B_Q3_K_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -747,6 +768,7 @@ fn real_public_mistral_7b_q2_k_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-Q2_K.gguf",
         sha256: MISTRAL_7B_Q2_K_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -768,6 +790,7 @@ fn real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ4_XS.gguf",
         sha256: MISTRAL_7B_IQ4_XS_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -783,6 +806,7 @@ fn real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_native_cpu() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ4_XS.gguf",
         sha256: MISTRAL_7B_IQ4_XS_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -804,6 +828,7 @@ fn real_public_mistral_7b_iq4_nl_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ4_NL.gguf",
         sha256: MISTRAL_7B_IQ4_NL_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -825,6 +850,7 @@ fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ3_M.gguf",
         sha256: MISTRAL_7B_IQ3_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -840,6 +866,7 @@ fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_native_cpu() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ3_M.gguf",
         sha256: MISTRAL_7B_IQ3_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -861,6 +888,7 @@ fn real_public_mistral_7b_iq3_xxs_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf",
         sha256: MISTRAL_7B_IQ3_XXS_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -882,6 +910,7 @@ fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ2_M.gguf",
         sha256: MISTRAL_7B_IQ2_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -897,6 +926,7 @@ fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_native_cpu() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ2_M.gguf",
         sha256: MISTRAL_7B_IQ2_M_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -918,6 +948,7 @@ fn real_public_mistral_7b_iq2_xs_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ2_XS.gguf",
         sha256: MISTRAL_7B_IQ2_XS_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -939,6 +970,7 @@ fn real_public_mistral_7b_iq2_xxs_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-IQ2_XXS.gguf",
         sha256: MISTRAL_7B_IQ2_XXS_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -965,6 +997,7 @@ fn real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
         revision: QWEN_MOE_Q8_0_REVISION,
         file: "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf",
         sha256: QWEN_MOE_Q8_0_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -994,6 +1027,7 @@ fn real_public_deepseek_v2_lite_q8_0_gguf_checkpoint_generates_on_cuda() {
         revision: DEEPSEEK_V2_LITE_REVISION,
         file: "DeepSeek-V2-Lite-Chat.Q8_0.gguf",
         sha256: DEEPSEEK_V2_LITE_Q8_0_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }
 
@@ -1022,6 +1056,54 @@ fn real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_cuda() {
         revision: GEMMA4_E2B_QAT_REVISION,
         file: "gemma-4-E2B_q4_0-it.gguf",
         sha256: GEMMA4_E2B_QAT_SHA256,
+        prompt: DEFAULT_PROMPT,
+    });
+}
+
+/// `ggml-org/gemma-4-12B-it-GGUF`'s exact pinned commit: llama.cpp's
+/// exports of `google/gemma-4-12B-it`, whose Hugging Face bundle declares
+/// `gemma4_unified` (`read-unified-text-decoder`). The GGUF files declare
+/// `gemma4` and leave the vision embedder to the `mmproj` file.
+const GEMMA4_12B_REVISION: &str = "501d13dba70e3c02b1b12c78fd9e6b08ad413960";
+/// `gemma-4-12B-it-Q4_0.gguf`'s sha256 (7,219,673,216 bytes) at
+/// [`GEMMA4_12B_REVISION`], as Hugging Face declares it.
+const GEMMA4_12B_Q4_0_SHA256: &str =
+    "sha256:3712b9bd32cae83a22f67ee7a4466d8d7a4f21646ac8a07d19bf9418e8767a70";
+
+/// Gemma 4 12B instruct (`Q4_0`) on CUDA, through the Gemma 4 Model
+/// Component: five sliding-window layers to each full one, full layers with
+/// one K/V head of width 512 that derives V from K, a quarter of each full
+/// head rotated through `rope_freqs`, no per-layer inputs and no experts.
+/// 7.2 GB packed: one 12 GB GPU holds it.
+#[test]
+#[ignore = "downloads/holds a 7.2GB real quantized checkpoint"]
+fn real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda gemma-4-12b-it q4_0 gguf",
+        dir_env: "MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR",
+        repository: "ggml-org/gemma-4-12B-it-GGUF",
+        revision: GEMMA4_12B_REVISION,
+        file: "gemma-4-12B-it-Q4_0.gguf",
+        sha256: GEMMA4_12B_Q4_0_SHA256,
+        prompt: GEMMA4_12B_PROMPT,
+    });
+}
+
+/// The same Gemma 4 12B checkpoint on the optimized CPU Provider: the
+/// first run on real weights produced a degenerate continuation on CUDA,
+/// and this one says whether the fault is in a CUDA Kernel or in what both
+/// Providers share (the Component's graph, the loader's layout).
+#[test]
+#[ignore = "downloads/holds a 7.2GB real quantized checkpoint"]
+fn real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native gemma-4-12b-it q4_0 gguf",
+        dir_env: "MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR",
+        repository: "ggml-org/gemma-4-12B-it-GGUF",
+        revision: GEMMA4_12B_REVISION,
+        file: "gemma-4-12B-it-Q4_0.gguf",
+        sha256: GEMMA4_12B_Q4_0_SHA256,
+        prompt: GEMMA4_12B_PROMPT,
     });
 }
 
@@ -1038,5 +1120,6 @@ fn real_public_gemma4_e2b_qat_q4_0_gguf_checkpoint_generates_on_native_cpu() {
         revision: GEMMA4_E2B_QAT_REVISION,
         file: "gemma-4-E2B_q4_0-it.gguf",
         sha256: GEMMA4_E2B_QAT_SHA256,
+        prompt: DEFAULT_PROMPT,
     });
 }

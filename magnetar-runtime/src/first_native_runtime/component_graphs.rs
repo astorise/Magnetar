@@ -48,15 +48,17 @@ pub(super) fn qwen_real_component_runtime()
     // `graph-builder`-only world. `1.5.0` (`execute-and-cache-moe-experts`)
     // adds `model-config.mixture-of-experts`, and the Component also checks
     // `rope-scaling` (`1.4.0`). The current Component also verifies the
-    // checkpoint activation exposed by `1.8.0`.
+    // checkpoint activation exposed by `1.8.0`. `1.13.0`
+    // (`support-qwen38-flash-next`): Qwen3.5's hybrid decoder, through
+    // `linear-attention`, `decoder-variants` and recurrent resources.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.8.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.13.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.8.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.13.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -296,9 +298,11 @@ pub fn register_inference_component_artifact(
     // version keep linking.
     // `1.7.0` (`express-latent-attention-forms`) adds latent attention,
     // mixed expert layers, expert routing and the YaRN RoPE case.
+    // `1.13.0` (`support-qwen38-flash-next`) adds `linear-attention` and
+    // `decoder-variants`.
     for version in [
         "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
-        "1.12.0",
+        "1.12.0", "1.13.0",
     ] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),

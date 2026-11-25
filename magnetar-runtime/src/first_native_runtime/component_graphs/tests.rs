@@ -198,7 +198,7 @@ fn failed_decoder_graph_builds_release_host_capability_state() {
         ),
     ] {
         manager.provide_capability(
-            WitInterface::new(name, "1.8.0"),
+            WitInterface::new(name, "1.13.0"),
             Arc::new(RecordingCapability {
                 inner,
                 keys: keys.clone(),

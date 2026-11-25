@@ -12,8 +12,52 @@ fn e2e_graph_nodes_transport_stays_tensor_value_typed() {
     );
 }
 
+/// `state.out = state.in + x` and `logits = state.out + x`, with the state
+/// declared recurrent.
+fn accumulating_state_graph() -> ExecutionGraph {
+    let data = TensorEdgeId::new("input.data");
+    let input = TensorEdgeId::new("state.in");
+    let output = TensorEdgeId::new("state.out");
+    let logits = TensorEdgeId::new("logits");
+    let metadata = |behavior| GraphRecurrentStateMetadata {
+        resource_id: "state.layer0.sum".into(),
+        layer: 0,
+        slot: "sum".into(),
+        behavior,
+        compatibility_key: "model-v1".into(),
+    };
+    let shape = f32_tensor_descriptor_from_shape(&[1, 2]);
+    let mut input_edge = TensorEdge::new(input.clone(), shape.clone());
+    input_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Input));
+    let mut output_edge = TensorEdge::new(output.clone(), shape.clone());
+    output_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Output));
+    let add = |id: &str| {
+        ExecutionNode::new(
+            ExecutionNodeId::new(id),
+            OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+        )
+    };
+    ExecutionGraph::new(ExecutionGraphId::new("state"), ExecutionGraphPhase::Decode)
+        .with_edge(TensorEdge::new(data.clone(), shape.clone()))
+        .with_edge(input_edge)
+        .with_edge(output_edge)
+        .with_edge(TensorEdge::new(logits.clone(), shape))
+        .with_node(
+            add("update")
+                .with_input(input)
+                .with_input(data.clone())
+                .with_output(output.clone()),
+        )
+        .with_node(
+            add("read")
+                .with_input(output)
+                .with_input(data)
+                .with_output(logits),
+        )
+}
+
 #[test]
-fn recurrent_graph_planning_is_refused_before_allocating_resources() {
+fn recurrent_state_starts_at_zero_and_commits_only_accepted_steps() {
     let fixture = e2e_fixture().unwrap();
     let mut runtime = build_runtime_trusting_fixture(&fixture);
     let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
@@ -21,40 +65,140 @@ fn recurrent_graph_planning_is_refused_before_allocating_resources() {
         .unwrap()
         .status()
         .mutation_version;
-    let mut graph =
-        ExecutionGraph::new(ExecutionGraphId::new("state"), ExecutionGraphPhase::Decode);
-    let input = TensorEdgeId::new("state.in");
-    let output = TensorEdgeId::new("state.out");
-    let metadata = |behavior| GraphRecurrentStateMetadata {
-        resource_id: "state.layer0.conv".into(),
-        layer: 0,
-        slot: "conv".into(),
-        behavior,
-        compatibility_key: "model-v1".into(),
-    };
-    let mut input_edge = TensorEdge::new(input.clone(), f32_tensor_descriptor_from_shape(&[1, 2]));
-    input_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Input));
-    let mut output_edge =
-        TensorEdge::new(output.clone(), f32_tensor_descriptor_from_shape(&[1, 2]));
-    output_edge.recurrent_state = Some(metadata(GraphRecurrentStateBehavior::Output));
-    graph = graph
-        .with_edge(input_edge)
-        .with_edge(output_edge)
-        .with_node(
-            ExecutionNode::new(
-                ExecutionNodeId::new("update"),
-                OperatorId::magnetar("silu", 1, OperatorFamily::Activation),
-            )
-            .with_input(input)
-            .with_output(output),
-        );
+    let graph = accumulating_state_graph();
     graph.validate(&initial_operator_catalog()).unwrap();
-    let active_before = runtime
-        .memory()
-        .allocations()
-        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
-        .count();
-    let result = prepare_first_native_plan_for_graph(
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        1,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider,
+    )
+    .unwrap();
+    let cache = runtime
+        .create_kv_cache(KvCache::new(
+            KvCacheId::new("recurrent-session").unwrap(),
+            KvCacheScope::Session,
+            KvCacheCompatibility::new(
+                GenerationModelReference::ModelInstance(instance.clone()),
+                TokenizerId::new("tokenizer").unwrap(),
+            ),
+            KvCacheLayoutMetadata::contiguous(1, 1, 2, 8, ComputeDType::Float32),
+        ))
+        .unwrap();
+    let executor = resolve_kernel_execution_provider(&runtime, &provider).unwrap();
+    let mut try_step = |runtime: &mut Runtime, x: &[f32]| {
+        execute_first_native_graph_materializing(
+            runtime,
+            &fixture,
+            &instance,
+            &cache,
+            &graph,
+            &mut plan,
+            BTreeMap::from([(
+                TensorEdgeId::new("input.data"),
+                HostTensor::new([1, x.len() as u64], x.to_vec()).unwrap(),
+            )]),
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .map(|(_, outputs, _, _)| outputs[&TensorEdgeId::new("logits")].data.clone())
+    };
+    let commit = |runtime: &mut Runtime| {
+        KvUpdateTransaction {
+            provider_binding: provider.clone(),
+            executor: executor.clone(),
+            promoted: Vec::new(),
+        }
+        .commit(runtime, &cache)
+        .unwrap();
+    };
+
+    // A new sequence reads zeros; the step's state is pending, not committed.
+    assert_eq!(try_step(&mut runtime, &[1.0, 2.0]).unwrap(), [2.0, 4.0]);
+    let kv_cache = runtime.kv_cache(&cache).unwrap();
+    assert!(kv_cache.recurrent_resources.is_empty());
+    let first = kv_cache.pending_recurrent_resources["state.layer0.sum"].clone();
+    assert_eq!(first.shape, [1, 2]);
+    assert_eq!(first.compatibility_key, "model-v1");
+    commit(&mut runtime);
+    let kv_cache = runtime.kv_cache(&cache).unwrap();
+    assert!(kv_cache.pending_recurrent_resources.is_empty());
+    assert_eq!(kv_cache.recurrent_resources["state.layer0.sum"], first);
+
+    // A step that is not accepted leaves the committed state in place.
+    assert_eq!(try_step(&mut runtime, &[10.0, 20.0]).unwrap(), [21.0, 42.0]);
+    // A step failing inside the graph stages nothing.
+    let pending = runtime
+        .kv_cache(&cache)
+        .unwrap()
+        .pending_recurrent_resources
+        .clone();
+    assert!(try_step(&mut runtime, &[1.0, 2.0, 3.0]).is_err());
+    assert_eq!(
+        runtime
+            .kv_cache(&cache)
+            .unwrap()
+            .pending_recurrent_resources,
+        pending
+    );
+    super::super::recurrent_state::discard_recurrent_state(&mut runtime, &executor, &cache);
+    assert_eq!(
+        try_step(&mut runtime, &[100.0, 200.0]).unwrap(),
+        [201.0, 402.0]
+    );
+    // Steps of one attempt continue its pending state.
+    assert_eq!(
+        try_step(&mut runtime, &[1000.0, 2000.0]).unwrap(),
+        [2101.0, 4202.0]
+    );
+    commit(&mut runtime);
+    // The superseded value was released.
+    assert!(executor.read_tensor_value(&first.resource).is_none());
+    assert!(!runtime.memory().is_live_allocation(first.allocation));
+    assert_eq!(
+        try_step(&mut runtime, &[0.0, 0.0]).unwrap(),
+        [1101.0, 2202.0]
+    );
+
+    // Releasing the request's state frees every value; a new sequence
+    // starts from zeros again.
+    let held: Vec<_> = {
+        let kv_cache = runtime.kv_cache(&cache).unwrap();
+        kv_cache
+            .recurrent_resources
+            .values()
+            .chain(kv_cache.pending_recurrent_resources.values())
+            .cloned()
+            .collect()
+    };
+    assert_eq!(held.len(), 2);
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+    for binding in held {
+        assert!(executor.read_tensor_value(&binding.resource).is_none());
+        assert!(!runtime.memory().is_live_allocation(binding.allocation));
+    }
+    assert_eq!(try_step(&mut runtime, &[1.0, 1.0]).unwrap(), [2.0, 2.0]);
+}
+
+#[test]
+fn recurrent_state_inputs_are_runtime_owned_and_need_a_cache() {
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let graph = accumulating_state_graph();
+    let mut plan = prepare_first_native_plan_for_graph(
         &runtime,
         &graph,
         &instance,
@@ -62,18 +206,64 @@ fn recurrent_graph_planning_is_refused_before_allocating_resources() {
         1,
         PreparedExecutionPlanGeneration::new(1),
         &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
-    );
+    )
+    .unwrap();
+    let tensor = || HostTensor::new([1, 2], vec![1.0, 2.0]).unwrap();
+    let mut run = |runtime: &mut Runtime, cache: &str, bindings| {
+        execute_first_native_graph_materializing(
+            runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new(cache).unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+    };
+    // No KV cache to hold the state.
     assert!(matches!(
-        result,
-        Err(E2eConformanceError::KernelCoverageMissing { .. })
+        run(
+            &mut runtime,
+            "missing",
+            BTreeMap::from([(TensorEdgeId::new("input.data"), tensor())])
+        ),
+        Err(InferenceApiError::KvCacheUnavailable { .. })
     ));
-    assert_eq!(
+    let cache = runtime
+        .create_kv_cache(KvCache::new(
+            KvCacheId::new("recurrent-owned").unwrap(),
+            KvCacheScope::Session,
+            KvCacheCompatibility::new(
+                GenerationModelReference::ModelInstance(instance.clone()),
+                TokenizerId::new("tokenizer").unwrap(),
+            ),
+            KvCacheLayoutMetadata::contiguous(1, 1, 2, 8, ComputeDType::Float32),
+        ))
+        .unwrap();
+    // A caller-supplied state input is refused.
+    assert!(matches!(
+        run(
+            &mut runtime,
+            cache.as_str(),
+            BTreeMap::from([
+                (TensorEdgeId::new("input.data"), tensor()),
+                (TensorEdgeId::new("state.in"), tensor()),
+            ])
+        ),
+        Err(InferenceApiError::GraphPlanningFailed { .. })
+    ));
+    assert!(
         runtime
-            .memory()
-            .allocations()
-            .filter(|allocation| allocation.state == MemoryAllocationState::Active)
-            .count(),
-        active_before
+            .kv_cache(&cache)
+            .unwrap()
+            .pending_recurrent_resources
+            .is_empty()
     );
 }
 
@@ -2068,6 +2258,9 @@ fn the_reference_cpu_declares_every_layered_form() {
         ("attention", ATTENTION_VALUE_HEAD_DIMENSION_FEATURE),
         ("concat", CONCAT_HEADS_FEATURE),
         ("rope", ROPE_YARN_FREQUENCY_SCALING_FEATURE),
+        // `support-qwen38-flash-next`.
+        ("rmsnorm", RMSNORM_WEIGHT_OFFSET_FEATURE),
+        ("split", SPLIT_PER_HEAD_FEATURE),
     ] {
         assert!(
             provider_kernels_declare(&runtime, &provider, operator, feature),
@@ -2575,6 +2768,251 @@ fn prefill_and_decode_an_expanded_latent_attention_layer(device_resident: bool) 
         assert_eq!(
             executor.resident_shape(&state.v).unwrap()[1],
             MLA_HEADS * MLA_VALUE
+        );
+    }
+}
+
+/// Qwen3.5's gated full-attention block, built from portable operators the
+/// way the Qwen Component emits it, against the pinned upstream class
+/// (`support-qwen38-flash-next`): per-head query/gate split, zero-centered
+/// per-head norms, partial half-split rotary, grouped attention and the
+/// sigmoid output gate.
+#[test]
+fn qwen35_gated_attention_block_matches_pinned_reference() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        hidden_size: u64,
+        tokens: u64,
+        heads: u64,
+        kv_heads: u64,
+        head_dim: u64,
+        rotary_dim: u64,
+        rope_theta: f64,
+        epsilon: f64,
+        hidden: Vec<f32>,
+        weights: BTreeMap<String, Vec<f32>>,
+        output: Vec<f32>,
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../fixtures/qwen35-attention-reference.json"
+    ))
+    .unwrap();
+    let (rows, hidden) = (fixture.tokens, fixture.hidden_size);
+    let (heads, kv_heads, dim) = (fixture.heads, fixture.kv_heads, fixture.head_dim);
+    let int = |value: u64| OperatorAttributeValue::Integer(value as i64);
+    let mut g = FormsGraph {
+        graph: ExecutionGraph::new(
+            ExecutionGraphId::new("qwen35-attention"),
+            ExecutionGraphPhase::Prefill,
+        ),
+    };
+    let x = g.input("hidden", &[rows, hidden]);
+    // Projections as the loaders deliver them: `[in, out]`.
+    let weight_shapes = [
+        ("q_proj.weight", vec![hidden, 2 * heads * dim]),
+        ("k_proj.weight", vec![hidden, kv_heads * dim]),
+        ("v_proj.weight", vec![hidden, kv_heads * dim]),
+        ("o_proj.weight", vec![heads * dim, hidden]),
+        ("q_norm.weight", vec![dim]),
+        ("k_norm.weight", vec![dim]),
+    ];
+    let weight: BTreeMap<_, _> = weight_shapes
+        .iter()
+        .map(|(name, shape)| (*name, g.input(name, shape)))
+        .collect();
+    let transposed = Vec::new;
+    let projected = g.node(
+        "q_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![x.clone(), weight["q_proj.weight"].clone()],
+        &[rows, 2 * heads * dim],
+    );
+    // Each head's projection is [query | gate].
+    let split = ExecutionNodeId::new("q_split");
+    let (query, gate) = (
+        TensorEdgeId::new("edge.q_split.0"),
+        TensorEdgeId::new("edge.q_split.1"),
+    );
+    for edge in [&query, &gate] {
+        g.graph.edges.insert(
+            edge.clone(),
+            TensorEdge::new(
+                edge.clone(),
+                f32_tensor_descriptor_from_shape(&[rows, heads * dim]),
+            )
+            .with_producer(split.clone()),
+        );
+    }
+    g.graph
+        .edges
+        .get_mut(&projected)
+        .unwrap()
+        .consumers
+        .insert(split.clone());
+    g.graph.nodes.insert(
+        split.clone(),
+        ExecutionNode::new(
+            split,
+            OperatorId::magnetar("split", 1, OperatorFamily::Tensor),
+        )
+        .with_input(projected)
+        .with_output(query.clone())
+        .with_output(gate.clone())
+        .with_attribute("head_count", int(heads)),
+    );
+    let norm = |g: &mut FormsGraph, id: &str, input: TensorEdgeId, w: &str, count: u64| {
+        g.node(
+            id,
+            "rmsnorm",
+            OperatorFamily::Normalization,
+            vec![
+                ("epsilon", OperatorAttributeValue::Float(fixture.epsilon)),
+                ("head_count", int(count)),
+                ("head_dimension", int(dim)),
+                ("weight_offset", OperatorAttributeValue::Float(1.0)),
+            ],
+            vec![input, weight[w].clone()],
+            &[rows, count * dim],
+        )
+    };
+    let rope = |g: &mut FormsGraph, id: &str, input: TensorEdgeId, count: u64| {
+        g.node(
+            id,
+            "rope",
+            OperatorFamily::PositionEncoding,
+            vec![
+                ("base", OperatorAttributeValue::Float(fixture.rope_theta)),
+                ("dimension", int(fixture.rotary_dim)),
+                ("head_count", int(count)),
+                ("position_offset", int(0)),
+                (
+                    "rotation_pairing",
+                    OperatorAttributeValue::String("half_split".into()),
+                ),
+            ],
+            vec![input],
+            &[rows, count * dim],
+        )
+    };
+    let q = norm(&mut g, "q_norm", query, "q_norm.weight", heads);
+    let q = rope(&mut g, "q_rope", q, heads);
+    let k = g.node(
+        "k_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![x.clone(), weight["k_proj.weight"].clone()],
+        &[rows, kv_heads * dim],
+    );
+    let k = norm(&mut g, "k_norm", k, "k_norm.weight", kv_heads);
+    let k = rope(&mut g, "k_rope", k, kv_heads);
+    let v = g.node(
+        "v_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![x, weight["v_proj.weight"].clone()],
+        &[rows, kv_heads * dim],
+    );
+    let attended = g.node(
+        "attention",
+        "attention",
+        OperatorFamily::Attention,
+        vec![
+            ("causal", OperatorAttributeValue::Boolean(true)),
+            ("head_count", int(heads)),
+            ("kv_head_count", int(kv_heads)),
+            ("head_dimension", int(dim)),
+        ],
+        vec![q, k, v],
+        &[rows, heads * dim],
+    );
+    let gate = g.node(
+        "gate",
+        "activation",
+        OperatorFamily::Activation,
+        vec![("kind", OperatorAttributeValue::String("sigmoid".into()))],
+        vec![gate],
+        &[rows, heads * dim],
+    );
+    let gated = g.node(
+        "gated",
+        "mul",
+        OperatorFamily::Tensor,
+        vec![],
+        vec![attended, gate],
+        &[rows, heads * dim],
+    );
+    let output = g.node(
+        "o_proj",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        transposed(),
+        vec![gated, weight["o_proj.weight"].clone()],
+        &[rows, hidden],
+    );
+    let graph = g.graph;
+    graph.validate(&initial_operator_catalog()).unwrap();
+
+    let e2e = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&e2e);
+    let (instance, _) = load_fixture_instance(&e2e, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        rows,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    let mut bindings = BTreeMap::from([(
+        TensorEdgeId::new("input.hidden"),
+        HostTensor::new([rows, hidden], fixture.hidden.clone()).unwrap(),
+    )]);
+    for (name, shape) in &weight_shapes {
+        let values = &fixture.weights[*name];
+        // The checkpoint's `[out, in]` projection, transposed.
+        let values = match shape.as_slice() {
+            [inputs, outputs] => (0..inputs * outputs)
+                .map(|index| values[((index % outputs) * inputs + index / outputs) as usize])
+                .collect(),
+            _ => values.clone(),
+        };
+        bindings.insert(
+            TensorEdgeId::new(format!("input.{name}")),
+            HostTensor::new(shape.clone(), values).unwrap(),
+        );
+    }
+    let (_, outputs, _, _) = execute_first_native_graph_materializing(
+        &mut runtime,
+        &e2e,
+        &instance,
+        &KvCacheId::new("qwen35-attention").unwrap(),
+        &graph,
+        &mut plan,
+        bindings,
+        None,
+        Some(0),
+        &mut Vec::new(),
+        MaterializedEdges::All,
+        None,
+        None,
+    )
+    .unwrap();
+    let actual = &outputs[&output].data;
+    assert_eq!(actual.len(), fixture.output.len());
+    for (index, (a, b)) in actual.iter().zip(&fixture.output).enumerate() {
+        assert!(
+            (a - b).abs() <= 2e-6 + 1e-5 * b.abs(),
+            "output[{index}]: {a} != {b}"
         );
     }
 }

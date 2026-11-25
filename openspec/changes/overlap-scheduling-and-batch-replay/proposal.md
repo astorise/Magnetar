@@ -34,7 +34,7 @@ Existing contracts to reuse:
 ## Dependencies
 
 - `C02`: [`cache-and-optimize-prepared-graphs`](../cache-and-optimize-prepared-graphs/proposal.md).
-- `C04`: [`capture-and-replay-cuda-graphs`](../capture-and-replay-cuda-graphs/proposal.md).
+- `C04`: [`capture-and-replay-cuda-graphs`](../archive/2026-11-25-capture-and-replay-cuda-graphs/proposal.md).
 - `E01`: [`serve-continuous-batches-with-qos`](../serve-continuous-batches-with-qos/proposal.md).
 
 Dependencies are exit-gate prerequisites, not a ban on independent design or hardware experiments.

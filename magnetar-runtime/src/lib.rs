@@ -158,4 +158,6 @@ mod graph_fusion_runtime_tests;
 #[cfg(test)]
 mod kernel_registry_runtime_tests;
 #[cfg(test)]
+mod qwen4_exp_semantics_tests;
+#[cfg(test)]
 mod tests;

@@ -19,7 +19,7 @@ name: GPU Runner Smoke Test
 # runner, so the schedule cannot pile up runs alongside a manual dispatch.
 #
 # Step groups: a manual dispatch's `suite` input picks groups (kernels,
-# dense, long-context, gguf, multi-gpu, moe, gemma, kv); its default, "standard",
+# dense, long-context, gguf, multi-gpu, moe, gemma, kv, hybrid); its default, "standard",
 # leaves out the long-context campaigns (Tensor Cores on and off, about a
 # third of the run) and the TurboQuant KV checks (kv), which the daily
 # schedule still runs with every other group. The CUDA Provider build and
@@ -31,8 +31,9 @@ on:
       suite:
         description: >-
           Comma-separated groups to run: kernels, dense, long-context, gguf,
-          multi-gpu, moe, gemma, kv; or "standard" (all but long-context and kv) or "all".
-          The daily schedule always runs "all".
+          multi-gpu, moe, gemma, kv, hybrid; or "standard" (all but long-context and kv) or "all".
+          "latent" (the f32 latent history's context ceiling, 16.7 GB to download) is never part of
+          "standard" or "all". The daily schedule always runs "all".
         required: false
         default: standard
   schedule:
@@ -65,10 +66,10 @@ jobs:
           set -eu
           suite="$(echo "$SUITE" | tr -d ' ')"
           case ",$suite," in
-            *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe,gemma,kv" ;;
-            *,standard,*) suite="$suite,kernels,dense,gguf,multi-gpu,moe,gemma" ;;
+            *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe,gemma,kv,hybrid" ;;
+            *,standard,*) suite="$suite,kernels,dense,gguf,multi-gpu,moe,gemma,hybrid" ;;
           esac
-          for group in kernels dense long-context gguf multi-gpu moe gemma kv; do
+          for group in kernels dense long-context gguf multi-gpu moe gemma kv hybrid latent; do
             var="SUITE_$(echo "$group" | tr 'a-z-' 'A-Z_')"
             case ",$suite," in
               *",$group,"*) echo "$var=true" >> "$GITHUB_ENV"; echo "$group: on" ;;
@@ -77,7 +78,7 @@ jobs:
           done
           for group in $(echo "$suite" | tr ',' ' '); do
             case "$group" in
-              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe|gemma|kv) ;;
+              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe|gemma|kv|hybrid|latent) ;;
               *) echo "::error::unknown suite group: $group"; exit 1 ;;
             esac
           done
@@ -105,7 +106,7 @@ jobs:
         # unrelated to that change's own content), fixed here alongside.
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf
+          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf components/laya components/modernbert components/nemotron components/olala
       - name: Verify GPU is visible
         run: |
           set -eux
@@ -202,6 +203,15 @@ jobs:
         # table first; diagnostic only.
         timeout-minutes: 10
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml packed_embedding_lookup_times -- --ignored --nocapture
+      - name: CUDA captured step Device memory (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # capture-and-replay-cuda-graphs 1.2: the Device memory a captured
+        # rope -> rmsnorm step retains (its graph executable) and what its
+        # release gives back; the retirement test
+        # (`a_replay_in_flight_survives_the_retirement_of_its_resources`)
+        # runs with the conformance tests above.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml captured_step_device_memory -- --ignored --nocapture
       - name: Build and test the real first-native Qwen Component against a real CudaProvider
         if: ${{ env.SUITE_DENSE == 'true' }}
         # #58: `integration-tests/cuda-first-native` runs the real
@@ -1595,6 +1605,49 @@ jobs:
             echo "::error::Gemma 4 E2B QAT Q4_0 on the optimized CPU: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Download the pinned real Gemma 4 12B instruct Q4_0 GGUF checkpoint
+        # read-unified-text-decoder 2.3: 7.2 GB, public, pinned by its
+        # sha256, which the test verifies. The E2B export is removed first.
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' }}
+        env:
+          REVISION: 501d13dba70e3c02b1b12c78fd9e6b08ad413960
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/gemma-4-e2b-it-qat-q4_0-gguf-*
+          df -h "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/gemma-4-12b-it-q4_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/$REVISION/gemma-4-12B-it-Q4_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Gemma 4 12B instruct Q4_0 GGUF on CUDA and the optimized CPU Provider
+        # read-unified-text-decoder 2.3: the 12B's layout on real weights
+        # (five sliding layers to one full layer, one K/V head of width 512
+        # on the full layers, a quarter of each full head rotated) through
+        # the Gemma 4 Component, on one GPU and on the optimized CPU
+        # Provider. The model answers inside its chat template; the bare
+        # prompt of the other checkpoints makes it continue with digits
+        # (run 45572734242), on every Provider alike.
+        if: ${{ !cancelled() && env.SUITE_GEMMA == 'true' && env.MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 60
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -uo pipefail
+          trap 'rm -rf "$MAGNETAR_GEMMA4_12B_GGUF_Q4_0_REAL_CHECKPOINT_DIR"' EXIT
+          dir="$RUNNER_TEMP/qualification-reports/gemma-4-12b-q4_0-gguf"
+          mkdir -p "$dir"
+          status=0
+          run_variant() {
+            local label="$1" test="$2"
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml "$test" -- --include-ignored --test-threads=1 --nocapture > "$dir/$label.log" 2>&1 || echo "::warning::Gemma 4 12B $label: the test failed"
+            grep -h 'generated text\|warm TTFT' "$dir/$label.log" | sed "s/^/$label: /" || true
+            grep -Eq 'generated text ".*Paris' "$dir/$label.log" || { echo "::error::Gemma 4 12B Q4_0 on $label: the answer to 'What is the capital of France?' does not name Paris"; status=1; }
+          }
+          run_variant cuda real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_cuda
+          run_variant cpu-native real_public_gemma4_12b_q4_0_gguf_checkpoint_generates_on_native_cpu
+          exit "$status"
       - name: TurboQuant KV stores on real checkpoints against f32
         # turboquant-kv-history: each checkpoint generates on one GPU with
         # f32, tq4 and tq3 KV stores (MAGNETAR_KV_PRECISION); the greedy
@@ -1809,7 +1862,7 @@ jobs:
         # register-deepseek-model-component: 16.7 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
         # Qwen1.5-MoE checkpoint is removed first to free the disk.
-        if: ${{ !cancelled() && env.SUITE_MOE == 'true' }}
+        if: ${{ !cancelled() && (env.SUITE_MOE == 'true' || env.SUITE_LATENT == 'true') }}
         env:
           REVISION: b6350f4c672640e949652ae480226b25deb88091
         shell: bash
@@ -1908,6 +1961,77 @@ jobs:
           echo "GPU clocks (timestamp, index, SM MHz, memory MHz, temperature, power, P-state):"
           cat "$report/clocks.csv" || true
           cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - name: DeepSeek-V2-Lite-Chat Q8_0 GGUF f32 latent history ceiling
+        # bound-one-pass-prefill-memory 3.2: the longest context an f32
+        # latent history prefills on the two 12 GB GPUs, the layers
+        # balanced. 16,384 tokens ran out of the second GPU's memory at
+        # layer 25 (run 44382825307); 4,096 runs. Ascending contexts, the
+        # test stops at the first that fails and prints each GPU's free
+        # memory after it.
+        if: ${{ !cancelled() && env.SUITE_LATENT == 'true' && env.MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+          MAGNETAR_KV_POOL_BYTES: "0"
+          MAGNETAR_KV_GAINS_PRECISIONS: "f32"
+          MAGNETAR_KV_GAINS_CONTEXTS: "4096,8192,12288,16384"
+          MAGNETAR_KV_GAINS_LABEL: deepseek-v2-lite-chat-q8_0-f32-ceiling
+        shell: bash
+        run: |
+          set -o pipefail
+          report="$RUNNER_TEMP/qualification-reports/deepseek-v2-lite-q8_0-f32-ceiling"
+          mkdir -p "$report"
+          MAGNETAR_KV_GAINS_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_V2_LITE_GGUF_Q8_0_REAL_CHECKPOINT_DIR" \
+          MAGNETAR_KV_GAINS_REPORT="$report/gains.md" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml turboquant_kv_gains_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$report/gains.log"
+          cat "$report/gains.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Download the pinned real Qwen3.5-0.8B-Base checkpoint
+        if: ${{ !cancelled() && env.SUITE_HYBRID == 'true' }}
+        # support-qwen38-flash-next task 2.7: the gated-delta hybrid (three
+        # linear-attention layers to each gated full-attention layer),
+        # Apache-2.0. The weights' sha256 is verified by the test itself;
+        # the other files against the digests they had at this revision.
+        env:
+          REVISION: dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68
+          CONFIG_JSON_SHA256: b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204
+          TOKENIZER_JSON_SHA256: fe000e3ed39ed12b8d2481d527d44f93c65d37e87645d2dcc80d1bf9d50d2927
+          TOKENIZER_CONFIG_JSON_SHA256: e611fbccc7c29ef3b1cafb1cb7ea548d189968632901d678fd62be68c47885de
+        run: |
+          set -eux
+          dir="$RUNNER_TEMP/qwen3.5-0.8b-base-$REVISION"
+          mkdir -p "$dir"
+          base="https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/resolve/$REVISION"
+          for file in config.json tokenizer.json tokenizer_config.json; do
+            curl -fsSL "$base/$file" -o "$dir/$file"
+          done
+          curl -fsSL "$base/model.safetensors-00001-of-00001.safetensors" -o "$dir/model.safetensors"
+          verify() {
+            local file="$1" expected="$2"
+            local actual
+            actual="$(sha256sum "$dir/$file" | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$file sha256 mismatch: expected $expected, got $actual"
+              exit 1
+            fi
+          }
+          verify config.json "$CONFIG_JSON_SHA256"
+          verify tokenizer.json "$TOKENIZER_JSON_SHA256"
+          verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
+          echo "MAGNETAR_QWEN35_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Qwen3.5-0.8B-Base on CUDA against the transformers corpus
+        if: ${{ !cancelled() && env.SUITE_HYBRID == 'true' && env.MAGNETAR_QWEN35_REAL_CHECKPOINT_DIR != '' }}
+        # One prefill and 15 decode steps that carry the 18 gated-delta
+        # mixers' recurrent states, against transformers' full recompute
+        # (fixtures/qualification/qwen3.5-0.8b-base-dc7cdfe-transformers-f32.json):
+        # 16 equal greedy tokens and the top logits within the F32 profile.
+        timeout-minutes: 30
+        env:
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda,cpu-native
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml qwen3_5_real_checkpoint -- --include-ignored --test-threads=1 --nocapture
       - name: GPU peer-to-peer readiness, again (diagnostic)
         # The readiness printed at the start, repeated where the job's log
         # tail keeps it.

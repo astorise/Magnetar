@@ -98,15 +98,8 @@ pub(super) fn prepare_first_native_plan_serving(
     generation: PreparedExecutionPlanGeneration,
     provider: &ProviderBinding,
 ) -> Result<PreparedExecutionPlan, E2eConformanceError> {
-    if graph
-        .edges
-        .values()
-        .any(|edge| edge.recurrent_state.is_some())
-    {
-        return Err(E2eConformanceError::KernelCoverageMissing {
-            reason: "recurrent state lifecycle is not implemented by this execution planner".into(),
-        });
-    }
+    // Recurrent state edges need no Kernel: the executor binds them to the
+    // session's state (`support-qwen38-flash-next`).
     let phase = PreparedExecutionPhase::from(graph.phase);
     let mut scope = PreparedExecutionPlanScope::for_phase(phase)
         .with_model_instance(instance.clone(), model_instance_revision)

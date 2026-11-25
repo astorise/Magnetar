@@ -383,3 +383,62 @@ shape validation before execution.
 - **WHEN** its Component builds a production graph
 - **THEN** graph construction or validation fails before the graph executes
 
+### Requirement: Model configuration exposes a per-layer layout
+
+`model-config@1.6.0` SHALL expose `layer-layout`, which returns one `layer-spec` per decoder layer when the active artifact's layers differ, or `none` when `architecture-config` describes every layer. It SHALL also expose `options`, carrying `final-logit-softcapping` and `per-layer-input-size`.
+
+The Runtime SHALL derive these values from the artifact's normalized configuration. It SHALL refuse a layout whose entry count differs from the layer count, whose widths are zero, whose KV heads do not divide the attention heads, or whose `kv-source-layer` is not an earlier layer that computes its own K/V with the same head width and KV head count.
+
+#### Scenario: Uniform checkpoint
+- **WHEN** a Component bound to a checkpoint with uniform layers calls `layer-layout` and `options`
+- **THEN** it gets `none` and an `architecture-options` record whose fields are both `none`
+
+#### Scenario: Layered checkpoint
+- **WHEN** the bound configuration carries a layout and options
+- **THEN** `layer-layout` returns one record per layer with the bound values, and `options` returns the bound softcap and per-layer input width
+
+#### Scenario: Inconsistent layout
+- **WHEN** a configuration's layout names a later layer as a KV source
+- **THEN** validation fails before any Component is invoked
+
+### Requirement: Earlier contract versions keep linking
+
+The Runtime SHALL provide `graph-builder` and `model-config` at `1.6.0` and at every earlier supported version, `1.2.0` to `1.5.0`.
+
+#### Scenario: Component compiled against 1.5.0
+- **WHEN** a Component whose manifest declares `1.5.0` is linked after this change
+- **THEN** it links and builds graphs as before
+
+### Requirement: The graph-builder offers every tensor of the loaded artifact
+
+For a loaded Model Artifact, the graph-builder SHALL offer each tensor of the artifact's inventory as a weight a Component may request:
+- a tensor the architecture configuration derives SHALL keep its derived shape;
+- any other tensor SHALL have the shape the inventory declares.
+
+#### Scenario: Per-head norm weights
+- **WHEN** a Component requests `layers.0.self_attn.q_norm` and the loaded artifact carries that tensor
+- **THEN** the graph-builder binds it with the artifact's shape, and the graph is built
+
+### Requirement: Model configuration for latent attention, mixed expert layers and expert routing
+
+`model-config` `1.7.0` SHALL add, without changing any earlier function or record: `multi-head-latent-attention` (`option<mla-config>`), `mixture-of-experts-layers` (`option<list<bool>>`, one entry per layer), `expert-routing` (`option<expert-routing-config>`), and a `yarn` case of `rope-frequency-scaling`. The host SHALL keep serving `1.2.0` to `1.6.0`, and SHALL encode each value against the calling Component's own types, so that a Component compiled against an earlier version fails its call instead of receiving a case it cannot represent.
+
+#### Scenario: The values cross the real component boundary
+- **WHEN** a Component compiled against `1.7.0` reads the four functions for a checkpoint declaring latent attention, three layers of which two are MoE, sigmoid routing in four groups and YaRN
+- **THEN** it reads back every field the Runtime bound, and reads `none` from each for a checkpoint declaring none of them
+
+#### Scenario: A Component predating YaRN
+- **WHEN** a Component compiled against `1.4.0` calls `rope-scaling` for a YaRN checkpoint
+- **THEN** the call fails
+
+### Requirement: Declared features a graph does not show must be read
+
+When the bound configuration declares latent attention, mixed expert layers or expert routing, the Runtime SHALL refuse a graph built by a Component that did not call the function carrying that feature since the configuration was bound. Every `rope` node SHALL declare exactly the configuration's frequency scaling, YaRN included.
+
+#### Scenario: A Component that predates the feature
+- **WHEN** the Qwen Component compiled against `1.5.0` builds graphs for a checkpoint declaring mixed expert layers or expert routing
+- **THEN** the Runtime refuses the graphs and names the unread function
+
+#### Scenario: A YaRN checkpoint without YaRN nodes
+- **WHEN** a graph for a YaRN checkpoint has a `rope` node without the YaRN attributes, or with other values
+- **THEN** the Runtime refuses the graph

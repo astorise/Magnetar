@@ -1824,6 +1824,7 @@ pub(super) fn dispatch_qwen_oracle_mlp_gate_up(
         &format!("{layer_id}.split"),
         gate_up,
         [None, None],
+        BTreeMap::new(),
     )?;
     let [gate, up]: [NodeValue; 2] =
         split_outputs
@@ -6739,6 +6740,10 @@ pub(super) struct ReplayingExecutor {
     /// Test hooks.
     pub(super) fail_capture: AtomicBool,
     pub(super) invalidate_next_replay: AtomicBool,
+    /// Refuses to begin a capture for lack of memory, as a Provider that
+    /// cannot reserve the memory a capture needs.
+    pub(super) refuse_capture_memory: AtomicBool,
+    pub(super) capture_attempts: AtomicU64,
     /// Selects greedy tokens "on the Device" (`select_greedy_column`).
     pub(super) select_greedy: AtomicBool,
     pub(super) greedy_selections: AtomicU64,
@@ -6774,6 +6779,8 @@ impl ReplayingExecutor {
             state: Mutex::new(ReplayingState::default()),
             fail_capture: AtomicBool::new(false),
             invalidate_next_replay: AtomicBool::new(false),
+            refuse_capture_memory: AtomicBool::new(false),
+            capture_attempts: AtomicU64::new(0),
             select_greedy: AtomicBool::new(false),
             greedy_selections: AtomicU64::new(0),
             zero_on_provider: AtomicBool::new(false),
@@ -6982,6 +6989,16 @@ impl ProviderExecutionApi for ReplayingExecutor {
         &self,
         request: &StepCaptureRequest,
     ) -> Result<(), ProviderExecutionError> {
+        self.capture_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_capture_memory.load(Ordering::SeqCst) {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::OutOfMemory,
+                ProviderExecutionPhase::Submit,
+                ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+                None,
+                "the memory a capture needs could not be reserved",
+            ));
+        }
         let mut state = self.state.lock().unwrap();
         if state.recording.is_some() {
             return Err(Self::failure("a capture is already in progress"));
@@ -7213,4 +7230,126 @@ pub(super) fn run_replaying_decode_on(
             .unwrap();
     }
     (steps, executor, runtime)
+}
+
+/// Several requests on one engine and one [`ReplayingExecutor`] Runtime,
+/// for the captures' lifecycle (`capture-and-replay-cuda-graphs` 3.3).
+pub(super) struct ReplayingLifecycle {
+    pub(super) runtime: Runtime,
+    pub(super) fixture: E2eFixture,
+    pub(super) instance: ModelInstanceId,
+    pub(super) engine: E2eRuntimeModelExecutionEngine,
+    pub(super) executor: Arc<ReplayingExecutor>,
+}
+
+/// One request of a [`ReplayingLifecycle`]: its decode steps so far.
+pub(super) struct ReplayingRequest {
+    pub(super) request: GenerationRequest,
+    plans: FirstNativePreparedPlans,
+    generated: Vec<TokenId>,
+    /// Each step's logits bits, the prefill's first.
+    pub(super) steps: Vec<Vec<u32>>,
+}
+
+impl ReplayingLifecycle {
+    pub(super) fn new() -> Self {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let executor = Arc::new(ReplayingExecutor::new());
+        let provider = Arc::new(ReplayingProvider {
+            inner: ReferenceCpuProvider::new(),
+            executor: executor.clone(),
+        });
+        let mut runtime =
+            build_runtime_with_model_execution_engine_and_provider(&fixture, provider).unwrap();
+        let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let engine = new_kv_lifecycle_engine(&fixture);
+        engine.step_replay.set_enabled(true);
+        Self {
+            runtime,
+            fixture,
+            instance,
+            engine,
+            executor,
+        }
+    }
+
+    /// A request over the prompt `[1, 2]`, prefilled and committed.
+    pub(super) fn start(
+        &mut self,
+        id: &str,
+        session: Option<InferenceSessionId>,
+    ) -> ReplayingRequest {
+        let tokenized = tokenize_prompt_input(
+            &self.fixture.tokenizer,
+            TokenizationRequest::new(PromptInput::TokenIds(vec![1, 2])),
+            None,
+        )
+        .unwrap();
+        let request = prepare_generation(
+            &self.runtime,
+            build_generation_request(
+                GenerationRequestId::new(id).unwrap(),
+                session,
+                GenerationModelReference::ModelInstance(self.instance.clone()),
+                generation_tokenizer_reference(&self.fixture),
+                tokenized,
+                16,
+                GenerationParameters::greedy(),
+                StopConditions::default(),
+                StreamingMode::Disabled,
+            ),
+        )
+        .unwrap();
+        let mut plans = first_native_plans_for_prompt(
+            &self.runtime,
+            &self.fixture,
+            &self.instance,
+            request.input_token_ids.len() as u64,
+        )
+        .unwrap();
+        let prefill = self
+            .engine
+            .execute_generation_step(&mut self.runtime, &request, &[], Some(&mut plans.prefill))
+            .unwrap();
+        self.engine
+            .commit_generation_step(&mut self.runtime, &request, &[], 1, &prefill)
+            .unwrap();
+        let bits = prefill.logits.iter().map(|value| value.to_bits()).collect();
+        ReplayingRequest {
+            request,
+            plans,
+            generated: vec![1],
+            steps: vec![bits],
+        }
+    }
+
+    /// `count` more decode steps of `request`.
+    pub(super) fn decode(&mut self, request: &mut ReplayingRequest, count: usize) {
+        for _ in 0..count {
+            let index = request.generated.len();
+            let step = self
+                .engine
+                .execute_generation_step(
+                    &mut self.runtime,
+                    &request.request,
+                    &request.generated,
+                    Some(&mut request.plans.decode),
+                )
+                .unwrap();
+            request
+                .steps
+                .push(step.logits.iter().map(|value| value.to_bits()).collect());
+            let token = (index % 3 + 1) as TokenId;
+            self.engine
+                .commit_generation_step(
+                    &mut self.runtime,
+                    &request.request,
+                    &request.generated,
+                    token,
+                    &step,
+                )
+                .unwrap();
+            request.generated.push(token);
+        }
+    }
 }

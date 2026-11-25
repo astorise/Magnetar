@@ -968,3 +968,124 @@ fn concat_across_heads_validates_its_widths() {
         Err(OperatorError::OperatorAttributeInvalid { .. })
     ));
 }
+
+#[test]
+fn qwen35_norm_offset_and_per_head_split_are_kernel_features() {
+    let attributes = |pairs: &[(&str, OperatorAttributeValue)]| {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        required_kernel_features(
+            "rmsnorm",
+            &attributes(&[
+                ("epsilon", OperatorAttributeValue::Float(1e-6)),
+                ("weight_offset", OperatorAttributeValue::Float(1.0)),
+            ]),
+            2
+        ),
+        vec![RMSNORM_WEIGHT_OFFSET_FEATURE]
+    );
+    // A zero offset is the baseline form.
+    assert!(
+        required_kernel_features(
+            "rmsnorm",
+            &attributes(&[("weight_offset", OperatorAttributeValue::Float(0.0))]),
+            2
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        required_kernel_features(
+            "split",
+            &attributes(&[("head_count", OperatorAttributeValue::Integer(8))]),
+            1
+        ),
+        vec![SPLIT_PER_HEAD_FEATURE]
+    );
+    assert!(
+        required_kernel_features(
+            "split",
+            &attributes(&[("head_count", OperatorAttributeValue::Integer(1))]),
+            1
+        )
+        .is_empty()
+    );
+
+    let catalog = initial_operator_catalog();
+    let tensor = |dimensions: &[u64]| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(dimensions.to_vec()),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        )
+    };
+    let split = catalog
+        .get(&OperatorId::magnetar("split", 1, OperatorFamily::Tensor))
+        .unwrap();
+    // Qwen3.5-0.8B's q_proj: 8 heads of [query 256 | gate 256].
+    let heads = attributes(&[("head_count", OperatorAttributeValue::Integer(8))]);
+    assert!(
+        split
+            .validate_invocation(
+                &[tensor(&[5, 4096])],
+                &[tensor(&[5, 2048]), tensor(&[5, 2048])],
+                &heads
+            )
+            .is_ok()
+    );
+    for (input, output, attributes) in [
+        // Blocks that do not split in half.
+        (
+            tensor(&[5, 24]),
+            tensor(&[5, 12]),
+            attributes(&[("head_count", OperatorAttributeValue::Integer(8))]),
+        ),
+        // A wrong output width.
+        (tensor(&[5, 32]), tensor(&[5, 8]), heads.clone()),
+        // A non-positive head count.
+        (
+            tensor(&[5, 32]),
+            tensor(&[5, 16]),
+            attributes(&[("head_count", OperatorAttributeValue::Integer(0))]),
+        ),
+    ] {
+        assert!(
+            split
+                .validate_invocation(&[input], &[output.clone(), output], &attributes)
+                .is_err()
+        );
+    }
+    let rmsnorm = catalog
+        .get(&OperatorId::magnetar(
+            "rmsnorm",
+            1,
+            OperatorFamily::Normalization,
+        ))
+        .unwrap();
+    let offset = |value: f64| {
+        attributes(&[
+            ("epsilon", OperatorAttributeValue::Float(1e-6)),
+            ("weight_offset", OperatorAttributeValue::Float(value)),
+        ])
+    };
+    assert!(
+        rmsnorm
+            .validate_invocation(
+                &[tensor(&[2, 8]), tensor(&[8])],
+                &[tensor(&[2, 8])],
+                &offset(1.0)
+            )
+            .is_ok()
+    );
+    assert!(
+        rmsnorm
+            .validate_invocation(
+                &[tensor(&[2, 8]), tensor(&[8])],
+                &[tensor(&[2, 8])],
+                &offset(f64::NAN)
+            )
+            .is_err()
+    );
+}

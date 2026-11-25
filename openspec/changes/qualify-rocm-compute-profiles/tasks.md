@@ -21,3 +21,7 @@
 - [ ] 3.5 Check third-party licenses, SBOM, signatures/provenance and artifact reproducibility where native libraries or generated artifacts change.
 - [ ] 3.6 Verify targeted disable, safe fallback/Unsupported, pinned mode and generation rollback; document support limits, public architecture/API migration and measurements.
 - [ ] 3.7 Update the roadmap coverage/support matrix with evidence and actual maturity only after implementation gates pass; archive only completed scope.
+
+## 4. Inherited items
+
+- [ ] 4.1 Decode on AMD hosts (inherited from `speed-up-dense-cpu-matmuls` 7.10, closed there on 2026-11-25 and deferred to this change by the owner). The measured gap, on the EPYC 9V45 (Zen 5): Magnetar 27.0 and 28.4 ms per token against 22.7 and 22.9 ms for llama-server and 21.4 and 21.8 ms for Ollama (runs 45442269420 and 45447623233); llama.cpp streams the 988 MB of one token at 44-46 GB/s, Magnetar at 37 GB/s. Lever to test: llama.cpp's row-at-a-time pattern (`row_streamed_matmul_costs`), one diagnostic at a time (`--test-threads=1`). It concerns the CPU kernels on AMD hosts as much as the ROCm Provider; say where it lands when this change starts.

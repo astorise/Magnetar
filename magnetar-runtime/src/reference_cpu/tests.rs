@@ -579,6 +579,38 @@ fn split_last_dim_in_half_handles_rank_one_input() {
 }
 
 #[test]
+fn split_heads_in_half_splits_each_head_block() {
+    // Two rows of two heads, each [query 2 | gate 2].
+    let input = HostTensor::new(
+        [2, 8],
+        [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, //
+            11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0,
+        ],
+    )
+    .unwrap();
+    let (query, gate) = split_heads_in_half(&input, 2).unwrap();
+    assert_eq!(query.shape, vec![2, 4]);
+    assert_eq!(query.data, vec![1.0, 2.0, 5.0, 6.0, 11.0, 12.0, 15.0, 16.0]);
+    assert_eq!(gate.data, vec![3.0, 4.0, 7.0, 8.0, 13.0, 14.0, 17.0, 18.0]);
+    // One head is the plain split.
+    assert_eq!(
+        split_heads_in_half(&input, 1).unwrap(),
+        split_last_dim_in_half(&input).unwrap()
+    );
+    assert!(split_heads_in_half(&input, 3).is_err());
+}
+
+#[test]
+fn offset_weight_adds_the_offset_to_every_value() {
+    let weight = HostTensor::new([3], [0.0, -0.5, 2.0]).unwrap();
+    assert_eq!(
+        offset_weight(&weight, 1.0).unwrap().data,
+        vec![1.0, 0.5, 3.0]
+    );
+}
+
+#[test]
 fn split_last_dim_in_half_rejects_odd_last_dimension() {
     let input = HostTensor::new([3], [1.0, 2.0, 3.0]).unwrap();
     assert_eq!(

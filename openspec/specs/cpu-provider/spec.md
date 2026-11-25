@@ -639,3 +639,26 @@ When release report is generated
 
 Then Reference CPU status is included.
 
+### Requirement: Optimized CPU Provider Runs Packed Q4_0 Weights
+
+The optimized CPU Provider SHALL accept packed `Q4_0` weights, and its matmuls over them SHALL match the Reference CPU over their dequantized values.
+
+#### Scenario: Q4_0 matmul
+- **WHEN** a matmul reads a packed `Q4_0` weight with int8 activations
+- **THEN** its result matches the Reference CPU's on the rounded activations and the dequantized weight
+
+### Requirement: CPU Providers Run The Layered And Latent-Attention Forms
+
+The Reference CPU Provider and the optimized CPU Provider of `providers/cpu` SHALL implement and advertise the optional operator forms the Runtime's own Reference CPU implements: the embedding `scale`; per-head and weightless `rmsnorm`; partial and YaRN `rope`; the attention `scale` and `value_head_dimension`; `concat` by heads; `moe-experts` with its activation and per-expert scale; `row-scale`; the `sigmoid`, `softcap` and `scale` activations; and a broadcasting `mul`. The optimized CPU Provider's own attention and embedding Kernels SHALL honour the forms they read, or leave the invocation to the Reference CPU Kernel.
+
+#### Scenario: Tiny checkpoints against transformers
+- **WHEN** the tiny Gemma 4 and DeepSeek-V2 checkpoints run on either CPU Provider, the optimized one with f32 activations
+- **THEN** every step's top-8 logits match the `transformers` references within 1e-3, with identical tokens
+
+### Requirement: CPU Providers Hold TurboQuant KV Stores
+
+The Reference CPU Provider and the optimized CPU Provider SHALL create TurboQuant KV stores, SHALL keep each store's offsets, and SHALL write each `kv-write` row as its TurboQuant dequantization with offsets, so that their attention defines the reference result over a quantized history.
+
+#### Scenario: Rounded rows
+- **WHEN** a row is written into a `tq4` store
+- **THEN** reading the store returns that row's TurboQuant dequantization with the store's offsets

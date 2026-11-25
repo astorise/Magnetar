@@ -29,6 +29,9 @@ fn sample_config() -> ModelArchitectureConfig {
         latent_attention: None,
         moe_layers: None,
         expert_routing: None,
+        linear_attention: None,
+        norm_weight_offset: None,
+        attention_output_gate: false,
         bos_token_id: None,
         eos_token_id: Some(151643),
     }
@@ -633,4 +636,62 @@ fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
     assert_eq!(capability.unread_declared_features("a").len(), 2);
     capability.clear_config("a");
     assert!(capability.unread_declared_features("a").is_empty());
+}
+
+#[test]
+fn hybrid_decoder_forms_are_exposed_and_must_be_read() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.linear_attention = Some(LinearAttentionConfig {
+        layers: (0..24).map(|layer| (layer + 1) % 4 != 0).collect(),
+        key_heads: 16,
+        value_heads: 16,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel: 4,
+    });
+    config.norm_weight_offset = Some(1.0);
+    config.attention_output_gate = true;
+    capability.bind_config("a", config);
+    capability.call("a", "hidden-activation", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec!["linear-attention", "decoder-variants"]
+    );
+    let result = capability.call("a", "linear-attention", &[]).unwrap();
+    let [ComponentValue::Option(Some(value))] = result.as_slice() else {
+        panic!("missing linear attention")
+    };
+    let ComponentValue::Record(fields) = value.as_ref() else {
+        panic!("wrong linear attention type")
+    };
+    let field = |name: &str| &fields.iter().find(|(key, _)| key == name).unwrap().1;
+    let ComponentValue::List(layers) = field("layers") else {
+        panic!("wrong layer list")
+    };
+    assert_eq!(layers.len(), 24);
+    assert_eq!(layers[3], ComponentValue::Bool(false));
+    assert_eq!(field("value-heads"), &ComponentValue::U32(16));
+    assert_eq!(field("key-head-dimension"), &ComponentValue::S64(128));
+    assert_eq!(field("conv-kernel"), &ComponentValue::U32(4));
+    let result = capability.call("a", "decoder-variants", &[]).unwrap();
+    assert_eq!(
+        result,
+        vec![ComponentValue::Option(Some(Box::new(
+            ComponentValue::Record(vec![
+                ("norm-weight-offset".into(), ComponentValue::F64(1.0)),
+                ("attention-output-gate".into(), ComponentValue::Bool(true)),
+            ])
+        )))]
+    );
+    assert!(capability.unread_declared_features("a").is_empty());
+
+    // A plain decoder declares neither.
+    capability.bind_config("b", sample_config());
+    capability.call("b", "hidden-activation", &[]).unwrap();
+    assert!(capability.unread_declared_features("b").is_empty());
+    assert_eq!(
+        capability.call("b", "decoder-variants", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
 }

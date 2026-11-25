@@ -98,6 +98,9 @@ pub(super) struct StepReplayState {
     pub(super) prefills: Mutex<PrefillRecordings>,
     /// The bytes every bucket namespace's intermediates may hold together.
     pub(super) prefill_intermediate_bytes: std::sync::atomic::AtomicU64,
+    /// Decode steps recorded for pooled store sets, which outlive their
+    /// requests (`reuse-decode-captures-across-requests`).
+    pub(super) pooled_decodes: Mutex<PooledDecodeRecordings>,
 }
 
 /// A prefill recording's key: the prefill graph, its bucket length and the
@@ -119,18 +122,57 @@ pub(super) struct PrefillRecordings {
     pub(super) tick: u64,
 }
 
-/// Where a bucketed prefill is in its key's sequence.
+/// A pooled decode recording's key (`reuse-decode-captures-across-requests`):
+/// the decode graph and the pooled store set its KV stores belong to.
+pub(super) type PooledDecodeKey = (ExecutionGraphSemanticFingerprint, u64);
+
+/// Decode steps recorded for pooled store sets, and where each key is in
+/// its per-node / capture / replay sequence.
+#[derive(Default)]
+pub(super) struct PooledDecodeRecordings {
+    pub(super) recorded: BTreeMap<PooledDecodeKey, RecordedDecodeStep>,
+    /// Keys that ran per node in their namespace, ready to capture.
+    pub(super) warmed: BTreeSet<PooledDecodeKey>,
+    /// Keys whose capture failed: their requests capture their own steps.
+    pub(super) declined: BTreeSet<PooledDecodeKey>,
+}
+
+/// The resource namespace of a pooled store set's decode steps of one
+/// decode graph (`reuse-decode-captures-across-requests`): their
+/// intermediates, token input and logits, which outlive each request so
+/// that its set's next request replays the same recording.
+pub(super) fn pooled_decode_namespace(
+    set: u64,
+    graph: &ExecutionGraphSemanticFingerprint,
+) -> String {
+    // FNV-1a: a short, stable name for the graph.
+    let digest = graph
+        .as_str()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    format!("{}{digest:016x}", pooled_decode_set_prefix(set))
+}
+
+/// What every decode namespace of pooled store set `set` starts with.
+pub(super) fn pooled_decode_set_prefix(set: u64) -> String {
+    format!("decode{set}-")
+}
+
+/// Where a recorded step (a bucketed prefill, or a pooled set's decode
+/// step) is in its key's sequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum PrefillRecordingStage {
+pub(super) enum RecordingStage {
     /// Run per node, keeping its intermediates for a later capture.
     Warm,
     Capture,
     Replay(Box<RecordedDecodeStepHandle>),
-    /// Run per node, as an unrecorded prefill.
+    /// Run per node, as an unrecorded step.
     Declined,
 }
 
-/// A recorded prefill, compared by its capture.
+/// A recorded step, compared by its capture.
 #[derive(Clone)]
 pub(super) struct RecordedDecodeStepHandle(pub(super) RecordedDecodeStep);
 
@@ -162,6 +204,7 @@ impl Default for StepReplayState {
                     .and_then(|bytes| bytes.trim().parse().ok())
                     .unwrap_or(super::prefill_buckets::DEFAULT_PREFILL_INTERMEDIATE_BYTES),
             ),
+            pooled_decodes: Mutex::default(),
         }
     }
 }
@@ -177,6 +220,11 @@ impl Drop for StepReplayState {
         }
         if let Ok(prefills) = self.prefills.get_mut() {
             for step in prefills.recorded.values() {
+                step.executor.release_step_capture(&step.capture);
+            }
+        }
+        if let Ok(decodes) = self.pooled_decodes.get_mut() {
+            for step in decodes.recorded.values() {
                 step.executor.release_step_capture(&step.capture);
             }
         }
@@ -227,18 +275,18 @@ impl StepReplay {
     }
 
     /// Where a bucketed prefill of `key` is in its sequence.
-    pub(super) fn prefill_stage(&self, key: &PrefillRecordingKey) -> PrefillRecordingStage {
+    pub(super) fn prefill_stage(&self, key: &PrefillRecordingKey) -> RecordingStage {
         let Ok(prefills) = self.0.prefills.lock() else {
-            return PrefillRecordingStage::Declined;
+            return RecordingStage::Declined;
         };
         if let Some(recorded) = prefills.recorded.get(key) {
-            PrefillRecordingStage::Replay(Box::new(RecordedDecodeStepHandle(recorded.clone())))
+            RecordingStage::Replay(Box::new(RecordedDecodeStepHandle(recorded.clone())))
         } else if prefills.declined.contains(key) {
-            PrefillRecordingStage::Declined
+            RecordingStage::Declined
         } else if prefills.warmed.contains(key) {
-            PrefillRecordingStage::Capture
+            RecordingStage::Capture
         } else {
-            PrefillRecordingStage::Warm
+            RecordingStage::Warm
         }
     }
 
@@ -363,6 +411,97 @@ impl StepReplay {
             .prefills
             .lock()
             .map_or(0, |prefills| prefills.recorded.len())
+    }
+
+    /// Where a pooled set's decode step of `key` is in its sequence.
+    pub(super) fn pooled_decode_stage(&self, key: &PooledDecodeKey) -> RecordingStage {
+        let Ok(decodes) = self.0.pooled_decodes.lock() else {
+            return RecordingStage::Declined;
+        };
+        if let Some(recorded) = decodes.recorded.get(key) {
+            RecordingStage::Replay(Box::new(RecordedDecodeStepHandle(recorded.clone())))
+        } else if decodes.declined.contains(key) {
+            RecordingStage::Declined
+        } else if decodes.warmed.contains(key) {
+            RecordingStage::Capture
+        } else {
+            RecordingStage::Warm
+        }
+    }
+
+    pub(super) fn pooled_decode_warmed(&self, key: PooledDecodeKey) {
+        if let Ok(mut decodes) = self.0.pooled_decodes.lock() {
+            decodes.warmed.insert(key);
+        }
+    }
+
+    /// Records `key`'s step, releasing the recording it replaces.
+    pub(super) fn record_pooled_decode(&self, key: PooledDecodeKey, step: RecordedDecodeStep) {
+        if let Ok(mut decodes) = self.0.pooled_decodes.lock()
+            && let Some(replaced) = decodes.recorded.insert(key, step)
+        {
+            replaced.executor.release_step_capture(&replaced.capture);
+        }
+    }
+
+    pub(super) fn decline_pooled_decode(&self, key: PooledDecodeKey) {
+        let step = self.0.pooled_decodes.lock().ok().and_then(|mut decodes| {
+            decodes.warmed.remove(&key);
+            let step = decodes.recorded.remove(&key);
+            decodes.declined.insert(key);
+            step
+        });
+        if let Some(step) = step {
+            step.executor.release_step_capture(&step.capture);
+        }
+    }
+
+    /// Drops a recording that no longer replays: the key captures again
+    /// at its next step (its intermediates stay in place).
+    pub(super) fn invalidate_pooled_decode(&self, key: &PooledDecodeKey) {
+        let step = self
+            .0
+            .pooled_decodes
+            .lock()
+            .ok()
+            .and_then(|mut decodes| decodes.recorded.remove(key));
+        if let Some(step) = step {
+            step.executor.release_step_capture(&step.capture);
+        }
+    }
+
+    /// Forgets every decode step of a pooled store set, releasing its
+    /// recordings: the set's stores and decode namespaces are about to be
+    /// released.
+    pub(super) fn release_pooled_decode_set(&self, set: u64) {
+        let released: Vec<RecordedDecodeStep> = match self.0.pooled_decodes.lock() {
+            Ok(mut decodes) => {
+                decodes.warmed.retain(|key| key.1 != set);
+                decodes.declined.retain(|key| key.1 != set);
+                let keys: Vec<_> = decodes
+                    .recorded
+                    .keys()
+                    .filter(|key| key.1 == set)
+                    .cloned()
+                    .collect();
+                keys.iter()
+                    .filter_map(|key| decodes.recorded.remove(key))
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        for step in released {
+            step.executor.release_step_capture(&step.capture);
+        }
+    }
+
+    /// How many pooled sets' decode steps are recorded (tests).
+    #[cfg(test)]
+    pub(super) fn pooled_decode_recordings(&self) -> usize {
+        self.0
+            .pooled_decodes
+            .lock()
+            .map_or(0, |decodes| decodes.recorded.len())
     }
 
     /// Forgets a request, releasing its capture.
@@ -575,6 +714,10 @@ pub(crate) struct CachedGraphs {
     /// Whether the prefill graph is the chunk's (`chunk-long-prefills`): its
     /// plan serves every longer prompt, which runs in passes of it.
     pub(crate) serves_longer_prompts: bool,
+    /// Whether the graphs carry recurrent state (`support-qwen38-flash-next`):
+    /// their steps are neither captured nor replayed, and their prefills
+    /// are never padded.
+    pub(crate) recurrent: bool,
     pub(crate) prefill_memo: GraphExecutionMemo,
     pub(crate) decode_memo: GraphExecutionMemo,
     /// The Prepared Execution Plans last prepared for these graphs, with
@@ -598,10 +741,13 @@ pub(crate) struct FirstNativePlanCacheKey {
 
 impl CachedGraphs {
     pub(crate) fn new(graphs: FirstNativeComponentGraphs) -> Self {
+        let recurrent = super::recurrent_state::has_recurrent_state(&graphs.prefill)
+            || super::recurrent_state::has_recurrent_state(&graphs.decode);
         Self {
             graphs,
             logits_row: false,
             serves_longer_prompts: false,
+            recurrent,
             prefill_memo: GraphExecutionMemo::default(),
             decode_memo: GraphExecutionMemo::default(),
             plans: std::sync::Mutex::new(None),
@@ -1158,6 +1304,9 @@ impl E2eRuntimeModelExecutionEngine {
                 release_pending_kv_resource(runtime, &provider, &layer.k);
                 release_pending_kv_resource(runtime, &provider, &layer.v);
             }
+            // The attempt's recurrent state goes with its KV; the committed
+            // state stays (`support-qwen38-flash-next`).
+            super::recurrent_state::discard_recurrent_state(runtime, &provider, &discarded.cache);
         }
         // A discarded prefill never made its cache visible as committed
         // state. Retire that empty cache too; a decode must keep its cache.
@@ -1265,12 +1414,10 @@ impl E2eRuntimeModelExecutionEngine {
         let stage = recording
             .as_ref()
             .map(|key| self.step_replay.prefill_stage(key));
-        let mut keeps_intermediates = matches!(
-            stage,
-            Some(PrefillRecordingStage::Warm | PrefillRecordingStage::Capture)
-        );
+        let mut keeps_intermediates =
+            matches!(stage, Some(RecordingStage::Warm | RecordingStage::Capture));
         match (&recording, stage) {
-            (Some(key), Some(PrefillRecordingStage::Replay(recorded))) => {
+            (Some(key), Some(RecordingStage::Replay(recorded))) => {
                 // The padding rows' outputs are never read: the packed
                 // matmuls skip them (`PADDING_ROWS_ATTRIBUTE`).
                 if let Some(output) = replay_recorded_step(
@@ -1288,7 +1435,7 @@ impl E2eRuntimeModelExecutionEngine {
                 self.step_replay.invalidate_prefill(key);
                 keeps_intermediates = true;
             }
-            (Some(key), Some(PrefillRecordingStage::Capture)) => {
+            (Some(key), Some(RecordingStage::Capture)) => {
                 let captured = self.capture_step(
                     runtime,
                     StepToCapture {
@@ -1442,6 +1589,12 @@ impl E2eRuntimeModelExecutionEngine {
             return Ok(None);
         };
         if !bucketed || !graphs.logits_row || !self.step_replay.prefill_enabled() {
+            return Ok(None);
+        }
+        // A replay would bypass the executor that binds and stages the
+        // recurrent state.
+        if graphs.recurrent {
+            trace_step_capture("not captured", "prefill with recurrent state");
             return Ok(None);
         }
         let Some(provider) = execution_plan
@@ -1665,6 +1818,19 @@ impl E2eRuntimeModelExecutionEngine {
         };
         for set in sets {
             self.step_replay.release_prefill_set(set.id);
+            // The set's decode recordings, then the intermediates they
+            // replay against (`reuse-decode-captures-across-requests`).
+            self.step_replay.release_pooled_decode_set(set.id);
+            let prefix = pooled_decode_set_prefix(set.id);
+            let namespaced: Vec<TensorResourceId> = runtime
+                .memory()
+                .tensor_residencies()
+                .filter(|residency| residency.tensor.as_str().starts_with(&prefix))
+                .map(|residency| residency.tensor.clone())
+                .collect();
+            for resource in &namespaced {
+                release_pending_kv_resource(runtime, &provider, resource);
+            }
             // A layer that reuses an earlier layer's K/V has no store.
             for (layer, width) in self.fixture.config.kv_row_widths().iter().enumerate() {
                 if width.is_none() {
@@ -2371,6 +2537,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         let Ok(provider) = resolve_kernel_execution_provider(runtime, &provider_binding) else {
             return Ok(());
         };
+        super::recurrent_state::release_recurrent_state(runtime, &provider, &committed.cache);
         // The committed bindings, plus each layer's `.pending` staging
         // resource that every commit copies from and leaves behind
         // (`execute_first_native_graph_nodes`'s KV pending writes).

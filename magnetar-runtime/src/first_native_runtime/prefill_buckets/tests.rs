@@ -405,7 +405,8 @@ impl ReplayHarness {
             build_runtime_with_model_execution_engine_and_provider(&fixture, provider).unwrap();
         let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
         let mut engine = new_kv_lifecycle_engine(&fixture);
-        // Decode steps run per node: only prefills are captured here.
+        // Decode steps run per node: only prefills are captured here
+        // (see `with_decode_replay`).
         engine.step_replay.set_enabled(false);
         let cache = ComponentGraphCache::default();
         cache.set_prefill_buckets(vec![8, 16]);
@@ -494,6 +495,22 @@ impl ReplayHarness {
             .release_request_state(&mut self.runtime, &request)
             .unwrap();
         steps
+    }
+
+    /// [`Self::new`] with decode steps captured and replayed too.
+    fn with_decode_replay() -> Self {
+        let harness = Self::new();
+        harness.engine.step_replay.set_enabled(true);
+        harness
+    }
+
+    /// The resources the pool's decode namespaces hold.
+    fn decode_namespace_resources(&self) -> usize {
+        self.runtime
+            .memory()
+            .tensor_residencies()
+            .filter(|residency| residency.tensor.as_str().starts_with("decode"))
+            .count()
     }
 
     fn captured_and_replayed(&self) -> (u64, u64) {
@@ -678,4 +695,113 @@ fn closing_a_session_keeps_the_pooled_stores_admitted() {
     assert_eq!(generate(&mut model), first);
     assert_eq!(allocation(&model), held);
     assert!(model.runtime.memory().is_live_allocation(held));
+}
+
+/// `reuse-decode-captures-across-requests`: the decode step of a pooled
+/// store set is captured once for every request the set serves. The first
+/// request runs its first decode step per node and captures its second;
+/// the second request's first step, one position earlier, captures again;
+/// every later step of every request replays, each request getting its own
+/// prompt's results.
+#[test]
+fn pooled_decode_steps_are_recorded_once_for_their_store_set() {
+    let decode_steps = 4;
+    let prompt: &[TokenId] = &[3, 9, 4];
+    let (expected, _) = run(prompt, None, decode_steps);
+    let mut harness = ReplayHarness::with_decode_replay();
+    let mut counts = Vec::new();
+    for index in 0..4 {
+        let steps = harness.generate(&format!("request-{index}"), prompt, decode_steps);
+        assert_close(&steps, &expected, &format!("request {index}"));
+        counts.push(harness.captured_and_replayed());
+    }
+    // (captures, replays): the first request captures its second decode
+    // step and replays two; the second captures its prefill and its first
+    // decode step and replays three; later ones replay all five steps.
+    assert_eq!(counts, vec![(1, 2), (3, 5), (3, 10), (3, 15)]);
+    assert_eq!(harness.engine.step_replay.pooled_decode_recordings(), 1);
+    // Everything a recording writes belongs to the set: its decode
+    // namespace, the prefill bucket's, or its stores.
+    let state = harness.executor.state.lock().unwrap();
+    let written: BTreeSet<String> = state
+        .captures
+        .values()
+        .flat_map(|capture| &capture.invocations)
+        .flat_map(|(_, _, invocation)| &invocation.outputs)
+        .map(|output| output.resource.id.as_str().to_string())
+        .collect();
+    assert!(written.iter().any(|id| id.starts_with("decode")));
+    for id in &written {
+        assert!(
+            id.starts_with("decode") || id.starts_with("prefill8.") || id.starts_with("kv.pool"),
+            "a recording writes '{id}'"
+        );
+    }
+}
+
+/// A pooled set's recorded decode step replays at later positions (a
+/// longer prompt) and is captured again at an earlier one (a shorter
+/// prompt), with every request's own results.
+#[test]
+fn a_shorter_prompt_captures_its_store_set_decode_step_again() {
+    let decode_steps = 4;
+    let prompts: [&[TokenId]; 3] = [&[5, 2, 7, 7, 1], &[3, 9, 4], &[8, 1, 3, 2, 2, 5]];
+    let mut harness = ReplayHarness::with_decode_replay();
+    let mut counts = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        let steps = harness.generate(&format!("request-{index}"), prompt, decode_steps);
+        assert_close(
+            &steps,
+            &run(prompt, None, decode_steps).0,
+            &format!("prompt {prompt:?}"),
+        );
+        counts.push(harness.captured_and_replayed());
+    }
+    // The 3-token prompt's first decode step (position 3) precedes the
+    // recorded one (position 6): captured again. The 6-token prompt's
+    // steps all follow it: replayed.
+    assert_eq!(counts, vec![(1, 2), (3, 5), (3, 10)]);
+}
+
+/// A failed decode capture declines the set's key: its requests run their
+/// steps as unpooled requests do, with correct results.
+#[test]
+fn a_failed_pooled_decode_capture_falls_back_to_the_request() {
+    let decode_steps = 3;
+    let prompt: &[TokenId] = &[3, 9, 4];
+    let (expected, _) = run(prompt, None, decode_steps);
+    let mut harness = ReplayHarness::with_decode_replay();
+    harness
+        .executor
+        .fail_capture
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for index in 0..3 {
+        let steps = harness.generate(&format!("declined-{index}"), prompt, decode_steps);
+        assert_close(&steps, &expected, &format!("request {index}"));
+    }
+    assert_eq!(harness.captured_and_replayed(), (0, 0));
+    assert_eq!(harness.engine.step_replay.pooled_decode_recordings(), 0);
+}
+
+/// A pooled set's decode namespace outlives its requests, and is released
+/// with its recording when the pool drops the set.
+#[test]
+fn dropping_a_store_set_releases_its_decode_recording_and_namespace() {
+    let mut harness = ReplayHarness::with_decode_replay();
+    harness.generate("first", &[3, 9, 4], 3);
+    assert!(
+        harness.decode_namespace_resources() > 0,
+        "kept past the request"
+    );
+    assert_eq!(harness.engine.step_replay.pooled_decode_recordings(), 1);
+    let dropped = harness.engine.kv_pool.drain_free();
+    assert!(!dropped.is_empty());
+    harness
+        .engine
+        .release_pooled_kv_sets(&mut harness.runtime, &dropped);
+    assert_eq!(harness.decode_namespace_resources(), 0);
+    assert_eq!(harness.engine.step_replay.pooled_decode_recordings(), 0);
+    // A new set starts its sequence again, with correct results.
+    let steps = harness.generate("again", &[3, 9, 4], 3);
+    assert_close(&steps, &run(&[3, 9, 4], None, 3).0, "after the set dropped");
 }

@@ -1151,6 +1151,88 @@ fn dropping_the_engine_releases_captures_its_requests_never_released() {
     assert_eq!(executor.counts(), (1, 2, 0));
 }
 
+/// A request abandoned between two replayed steps gives its capture back
+/// with its state, and the next request captures its own: nothing of the
+/// first one's capture is replayed for the second
+/// (`capture-and-replay-cuda-graphs` 3.3: cancellation, invalid state reuse).
+#[test]
+fn a_request_released_between_replayed_steps_gives_its_capture_back() {
+    let (per_node, _, _) = run_replaying_decode(false, true, 4, |_, _| {});
+    let mut lifecycle = ReplayingLifecycle::new();
+    let mut first = lifecycle.start("abandoned", None);
+    lifecycle.decode(&mut first, 3);
+    // Captured at the second decode step, replayed at the third.
+    assert_eq!(lifecycle.executor.counts(), (1, 1, 1));
+    lifecycle
+        .engine
+        .release_request_state(&mut lifecycle.runtime, &first.request)
+        .unwrap();
+    assert_eq!(lifecycle.executor.counts(), (1, 1, 0));
+    let mut second = lifecycle.start("next", None);
+    lifecycle.decode(&mut second, 4);
+    // The second request captured and replayed its own.
+    assert_eq!(lifecycle.executor.counts(), (2, 3, 1));
+    assert_eq!(second.steps, per_node);
+    assert_eq!(first.steps[..], per_node[..first.steps.len()]);
+}
+
+/// Two requests of two sessions replay their own captures, whatever the
+/// order of their steps; another session's release of one's id is refused
+/// and leaves its capture in place
+/// (`capture-and-replay-cuda-graphs` 3.3: tenant and session isolation).
+#[test]
+fn requests_of_two_sessions_replay_their_own_captures() {
+    let (per_node, _, _) = run_replaying_decode(false, true, 4, |_, _| {});
+    let mut lifecycle = ReplayingLifecycle::new();
+    let session_a = create_inference_session(
+        &mut lifecycle.runtime,
+        kv_lifecycle_session_request(&lifecycle.fixture, &lifecycle.instance),
+    )
+    .unwrap();
+    let session_b = create_inference_session(
+        &mut lifecycle.runtime,
+        kv_lifecycle_session_request(&lifecycle.fixture, &lifecycle.instance),
+    )
+    .unwrap();
+    let mut a = lifecycle.start("tenant-a", Some(session_a));
+    let mut b = lifecycle.start("tenant-b", Some(session_b.clone()));
+    for _ in 0..3 {
+        lifecycle.decode(&mut a, 1);
+        lifecycle.decode(&mut b, 1);
+    }
+    // Each captured at its second decode step and replayed at its third.
+    assert_eq!(lifecycle.executor.counts(), (2, 2, 2));
+    // Another session cannot release the capture of `tenant-a`.
+    let mut foreign = a.request.clone();
+    foreign.session = Some(session_b);
+    assert!(
+        lifecycle
+            .engine
+            .release_request_state(&mut lifecycle.runtime, &foreign)
+            .is_err()
+    );
+    assert_eq!(lifecycle.executor.counts(), (2, 2, 2));
+    lifecycle.decode(&mut a, 1);
+    lifecycle.decode(&mut b, 1);
+    assert_eq!(lifecycle.executor.counts(), (2, 4, 2));
+    assert_eq!(a.steps, per_node);
+    assert_eq!(b.steps, per_node);
+}
+
+/// A Provider that cannot reserve the memory a capture needs: every step
+/// runs per node, with the same values, and the request does not try
+/// again (`capture-and-replay-cuda-graphs` 3.3: memory pressure).
+#[test]
+fn a_capture_refused_for_memory_runs_every_step_per_node() {
+    let (per_node, _, _) = run_replaying_decode(false, true, 5, |_, _| {});
+    let (refused, executor, _) = run_replaying_decode(true, true, 5, |executor, _| {
+        executor.refuse_capture_memory.store(true, Ordering::SeqCst);
+    });
+    assert_eq!(per_node, refused);
+    assert_eq!(executor.counts(), (0, 0, 0));
+    assert_eq!(executor.capture_attempts.load(Ordering::SeqCst), 1);
+}
+
 /// A request reuses the plans prepared for its graphs while the Model
 /// Instance, the Provider and the Kernel Registry are unchanged, and
 /// prepares them again when the registry changes.

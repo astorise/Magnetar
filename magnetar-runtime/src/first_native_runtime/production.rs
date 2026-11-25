@@ -40,7 +40,7 @@ pub(super) const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub(super) const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:abfdf515d2d2d52bd0738d52d3628a6077e65d4217c6c19c9598eef7ae0386a1";
+    "sha256:136e96acfb84b8d8da46461f945c21d0c1a4be161a6e7b0a8a3e104635ae34e8";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -237,6 +237,34 @@ pub(super) fn weight_shapes_for_architecture_config(
         let kv_dim = kv_heads as u64 * head_dim;
         shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
         shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
+        // A gated-delta linear-attention layer (`support-qwen38-flash-next`):
+        // the mixer's projections in checkpoint `[out, in]` order.
+        if let Some(linear) = config
+            .linear_attention
+            .as_ref()
+            .filter(|linear| linear.is_linear(layer as usize))
+        {
+            let hidden = config.hidden_size;
+            let keys = u64::from(linear.key_heads) * linear.key_head_dim;
+            let value_heads = u64::from(linear.value_heads);
+            let values = value_heads * linear.value_head_dim;
+            let channels = 2 * keys + values;
+            for (name, shape) in [
+                ("in_qkv", vec![channels, hidden]),
+                ("in_z", vec![values, hidden]),
+                ("in_a", vec![value_heads, hidden]),
+                ("in_b", vec![value_heads, hidden]),
+                ("conv1d", vec![channels, u64::from(linear.conv_kernel)]),
+                ("a_log", vec![value_heads]),
+                ("dt_bias", vec![value_heads]),
+                ("norm", vec![linear.value_head_dim]),
+                ("out", vec![hidden, values]),
+            ] {
+                shapes.insert(format!("{prefix}.linear_attn.{name}"), shape);
+            }
+            insert_mlp_shapes(&mut shapes, &prefix, config, layer, intermediate_size);
+            continue;
+        }
         if let Some(mla) = &config.latent_attention {
             // `express-latent-attention-forms`: the split latent-attention
             // projections replace q/k/v/o.
@@ -257,6 +285,16 @@ pub(super) fn weight_shapes_for_architecture_config(
                 (q_dim, kv_dim),
                 (own_kv, own_v),
             );
+            // Qwen3.5's gated attention: each head's query is followed by
+            // its gate, and both query and key are normalized per head.
+            if config.attention_output_gate {
+                shapes.insert(
+                    format!("{prefix}.self_attn.q_proj"),
+                    vec![config.hidden_size, 2 * q_dim],
+                );
+                shapes.insert(format!("{prefix}.self_attn.q_norm"), vec![head_dim]);
+                shapes.insert(format!("{prefix}.self_attn.k_norm"), vec![head_dim]);
+            }
         }
         insert_mlp_shapes(&mut shapes, &prefix, config, layer, intermediate_size);
     }
@@ -442,6 +480,9 @@ pub(super) fn architecture_config_from_first_native_model_config(
         final_logit_softcapping: config.final_logit_softcapping,
         per_layer_input_size: config.per_layer_input_size,
         latent_attention: config.latent_attention,
+        linear_attention: config.linear_attention.clone(),
+        norm_weight_offset: config.norm_weight_offset,
+        attention_output_gate: config.attention_output_gate,
         moe_layers: config.moe_layers.clone(),
         expert_routing: config.expert_routing,
         bos_token_id: None,
@@ -501,6 +542,9 @@ pub(super) fn first_native_model_config_from_architecture_config(
         final_logit_softcapping: config.final_logit_softcapping,
         per_layer_input_size: config.per_layer_input_size,
         latent_attention: config.latent_attention,
+        linear_attention: config.linear_attention.clone(),
+        norm_weight_offset: config.norm_weight_offset,
+        attention_output_gate: config.attention_output_gate,
         moe_layers: config.moe_layers.clone(),
         expert_routing: config.expert_routing,
         require_bos: false,
@@ -1919,6 +1963,14 @@ impl ProductionLoadedModel {
                         .prefill_memo
                         .kv_edges_feed_only_attention(&component_graphs.prefill)
                 {
+                    self.graph_cache.set_prefill_buckets(Vec::new());
+                    self.graph_cache.set_prefill_chunk(0);
+                    continue;
+                }
+                // Padding rows would advance recurrent state past the prompt
+                // (`support-qwen38-flash-next`): such graphs run at the
+                // prompt's exact length.
+                if component_graphs.recurrent && graph_length != prompt_token_count {
                     self.graph_cache.set_prefill_buckets(Vec::new());
                     self.graph_cache.set_prefill_chunk(0);
                     continue;

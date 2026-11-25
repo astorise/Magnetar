@@ -144,10 +144,10 @@ use crate::operator::{
     ATTENTION_VALUE_HEAD_DIMENSION_FEATURE, CONCAT_HEADS_FEATURE, ConcatAxis,
     EMBEDDING_SCALE_FEATURE, MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE,
     MOE_RELU_SQUARED_FEATURE, MOE_SIGMOID_ROUTING_FEATURE, OperatorAttributeValue, OperatorFamily,
-    OperatorId, OperatorSpec, RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE,
-    ROPE_BANDED_FREQUENCY_SCALING_FEATURE, ROPE_PARTIAL_ROTARY_FEATURE,
-    ROPE_YARN_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling, RopeYarnFrequencyScaling,
-    TensorLayoutKind, TensorRole, concat_axis,
+    OperatorId, OperatorSpec, RMSNORM_PER_HEAD_FEATURE, RMSNORM_WEIGHT_OFFSET_FEATURE,
+    RMSNORM_WITHOUT_WEIGHT_FEATURE, ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+    ROPE_PARTIAL_ROTARY_FEATURE, ROPE_YARN_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling,
+    RopeYarnFrequencyScaling, SPLIT_PER_HEAD_FEATURE, TensorLayoutKind, TensorRole, concat_axis,
 };
 pub use crate::operator_semantics::{
     MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE, MoeRouting, NATIVE_CPU_PROVIDER_NAME,
@@ -1140,6 +1140,61 @@ pub fn residual_add(
 /// (`KernelInvocation.outputs: Vec<..>`, `store_output(invocation, index,
 /// ..)`) end to end -- not because any current graph needs a split
 /// Operator.
+/// `weight + offset`, element by element: the scale of a zero-centered
+/// norm (`rmsnorm.weight_offset`).
+pub fn offset_weight(weight: &HostTensor, offset: f32) -> Result<HostTensor, ReferenceCpuError> {
+    HostTensor::new(
+        weight.shape.clone(),
+        weight
+            .data
+            .iter()
+            .map(|value| value + offset)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+    })
+}
+
+/// [`split_last_dim_in_half`] applied to each of `head_count` equal blocks
+/// of the last dimension (`split.head_count`): the first halves of every
+/// block, in order, then the second halves.
+pub fn split_heads_in_half(
+    input: &HostTensor,
+    head_count: u64,
+) -> Result<(HostTensor, HostTensor), ReferenceCpuError> {
+    let Some((&last, outer)) = input.shape.split_last() else {
+        return split_last_dim_in_half(input);
+    };
+    if head_count <= 1 {
+        return split_last_dim_in_half(input);
+    }
+    if last == 0 || !last.is_multiple_of(2 * head_count) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "split of width {last} across {head_count} heads needs a multiple of {}",
+                2 * head_count
+            ),
+        ));
+    }
+    // Row-major: one row of `head_count` blocks is `head_count` rows of one.
+    let mut blocks = outer.to_vec();
+    blocks.extend([head_count, last / head_count]);
+    let reshaped = HostTensor::new(blocks, input.data.clone()).map_err(|error| {
+        ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+    })?;
+    let (left, right) = split_last_dim_in_half(&reshaped)?;
+    let mut half = outer.to_vec();
+    half.push(last / 2);
+    let back = |tensor: HostTensor| {
+        HostTensor::new(half.clone(), tensor.data).map_err(|error| {
+            ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+        })
+    };
+    Ok((back(left)?, back(right)?))
+}
+
 pub fn split_last_dim_in_half(
     input: &HostTensor,
 ) -> Result<(HostTensor, HostTensor), ReferenceCpuError> {
@@ -1492,7 +1547,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     let rmsnorm = with_features(
         "rmsnorm",
         OperatorFamily::Normalization,
-        &[RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE],
+        &[
+            RMSNORM_PER_HEAD_FEATURE,
+            RMSNORM_WITHOUT_WEIGHT_FEATURE,
+            RMSNORM_WEIGHT_OFFSET_FEATURE,
+        ],
     );
     let moe_experts = with_features(
         "moe-experts",
@@ -1537,6 +1596,13 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         ),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-residual", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-residual-final", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-residual-inject", OperatorFamily::Tensor),
+        baseline_advertisement("repeat-features", OperatorFamily::Tensor),
+        baseline_advertisement("qsa-select", OperatorFamily::Tensor),
+        baseline_advertisement("ngram-embedding", OperatorFamily::Tensor),
+        baseline_advertisement("ngram-ple", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("token-shift", OperatorFamily::Tensor),
@@ -1568,7 +1634,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("geodesic-residual", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
-        baseline_advertisement("split", OperatorFamily::Tensor),
+        with_features("split", OperatorFamily::Tensor, &[SPLIT_PER_HEAD_FEATURE]),
     ]
 }
 
@@ -2805,6 +2871,23 @@ impl ReferenceCpuExecutor {
                         ),
                     });
                 }
+                // Zero-centered norms scale by `weight_offset + weight`.
+                let weight = match invocation.attributes.get("weight_offset") {
+                    None => weight,
+                    Some(OperatorAttributeValue::Float(offset)) if offset.is_finite() => {
+                        let Some(weight) = weight else {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "rmsnorm weight_offset needs a weight".into(),
+                            });
+                        };
+                        Some(offset_weight(&weight, *offset as f32).map_err(KernelError::from)?)
+                    }
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("rmsnorm weight_offset {other:?}"),
+                        });
+                    }
+                };
                 match (&weight, heads) {
                     // Today's form keeps its own weight shapes.
                     (Some(weight), None) => {
@@ -2909,6 +2992,59 @@ impl ReferenceCpuExecutor {
                     Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
                 )
                 .map_err(KernelError::from)?
+            }
+            // Qwen4-Exp's blocks (`support-qwen38-flash-next` lot 3), through
+            // the shared semantics.
+            name @ ("gated-residual"
+            | "gated-residual-final"
+            | "gated-residual-inject"
+            | "repeat-features"
+            | "qsa-select"
+            | "ngram-embedding"
+            | "ngram-ple") => {
+                let outputs = &invocation.outputs;
+                for (i, output) in outputs.iter().enumerate() {
+                    if outputs[..i]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed = crate::operator_semantics::hyper_stream_operator(
+                    name,
+                    &inputs,
+                    &invocation.attributes,
+                )
+                .map_err(KernelError::from)?;
+                if outputs.len() != computed.len()
+                    || outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                        resource.resource.descriptor.shape.dimensions != tensor.shape
+                    })
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor);
+                }
+                return Ok(result);
             }
             name @ ("mamba2-mixer" | "gated-delta-mixer") => {
                 if invocation.outputs.len() != 3 {
@@ -3426,7 +3562,17 @@ impl ReferenceCpuExecutor {
             // every other arm relies on.
             "split" => {
                 let input = self.input_tensor(invocation, 0)?;
-                let (left, right) = split_last_dim_in_half(&input).map_err(KernelError::from)?;
+                let head_count = match invocation.attributes.get("head_count") {
+                    None => 1,
+                    Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("split head_count {other:?}"),
+                        });
+                    }
+                };
+                let (left, right) =
+                    split_heads_in_half(&input, head_count).map_err(KernelError::from)?;
                 let left_descriptor = self.store_output(invocation, 0, left)?;
                 let right_descriptor = self.store_output(invocation, 1, right)?;
                 result

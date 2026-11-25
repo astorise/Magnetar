@@ -349,13 +349,13 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
     let model_config_capability = Arc::new(crate::ModelConfigCapability::new());
     let mut engine = WasmtimeComponentEngine::new().unwrap();
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.8.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.13.0");
     engine.register_capability(
         graph_builder_interface.clone(),
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.8.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.13.0");
     engine.register_capability(
         model_config_interface.clone(),
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -363,7 +363,7 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
 
     let export_interface = WitInterface::new(
         "magnetar:model-component-graph/model-component-graph-producer",
-        "1.8.0",
+        "1.13.0",
     );
     let definition = ComponentDefinition {
         id: ComponentDefinitionId::new(200),
@@ -445,6 +445,9 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             latent_attention: None,
             moe_layers: None,
             expert_routing: None,
+            linear_attention: None,
+            norm_weight_offset: None,
+            attention_output_gate: false,
             bos_token_id: None,
             eos_token_id: None,
         },
@@ -601,15 +604,15 @@ fn wasmtime_engine_builds_and_validates_recurrent_state_graphs() {
         let split = &graph.nodes[&crate::ExecutionNodeId::new("split")];
         assert_eq!(split.outputs.len(), 2);
         assert_ne!(split.outputs[0], split.outputs[1]);
-        assert!(matches!(
+        assert!(
             crate::plan_execution_graph(
                 &graph,
                 &crate::default_graph_catalog(),
                 &crate::GraphPlanningPolicy::default(),
                 None
-            ),
-            Err(crate::GraphError::ProviderCapabilityUnavailable(_))
-        ));
+            )
+            .is_ok()
+        );
     }
     capability.prepare_session(
         instance.engine_key(),

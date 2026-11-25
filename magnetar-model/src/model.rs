@@ -780,8 +780,43 @@ pub struct ModelArchitectureConfig {
     /// every expert, no groups, weights unscaled, no selection bias, and a
     /// gated shared expert when the mixture declares one.
     pub expert_routing: Option<ExpertRoutingConfig>,
+    /// Gated-delta linear attention layers of a hybrid decoder
+    /// (`model-config`'s `linear-attention`, `1.13.0`,
+    /// `support-qwen38-flash-next`). `None`: every layer is full attention.
+    pub linear_attention: Option<LinearAttentionConfig>,
+    /// The scale of every decoder RMSNorm is `norm_weight_offset + weight`
+    /// (`model-config`'s `decoder-variants`, `1.13.0`): Qwen3.5's
+    /// zero-centered norms use 1. `None` means 0.
+    pub norm_weight_offset: Option<f64>,
+    /// Each attention head's query projection is followed by a gate of the
+    /// same width, and the attention output is multiplied by the gate's
+    /// sigmoid (`decoder-variants`, `1.13.0`).
+    pub attention_output_gate: bool,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
+}
+
+/// The gated-delta linear attention layers of a hybrid decoder, mirroring
+/// `model-config`'s `linear-attention-config` (`1.13.0`). A linear layer
+/// mixes tokens with a `gated-delta-mixer` whose convolution and recurrent
+/// state are fixed-size; it keeps no KV history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearAttentionConfig {
+    /// One entry per decoder layer: `true` for a linear layer, `false` for
+    /// a full-attention layer.
+    pub layers: Vec<bool>,
+    pub key_heads: u32,
+    pub value_heads: u32,
+    pub key_head_dim: u64,
+    pub value_head_dim: u64,
+    pub conv_kernel: u32,
+}
+
+impl LinearAttentionConfig {
+    /// Whether `layer` is a linear (gated-delta) layer.
+    pub fn is_linear(&self, layer: usize) -> bool {
+        self.layers.get(layer).copied().unwrap_or(false)
+    }
 }
 
 /// One decoder layer's geometry, mirroring `model-config`'s `layer-spec`
@@ -1031,6 +1066,30 @@ impl ModelArchitectureConfig {
         if self.per_layer_input_size == Some(0) {
             return Err(ModelArtifactError::InvalidManifest {
                 message: "per-layer input size must not be zero".into(),
+            });
+        }
+        if let Some(linear) = &self.linear_attention {
+            let invalid = linear.layers.len() != self.num_hidden_layers as usize
+                || linear.key_heads == 0
+                || linear.value_heads == 0
+                || !linear.value_heads.is_multiple_of(linear.key_heads)
+                || linear.key_head_dim == 0
+                || linear.value_head_dim == 0
+                || linear.conv_kernel < 2;
+            if invalid {
+                return Err(ModelArtifactError::InvalidManifest {
+                    message: "linear attention needs one entry per layer, positive head counts \
+                              and widths with value heads a multiple of key heads, and a \
+                              convolution kernel of at least 2"
+                        .into(),
+                });
+            }
+        }
+        if let Some(offset) = self.norm_weight_offset
+            && !offset.is_finite()
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!("norm weight offset {offset} must be finite"),
             });
         }
         Ok(())

@@ -216,6 +216,9 @@ pub enum ShapeRule {
     RmsNorm,
     RowBroadcastAdd,
     RowConcat,
+    /// The last dimension into two halves; with `head_count`, each head's
+    /// block of it splits in half.
+    Split,
     Rank(u64),
 }
 
@@ -312,6 +315,17 @@ pub const RMSNORM_PER_HEAD_FEATURE: &str = "rmsnorm-per-head";
 /// Kernel feature an `rmsnorm` Kernel advertises when it accepts a single
 /// input (no weight, scale 1).
 pub const RMSNORM_WITHOUT_WEIGHT_FEATURE: &str = "rmsnorm-without-weight";
+
+/// Kernel feature an `rmsnorm` Kernel advertises when it honours
+/// `weight_offset`: the normalized row is multiplied by `offset + weight`
+/// (Qwen3.5's zero-centered norms, `support-qwen38-flash-next`).
+pub const RMSNORM_WEIGHT_OFFSET_FEATURE: &str = "rmsnorm-weight-offset";
+
+/// Kernel feature a `split` Kernel advertises when it honours `head_count`:
+/// each of the `head_count` equal blocks of a row is split in half, the
+/// first halves forming the first output and the second halves the second
+/// (Qwen3.5's per-head query and gate, `support-qwen38-flash-next`).
+pub const SPLIT_PER_HEAD_FEATURE: &str = "split-per-head";
 
 /// Kernel feature a `rope` Kernel advertises when it honours
 /// `partial_rotary_factor`.
@@ -410,6 +424,14 @@ pub fn required_kernel_features(
             }
         }
         "embedding" if present("scale") => features.push(EMBEDDING_SCALE_FEATURE),
+        "split" => {
+            if !matches!(
+                attributes.get("head_count"),
+                None | Some(OperatorAttributeValue::Integer(1))
+            ) {
+                features.push(SPLIT_PER_HEAD_FEATURE);
+            }
+        }
         "activation" => {
             if matches!(attributes.get("kind"), Some(OperatorAttributeValue::String(kind)) if kind == "relu_squared")
             {
@@ -419,6 +441,11 @@ pub fn required_kernel_features(
         "rmsnorm" => {
             if present("head_count") || present("head_dimension") {
                 features.push(RMSNORM_PER_HEAD_FEATURE);
+            }
+            if attributes.get("weight_offset").is_some_and(
+                |value| !matches!(value, OperatorAttributeValue::Float(offset) if *offset == 0.0),
+            ) {
+                features.push(RMSNORM_WEIGHT_OFFSET_FEATURE);
             }
             if input_count < 2
                 || matches!(
@@ -1574,7 +1601,64 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // existing rule expresses "half the last dimension of the input,"
         // and inventing one for a single deliberately-minimal proof
         // operator is not warranted.
-        ("split", OperatorFamily::Tensor, 1, 2, ShapeRule::Any),
+        ("split", OperatorFamily::Tensor, 1, 2, ShapeRule::Split),
+        // `support-qwen38-flash-next` lot 3: Qwen4-Exp's blocks, defined by
+        // Transformers' `qwen4_exp` (design D7). `ShapeRule::Any`: the
+        // Reference semantics validate every shape, and no existing rule
+        // expresses these.
+        // The residual's `hc_count` streams mixed into a block's input and
+        // the per-stream write weights, or (`-final`) the mixed input only.
+        (
+            "gated-residual",
+            OperatorFamily::LinearAlgebra,
+            5,
+            2,
+            ShapeRule::Any,
+        ),
+        (
+            "gated-residual-final",
+            OperatorFamily::LinearAlgebra,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
+        // A block's output written back into every stream.
+        (
+            "gated-residual-inject",
+            OperatorFamily::Tensor,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        // `[T, H]` repeated along the features: the embedding becoming the
+        // streams.
+        (
+            "repeat-features",
+            OperatorFamily::Tensor,
+            1,
+            1,
+            ShapeRule::Any,
+        ),
+        // QSA's token selection: queries, raw index keys, the key norm's
+        // weight, and the kept token positions per query.
+        ("qsa-select", OperatorFamily::Tensor, 3, 1, ShapeRule::Any),
+        // The hashed n-gram rows of a token sequence and the next context.
+        (
+            "ngram-embedding",
+            OperatorFamily::Tensor,
+            3,
+            2,
+            ShapeRule::Any,
+        ),
+        // The PLE gate and dilated convolution, with the convolution's
+        // history as an explicit state.
+        (
+            "ngram-ple",
+            OperatorFamily::LinearAlgebra,
+            9,
+            2,
+            ShapeRule::Any,
+        ),
     ] {
         let mut spec = OperatorSpec::new(OperatorId::magnetar(name, 1, family), inputs, outputs)
             .with_shape_rule(shape)
@@ -1597,6 +1681,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             "rmsnorm" => 1,
             "moe-experts" => 5,
             "mamba2-mixer" => 10,
+            "gated-delta-mixer" => 12,
             "affine-layernorm" => 2,
             "attention" => 3,
             _ => inputs,
@@ -1625,6 +1710,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             "encoder-attention"
                 | "mamba2-mixer"
                 | "gated-delta-mixer"
+                | "gated-residual"
+                | "gated-residual-final"
+                | "gated-residual-inject"
+                | "repeat-features"
+                | "qsa-select"
+                | "ngram-embedding"
+                | "ngram-ple"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -1766,6 +1858,106 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "zero_centered_norm",
                 OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "gated-residual" | "gated-residual-final" => OperatorAttributeSchema::default()
+            .with_rule(
+                "hc_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            ),
+        "repeat-features" => OperatorAttributeSchema::default().with_rule(
+            "count",
+            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+        ),
+        "qsa-select" => OperatorAttributeSchema::default()
+            .with_rule(
+                "head_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "compress_ratio",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "budget",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "rotary_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "rope_base",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            ),
+        "ngram-embedding" => OperatorAttributeSchema::default()
+            .with_rule(
+                "ngram_size",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "heads_per_ngram",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "vocab_size",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "vocab_base",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "layer_index",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "seed",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "eos_token_id",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            ),
+        "ngram-ple" => OperatorAttributeSchema::default()
+            .with_rule(
+                "hc_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_kernel",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_dilation",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
             ),
         "gated-delta-mixer" => OperatorAttributeSchema::default()
             .with_rule(
@@ -2079,7 +2271,17 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "with_scale",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+            )
+            // The row is multiplied by `weight_offset + weight` (default 0).
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
             ),
+        // Each of `head_count` (default 1) equal row blocks splits in half.
+        "split" => OperatorAttributeSchema::default().with_rule(
+            "head_count",
+            OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+        ),
         "moe-experts" => OperatorAttributeSchema::default()
             .with_rule(
                 "experts",
@@ -2173,6 +2375,57 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     }
 }
 
+/// `split`: the last dimension into two halves; with `head_count` heads,
+/// each `width / head_count` block of it splits in half.
+fn validate_split_shape(
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(), OperatorError> {
+    let head_count = match attributes.get("head_count") {
+        None => 1,
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+        Some(_) => {
+            return Err(OperatorError::OperatorAttributeInvalid {
+                attribute: "head_count".into(),
+                reason: "must be a positive integer".into(),
+            });
+        }
+    };
+    let [input] = inputs else {
+        return Err(OperatorError::InputArityInvalid {
+            expected: 1,
+            actual: inputs.len(),
+        });
+    };
+    let Some((&width, outer)) = input.shape.dimensions.split_last() else {
+        return Err(OperatorError::ShapeUnsupported {
+            reason: "split takes an input with at least one dimension".into(),
+        });
+    };
+    if width == 0 || !width.is_multiple_of(2 * head_count) {
+        return Err(OperatorError::ShapeMismatch {
+            reason: format!(
+                "split of width {width} into halves of {head_count} head(s) needs a multiple of {}",
+                2 * head_count
+            ),
+        });
+    }
+    let mut half = outer.to_vec();
+    half.push(width / 2);
+    for output in outputs {
+        if output.shape.dimensions != half {
+            return Err(OperatorError::ShapeMismatch {
+                reason: format!(
+                    "split expects outputs {half:?}, got {:?}",
+                    output.shape.dimensions
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A head-wise `concat` ([`ConcatAxis::Heads`]): `[T, H * a]` and `[T, b']`
 /// rows (`b'` = `b` or `H * b`) giving `[T, H * (a + b)]`.
 fn validate_concat_heads(
@@ -2227,7 +2480,9 @@ fn validate_gated_delta_mixer_shape(
     let invalid = || OperatorError::ShapeMismatch {
         reason: "invalid gated-delta mixer geometry, attributes or tensor shapes".into(),
     };
-    if inputs.len() != 13 || outputs.len() != 3 {
+    // The trailing 0/1 token mask is optional: without it every token is
+    // valid (`support-qwen38-flash-next`).
+    if !(12..=13).contains(&inputs.len()) || outputs.len() != 3 {
         return Err(invalid());
     }
     let positive = |name: &str| match attributes.get(name) {
@@ -2664,6 +2919,7 @@ fn validate_shape_rule(
             }
             Ok(())
         }
+        ShapeRule::Split => validate_split_shape(inputs, outputs, attributes),
         ShapeRule::RmsNorm => {
             if inputs.is_empty() {
                 return Err(OperatorError::InputArityInvalid {
@@ -2683,6 +2939,16 @@ fn validate_shape_rule(
                 return Err(OperatorError::ShapeMismatch {
                     reason: "RMSNorm output shape must match input".into(),
                 });
+            }
+            match attributes.get("weight_offset") {
+                None => {}
+                Some(OperatorAttributeValue::Float(offset)) if offset.is_finite() => {}
+                Some(_) => {
+                    return Err(OperatorError::OperatorAttributeInvalid {
+                        attribute: "weight_offset".into(),
+                        reason: "must be a finite float".into(),
+                    });
+                }
             }
             // A scale-less RMSNorm has no weight.
             let Some(weight) = inputs.get(1).map(|weight| &weight.shape.dimensions) else {

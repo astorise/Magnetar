@@ -392,6 +392,12 @@ pub struct FirstNativeModelConfig {
     pub per_layer_input_size: Option<u32>,
     /// See [`crate::ModelArchitectureConfig::latent_attention`].
     pub latent_attention: Option<crate::LatentAttentionConfig>,
+    /// See [`crate::ModelArchitectureConfig::linear_attention`].
+    pub linear_attention: Option<crate::LinearAttentionConfig>,
+    /// See [`crate::ModelArchitectureConfig::norm_weight_offset`].
+    pub norm_weight_offset: Option<f64>,
+    /// See [`crate::ModelArchitectureConfig::attention_output_gate`].
+    pub attention_output_gate: bool,
     /// See [`crate::ModelArchitectureConfig::moe_layers`].
     pub moe_layers: Option<Vec<bool>>,
     /// See [`crate::ModelArchitectureConfig::expert_routing`].
@@ -425,6 +431,9 @@ impl FirstNativeModelConfig {
             final_logit_softcapping: None,
             per_layer_input_size: None,
             latent_attention: None,
+            linear_attention: None,
+            norm_weight_offset: None,
+            attention_output_gate: false,
             moe_layers: None,
             expert_routing: None,
             require_bos: false,
@@ -508,6 +517,21 @@ impl FirstNativeModelConfig {
     /// (`per-layer-kv-geometry`). Under latent attention, the latent
     /// history's width ([`Self::latent_history_width`]).
     pub fn kv_row_widths(&self) -> Vec<Option<u64>> {
+        let mut widths = self.attention_kv_row_widths();
+        // A linear-attention layer keeps recurrent state, not KV history
+        // (`support-qwen38-flash-next`).
+        if let Some(linear) = &self.linear_attention {
+            for (layer, width) in widths.iter_mut().enumerate() {
+                if linear.is_linear(layer) {
+                    *width = None;
+                }
+            }
+        }
+        widths
+    }
+
+    /// [`Self::kv_row_widths`] as if every layer were an attention layer.
+    fn attention_kv_row_widths(&self) -> Vec<Option<u64>> {
         let layers = self.architecture.layer_count as usize;
         if let Some(width) = self.latent_history_width() {
             return vec![Some(width); layers];

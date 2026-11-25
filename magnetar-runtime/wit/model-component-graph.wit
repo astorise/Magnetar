@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.12.0;
+package magnetar:model-component-graph@1.13.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -102,8 +102,9 @@ interface graph-builder {
   /// shapes have nonzero fixed dimensions and at most 67,108,864 f32 elements.
   /// The same layer/slot must have the same shape throughout one graph.
   /// These identities describe state, not Provider handles or KV caches.
-  /// Added in 1.11.0; current execution explicitly refuses graphs using it
-  /// until transactional recurrent-state lifecycle support is implemented.
+  /// Added in 1.11.0. Since 1.13.0 the first-native Runtime executes such
+  /// graphs: it keeps the state per KV cache, zero for a new sequence, and
+  /// commits it with the accepted token (`support-qwen38-flash-next`).
   recurrent-resource: func(layer: u64, slot: string, shape: tensor-shape) -> string;
 
   /// Declares the prior committed value of a resource as an input edge.
@@ -445,6 +446,39 @@ interface model-config {
   /// Added in 1.12.0. A declared encoder configuration must be read by its
   /// Component before a graph is accepted; older Components cannot ignore it.
   encoder-config: func() -> option<encoder-settings>;
+
+  /// The gated-delta linear attention layers of a hybrid decoder (Qwen3.5).
+  /// Added in 1.13.0. A linear layer mixes tokens with a `gated-delta-mixer`
+  /// whose convolution and recurrent states are recurrent resources; it has
+  /// no KV history. The other layers are full attention.
+  record linear-attention-config {
+    /// One entry per decoder layer: true for a linear layer.
+    layers: list<bool>,
+    key-heads: u32,
+    value-heads: u32,
+    key-head-dimension: u64,
+    value-head-dimension: u64,
+    conv-kernel: u32,
+  }
+
+  /// Added in 1.13.0: `none` when every layer is full attention. A declared
+  /// value must be read before a graph is accepted.
+  linear-attention: func() -> option<linear-attention-config>;
+
+  /// Decoder forms `architecture-config` cannot carry. Added in 1.13.0.
+  record decoder-variant-config {
+    /// Every decoder RMSNorm scales by `norm-weight-offset + weight`
+    /// (Qwen3.5's zero-centered norms: 1). The linear-attention mixer's
+    /// gated norm keeps its plain weight.
+    norm-weight-offset: f64,
+    /// Each attention head's query projection is followed by a gate of the
+    /// same width; the attention output is multiplied by its sigmoid.
+    attention-output-gate: bool,
+  }
+
+  /// Added in 1.13.0: `none` keeps the plain forms. A declared value must
+  /// be read before a graph is accepted.
+  decoder-variants: func() -> option<decoder-variant-config>;
 }
 
 /// A separate graph-producing world for one bidirectional encoder pass.

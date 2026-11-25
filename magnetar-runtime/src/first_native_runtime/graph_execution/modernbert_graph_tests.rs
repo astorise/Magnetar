@@ -369,11 +369,11 @@ fn modernbert_component_graph_matches_pinned_transformers() {
         "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
     )
     .replace(
-        "sha256:abfdf515d2d2d52bd0738d52d3628a6077e65d4217c6c19c9598eef7ae0386a1",
+        "sha256:136e96acfb84b8d8da46461f945c21d0c1a4be161a6e7b0a8a3e104635ae34e8",
         &digest.value,
     )
     .replace("magnetar.qwen.real", "magnetar.modernbert.test")
-    .replace("1.8.0", "1.12.0");
+    .replace("1.13.0", "1.12.0");
     let trust = ComponentTrustStore::default().trust_digest(&digest.value);
     register_inference_component_artifact(bytes, manifest.into_bytes(), &trust).unwrap();
     let cases: Vec<Case> = serde_json::from_str(include_str!(

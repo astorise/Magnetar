@@ -580,11 +580,82 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        // Qwen4-Exp's blocks (`support-qwen38-flash-next` lot 3). Their output
+        // shapes follow from their inputs and attributes.
+        name @ ("gated-residual"
+        | "gated-residual-final"
+        | "gated-residual-inject"
+        | "repeat-features"
+        | "qsa-select"
+        | "ngram-embedding"
+        | "ngram-ple") => {
+            let input_shapes: Vec<Vec<u64>> =
+                inputs.iter().map(|value| value.shape().to_vec()).collect();
+            let shapes = crate::operator_semantics::hyper_stream_output_shapes(
+                name,
+                &input_shapes,
+                &node.attributes,
+            )
+            .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                reason: format!("graph node '{node_id}' ({name}): {error}"),
+            })?;
+            if node.outputs.len() != shapes.len() {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' ({name}) declares {} output edge(s), not {}",
+                        node.outputs.len(),
+                        shapes.len()
+                    ),
+                });
+            }
+            if let Some(graph) = ctx.graph.as_ref() {
+                for (index, (edge_id, shape)) in node.outputs.iter().zip(&shapes).enumerate() {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if &edge.descriptor.shape.dimensions != shape {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' output {index} has the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let mut targets = vec![output_target];
+            for edge_id in &node.outputs[1..] {
+                targets.push((
+                    ctx.edge_resource(edge_id.as_str()),
+                    resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                    ctx.output_owner(kv_cache_id),
+                ));
+            }
+            let family = if matches!(
+                name,
+                "gated-residual" | "gated-residual-final" | "ngram-ple"
+            ) {
+                OperatorFamily::LinearAlgebra
+            } else {
+                OperatorFamily::Tensor
+            };
+            dispatch_pure_operator_outputs(
+                ctx,
+                node_id,
+                dispatch_operator_id(name, family),
+                inputs,
+                targets,
+                &shapes,
+                node.attributes.clone(),
+            )
+        }
         name @ ("mamba2-mixer" | "gated-delta-mixer") => {
             let valid_inputs = if name == "mamba2-mixer" {
                 (10..=13).contains(&inputs.len())
             } else {
-                inputs.len() == 13
+                // The token mask is optional.
+                (12..=13).contains(&inputs.len())
             };
             if !valid_inputs || node.outputs.len() != 3 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1313,6 +1384,7 @@ pub(super) fn dispatch_first_native_graph_node(
                 node_id,
                 input,
                 [Some(output_target), Some(second_output_target)],
+                node.attributes.clone(),
             )
         }
         other => Err(InferenceApiError::OperatorUnsupported {
@@ -1678,18 +1750,18 @@ pub(super) fn execute_first_native_graph_nodes(
     mut written_resources: Option<&mut Vec<TensorResourceId>>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
-    // Recurrent edges are validated by the graph contract, but this executor
-    // does not yet own their transactional session lifecycle. Never treat them
-    // as ordinary inputs/outputs or KV history in the meantime.
-    if graph
-        .edges
-        .values()
-        .any(|edge| edge.recurrent_state.is_some())
-    {
-        return Err(InferenceApiError::KernelUnavailable {
-            reason: "recurrent state lifecycle is not implemented by this executor".into(),
-        });
-    }
+    // Recurrent state inputs read the KV cache's state: pending in this
+    // attempt, else committed, else zeros (`support-qwen38-flash-next`).
+    let recurrent = super::recurrent_state::recurrent_bindings(graph)?;
+    let mut initial_bindings = initial_bindings;
+    let mut resident_bindings = resident_bindings;
+    super::recurrent_state::bind_recurrent_inputs(
+        runtime,
+        kv_cache_id,
+        &recurrent,
+        &mut initial_bindings,
+        &mut resident_bindings,
+    )?;
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph
@@ -1850,6 +1922,13 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "moe-experts"
                 | "mamba2-mixer"
                 | "gated-delta-mixer"
+                | "gated-residual"
+                | "gated-residual-final"
+                | "gated-residual-inject"
+                | "repeat-features"
+                | "qsa-select"
+                | "ngram-embedding"
+                | "ngram-ple"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -1872,6 +1951,8 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "rmsnorm"
                 | "rope"
                 | "concat"
+                // Reads only its input's shape (`support-qwen38-flash-next`).
+                | "split"
         );
         let inputs_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let mut inputs = Vec::with_capacity(node.inputs.len());
@@ -1935,6 +2016,13 @@ pub(super) fn execute_first_native_graph_nodes(
             node.operator.name(),
             "mamba2-mixer"
                 | "gated-delta-mixer"
+                | "gated-residual"
+                | "gated-residual-final"
+                | "gated-residual-inject"
+                | "repeat-features"
+                | "qsa-select"
+                | "ngram-embedding"
+                | "ngram-ple"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -2482,10 +2570,9 @@ pub(super) fn execute_first_native_graph_nodes(
             for edge_id in &node.inputs {
                 if last_reader.get(edge_id) != Some(&node_index)
                     || kept_edges.contains(&edge_id.as_str())
-                    || graph
-                        .edges
-                        .get(edge_id)
-                        .is_none_or(|edge| edge.kv_cache.is_some())
+                    || graph.edges.get(edge_id).is_none_or(|edge| {
+                        edge.kv_cache.is_some() || edge.recurrent_state.is_some()
+                    })
                 {
                     continue;
                 }
@@ -2550,6 +2637,14 @@ pub(super) fn execute_first_native_graph_nodes(
     let dispatch_result = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
         reason: "first-native graph executed no nodes".into(),
     })?;
+    let recurrent_outputs: BTreeMap<_, _> = recurrent
+        .iter()
+        .filter_map(|binding| {
+            bindings
+                .get_key_value(&binding.output_edge)
+                .map(|(edge, value)| (edge.clone(), value.clone()))
+        })
+        .collect();
     let materialize_clock = dispatch_ctx.runtime.phase_ledger().clock();
     if let MaterializedEdges::Only(edges)
     | MaterializedEdges::LastRow(edges)
@@ -2566,6 +2661,16 @@ pub(super) fn execute_first_native_graph_nodes(
         .runtime
         .phase_ledger_mut()
         .record(materialize_clock, StepPhase::OutputMaterialize);
+    // Each recurrent output becomes the cache's pending state, kept under
+    // its own resource: the edge's is overwritten by the next step. Last:
+    // it releases the pending value this step read.
+    super::recurrent_state::stage_recurrent_outputs(
+        dispatch_ctx.runtime,
+        executor,
+        kv_cache_id,
+        &recurrent,
+        &recurrent_outputs,
+    )?;
     Ok((dispatch_result, materialized_bindings, updated_layer_kv))
 }
 
@@ -2731,6 +2836,8 @@ mod mamba3_tests;
 mod modernbert_graph_tests;
 #[cfg(test)]
 mod projected_differential_attention_tests;
+#[cfg(test)]
+mod qwen4_exp_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

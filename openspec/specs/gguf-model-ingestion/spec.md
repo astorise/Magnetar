@@ -70,6 +70,11 @@ The GGUF ingestor's tokenizer construction SHALL build a real tokenizer directly
 - **WHEN** a GGUF file declares the same token id for both its beginning-of-sequence and end-of-sequence special tokens
 - **THEN** tokenizer construction succeeds, registering that id under one role rather than failing on a special-token conflict
 
+#### Scenario: A byte-level BPE adds no space before the text
+
+- **WHEN** a byte-level BPE tokenizer built from a GGUF file encodes text that does not start with a space
+- **THEN** the first token is the text's own first piece, not one carrying a leading space, as llama.cpp and the checkpoint's upstream `tokenizer.json` encode it
+
 ### Requirement: GGUF Ingestion Dequantizes Supported Block Formats
 
 The GGUF ingestor SHALL dequantize a tensor whose declared storage uses a supported GGUF block quantization format (`Q8_0`, `Q4_K`, or `Q5_K`) to `F32` before that tensor's shape/layout normalization (including any projection-weight transpose) runs, and SHALL report that tensor's dequantized `F32` storage dtype, byte size, and absence of quantization metadata in the returned Model Artifact -- never the original quantized values. Any GGUF `ggml_type` this ingestor's underlying parser does not itself recognize continues to fail at the parser layer, before this ingestor ever sees such a tensor.
@@ -89,3 +94,51 @@ The GGUF ingestor SHALL dequantize a tensor whose declared storage uses a suppor
 - **WHEN** a GGUF file's tensors are entirely unquantized (`F32`/`F16`/`BF16`)
 - **THEN** ingestion proceeds normally, unaffected by dequantization support existing for other tensors
 
+### Requirement: GGUF Ingestion Derives A Layered File's Packed Tensors
+
+GGUF ingestion SHALL derive the tensors a `gemma4` file's Model Component requests from its packed tensors:
+- **Per-layer input tables:** each layer's slice of `per_layer_token_embd` (columns) and `per_layer_model_proj` (rows).
+- **Routed experts:** the stacked gate and up projections from `ffn_gate_up_exps`.
+- **Router:** `ffn_gate_inp` with `ffn_gate_inp.scale` and `hidden^-0.5` folded in, as `f32`, and `ffn_down_exps.scale` as the per-expert scale.
+
+A block-quantized table SHALL be cut on block boundaries and copied without re-encoding, and a cut inside a block SHALL be refused.
+
+#### Scenario: Block-quantized per-layer embedding
+- **WHEN** `per_layer_token_embd` is `Q8_0` with one 32-element block per layer per row
+- **THEN** `layers.1.per_layer_embedding` is each row's second block, byte for byte
+
+### Requirement: GGUF Ingestion Reads Q4_0 Tensors
+
+GGUF ingestion SHALL read a `Q4_0` tensor (GGML type 2) as storage dtype `Q4`.
+
+A `Q4_0` projection SHALL keep its stored bytes, packed, and SHALL declare transposed storage, as a `Q8_0` projection does.
+
+#### Scenario: A Q4_0 projection
+- **WHEN** a GGUF file stores a projection weight as `Q4_0`
+- **THEN** its tensor keeps storage dtype `Q4` with transposed storage declared, and Model Loading reads its values as `d * (q - 8)`, transposed
+
+### Requirement: GGUF Ingestion Reads deepseek2 Files
+
+GGUF ingestion SHALL read a `deepseek2` file's `attention.kv_lora_rank` as multi-head latent attention, its YaRN keys as llama.cpp applies them, its leading dense layers and routed experts with their routing, and SHALL split its latent-attention projections into the tensors the Model Component requests, from either form of the key and value projection llama.cpp's converter has written.
+
+The expanded head widths come from `key_length_mla` and `value_length_mla` when present (files converted after llama.cpp split `attn_kv_b`, which declare the latent's widths in `key_length` and `value_length` and one K/V head), from `key_length` and `value_length` otherwise; the rotated width from `rope.dimension_count`. YaRN keeps cosines and sines unscaled and takes `mscale_all_dim` as `yarn_log_multiplier / 0.1`, with `beta_fast` 32 and `beta_slow` 1 unless declared. Scoring is softmax when `expert_gating_func` is absent or `1`, sigmoid when `2`; another value is refused. With `expert_group_count` above 1, a group is scored by its best expert after a softmax and by its two best after a sigmoid. `exp_probs_b.bias` is the selection bias. `attn_q`/`attn_q_b`, `attn_kv_a_mqa` and `attn_kv_b` are split by rows like the Hugging Face checkpoint's; `attn_v_b` is already the value projection; `attn_k_b`'s heads are transposed back, in the stored float type or in `f32` from a block-quantized one.
+
+#### Scenario: A DeepSeek-V2-Lite file from before the split
+- **WHEN** the loader reads the metadata of `DeepSeek-V2-Lite-Chat.Q4_K_M.gguf` (converted in 2024)
+- **THEN** it declares the same latent attention, head widths, experts and dense first layer as the Hugging Face configuration, YaRN with factor 40 over 4096 positions and `mscale_all_dim` 0.707, and every tensor name in the file has a canonical name
+
+#### Scenario: Either key and value form
+- **WHEN** a file stores `attn_kv_b`, or `attn_k_b` and `attn_v_b` written from the same `kv_b` as the converter writes them
+- **THEN** both yield the same split key and value projections, equal to the rows of `kv_b`
+
+#### Scenario: A block-quantized split key projection
+- **WHEN** `attn_k_b` is stored as `Q8_0`
+- **THEN** the key projection reaches the Component in `f32`, each head transposed back
+
+### Requirement: GGUF Loader Reads The Gemma 4 Tokenizer
+
+The GGUF loader SHALL build the tokenizer of a file whose `tokenizer.ggml.model` is `gemma4` from its own metadata: its pieces and `tokenizer.ggml.merges` as a byte-fallback BPE, spaces encoded as `▁` with no space added before the text, `▁` decoded back to spaces. Its encoding and decoding SHALL match the checkpoint's upstream `tokenizer.json`.
+
+#### Scenario: Gemma 4 E2B tokenizer parity
+- **WHEN** the tokenizer is built from the Gemma 4 E2B QAT `Q4_0` file's metadata
+- **THEN** it encodes and decodes the parity texts exactly as the upstream `tokenizer.json` does, allowing only the beginning-of-sequence token it adds before an encoding with special tokens

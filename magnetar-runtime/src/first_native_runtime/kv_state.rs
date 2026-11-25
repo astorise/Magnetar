@@ -179,6 +179,8 @@ impl KvUpdateTransaction {
                 },
             );
         }
+        // The step's recurrent state is accepted with its KV rows.
+        super::recurrent_state::commit_recurrent_state(runtime, &self.executor, cache)?;
         Ok(committed)
     }
 }
@@ -366,10 +368,37 @@ impl E2eRuntimeModelExecutionEngine {
         let key = Self::kv_state_key(request);
         // Only steps whose KV history is kept in place: their shapes and
         // resources are the same from one step to the next.
-        let replayable = self.step_replay.is_enabled()
+        // A replay would bypass the executor that binds and stages the
+        // recurrent state (`support-qwen38-flash-next`).
+        if graphs.recurrent && decode_index == STEP_CAPTURE_DECODE_INDEX {
+            trace_step_capture("not captured", "decode step with recurrent state");
+        }
+        let replayable = !graphs.recurrent
+            && self.step_replay.is_enabled()
             && kv_stores.is_some()
             && !kv_state.layer_kv.is_empty()
             && kv_state.layer_kv.values().all(|layer| layer.rows.is_some());
+        // A pooled store set outlives its request: its decode step is
+        // recorded once for every request the set serves
+        // (`reuse-decode-captures-across-requests`).
+        if replayable && let Some(set) = kv_stores.and_then(|spec| spec.pool_set) {
+            let pooled = (graphs.decode_memo.fingerprint(&graphs.decode).clone(), set);
+            if let Some(output) = self.execute_pooled_decode_step(
+                runtime,
+                kv_state,
+                execution_plan,
+                graphs,
+                model_instance,
+                &ids_tensor,
+                absolute_position,
+                node_events,
+                kv_stores,
+                greedy,
+                pooled,
+            )? {
+                return Ok(output);
+            }
+        }
         if replayable {
             if let Some(recorded) = self.step_replay.recorded(&key) {
                 if let Some(output) = replay_decode_step(
@@ -425,6 +454,124 @@ impl E2eRuntimeModelExecutionEngine {
             true,
         )
         .map(|output| (output, None))
+    }
+
+    /// One decode step of a request whose KV stores are a pooled store set
+    /// (`reuse-decode-captures-across-requests`), keyed by the decode graph
+    /// and the set rather than by the request: run per node in the set's
+    /// decode namespace (whose intermediates outlive the request), then
+    /// captured, then replayed by every later step and request of the set.
+    /// A step earlier than the recorded one (a shorter prompt) captures
+    /// again: a replay only advances positions. `None` when the key is
+    /// declined: the caller runs the step as an unpooled request's.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_pooled_decode_step(
+        &self,
+        runtime: &mut Runtime,
+        kv_state: &FirstNativeExecutionKvState,
+        execution_plan: &mut PreparedExecutionPlan,
+        graphs: &CachedGraphs,
+        model_instance: &ModelInstanceId,
+        ids_tensor: &HostTensor,
+        absolute_position: u64,
+        node_events: &mut Vec<PerNodeCausalEvent>,
+        kv_stores: Option<KvStoreSpec>,
+        greedy: Option<&DeviceGreedyPlan>,
+        key: PooledDecodeKey,
+    ) -> Result<Option<(FirstNativeGraphExecutionOutput, Option<u64>)>, InferenceApiError> {
+        let namespace = pooled_decode_namespace(key.1, &key.0);
+        let capture = match self.step_replay.pooled_decode_stage(&key) {
+            RecordingStage::Declined => return Ok(None),
+            RecordingStage::Replay(recorded) if absolute_position >= recorded.0.position => {
+                if let Some(output) = replay_decode_step(
+                    runtime,
+                    &recorded.0,
+                    vec![ids_tensor.clone()],
+                    absolute_position,
+                    greedy,
+                )? {
+                    return Ok(Some(output));
+                }
+                // Invalidated: this step runs per node, the next captures.
+                self.step_replay.invalidate_pooled_decode(&key);
+                false
+            }
+            // Before the recorded position: the namespace's intermediates
+            // are in place, so this step captures at once.
+            RecordingStage::Replay(_) | RecordingStage::Capture => true,
+            RecordingStage::Warm => {
+                // Keep no namespace for a Provider that cannot capture.
+                let captures = match execution_plan.node_bindings.first() {
+                    Some(binding) => resolve_kernel_execution_provider(runtime, &binding.provider)?
+                        .supports_step_capture(),
+                    None => false,
+                };
+                if !captures {
+                    self.step_replay.decline_pooled_decode(key);
+                    return Ok(None);
+                }
+                false
+            }
+        };
+        if capture {
+            let captured = self.capture_step(
+                runtime,
+                StepToCapture {
+                    cache: &kv_state.cache,
+                    graph: &graphs.decode,
+                    memo: &graphs.decode_memo,
+                    inputs: vec![(
+                        TensorEdgeId::new("input.token_ids"),
+                        TensorResourceId::new(format!("{namespace}.input.token_ids")),
+                        ids_tensor.clone(),
+                    )],
+                    input_owner: MemoryAllocationOwner::Session(namespace.clone()),
+                    kv_history: Some(&kv_state.layer_kv),
+                    position: absolute_position,
+                    resource_namespace: Some(&namespace),
+                    advancing_attributes: &STEP_ADVANCING_ATTRIBUTES,
+                },
+                execution_plan,
+                model_instance,
+                node_events,
+                kv_stores,
+            )?;
+            return match captured {
+                Some((recorded, output)) => {
+                    trace_step_capture(
+                        "captured",
+                        format!("decode step at {absolute_position} for store set {}", key.1),
+                    );
+                    self.step_replay.record_pooled_decode(key, recorded);
+                    Ok(Some((output, None)))
+                }
+                None => {
+                    // The request captures its own step instead.
+                    self.step_replay.decline_pooled_decode(key);
+                    Ok(None)
+                }
+            };
+        }
+        let output = execute_first_native_graph_namespaced(
+            runtime,
+            &self.fixture,
+            model_instance,
+            &kv_state.cache,
+            &graphs.decode,
+            execution_plan,
+            BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor.clone())]),
+            Some(&kv_state.layer_kv),
+            Some(absolute_position),
+            node_events,
+            MaterializedEdges::Only(&["logits"]),
+            Some(&graphs.decode_memo),
+            kv_stores,
+            Some(&namespace),
+            // A namespace keeps its resources whatever happens.
+            false,
+        )?;
+        self.step_replay.pooled_decode_warmed(key);
+        Ok(Some((output, None)))
     }
 
     /// Runs one decode step per node inside a step capture. `None` when the

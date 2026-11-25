@@ -344,6 +344,13 @@ pub fn run_first_native_graph_segment_dispatch(
     kv_history: Option<&LayerKvMap>,
     absolute_position_override: Option<u64>,
 ) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
+    // A segment's steps are not committed through the KV transaction that
+    // commits recurrent state (`support-qwen38-flash-next`).
+    if super::recurrent_state::has_recurrent_state(graph) {
+        return Err(E2eConformanceError::KernelCoverageMissing {
+            reason: "recurrent state across layer segments is not implemented".into(),
+        });
+    }
     let status = require_ready_first_native_instance(&runtime, &instance)?;
     let mutation_version = status.status().mutation_version;
     let sequence_length = if start_layer == 0 {

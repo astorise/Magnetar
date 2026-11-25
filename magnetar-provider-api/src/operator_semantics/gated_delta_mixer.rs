@@ -7,7 +7,10 @@ use crate::{
     tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode},
 };
 
-use super::gated_delta_mixer_core::{MixerConfig, MixerState, MixerWeights, mixer_f32};
+use super::gated_delta_mixer_core::{
+    MixerConfig, MixerGateWeights, MixerProjections, MixerState, MixerWeights, mixer_f32,
+    mixer_recurrence_f32,
+};
 
 const MAX_ELEMENTS: u64 = 67_108_864;
 
@@ -83,8 +86,11 @@ pub fn gated_delta_mixer(
     inputs: &[HostTensor],
     config: GatedDeltaMixer,
 ) -> Result<[HostTensor; 3], ReferenceCpuError> {
-    if inputs.len() != 13 {
-        return Err(invalid("gated-delta mixer requires thirteen inputs"));
+    // Twelve inputs: no token mask, every token is valid.
+    if !(12..=13).contains(&inputs.len()) {
+        return Err(invalid(
+            "gated-delta mixer requires twelve or thirteen inputs",
+        ));
     }
     let [tokens, hidden] = inputs[0].shape.as_slice() else {
         return Err(invalid("gated-delta hidden input must be rank two"));
@@ -133,15 +139,19 @@ pub fn gated_delta_mixer(
     for (input, shape) in inputs.iter().zip(&shapes) {
         check(input, shape)?;
     }
-    let mask = inputs[12]
-        .data
-        .iter()
-        .map(|value| match *value {
-            0.0 => Ok(0),
-            1.0 => Ok(1),
-            _ => Err(invalid("gated-delta mask must contain only zero or one")),
+    let mask = inputs
+        .get(12)
+        .map(|mask| {
+            mask.data
+                .iter()
+                .map(|value| match *value {
+                    0.0 => Ok(0),
+                    1.0 => Ok(1),
+                    _ => Err(invalid("gated-delta mask must contain only zero or one")),
+                })
+                .collect::<Result<Vec<u8>, _>>()
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .transpose()?;
     let output = mixer_f32(
         MixerConfig {
             hidden: usize::try_from(*hidden).map_err(|_| invalid("hidden size too large"))?,
@@ -154,7 +164,7 @@ pub fn gated_delta_mixer(
         },
         usize::try_from(*tokens).map_err(|_| invalid("token count too large"))?,
         &inputs[0].data,
-        Some(&mask),
+        mask.as_deref(),
         MixerWeights {
             in_qkv: &inputs[3].data,
             in_z: &inputs[4].data,
@@ -178,3 +188,78 @@ pub fn gated_delta_mixer(
         HostTensor::new(shapes[2].clone(), output.recurrent_state)?,
     ])
 }
+
+/// The gated-delta mixer between its input and output projections, for a
+/// Provider that computes the projections itself: `projections` are the
+/// chunk's `[tokens, width]` QKV, Z, A and B projections (a masked token's
+/// all zero), `states` the prior convolution and recurrent states, and
+/// `weights` the depthwise convolution, `A_log`, `dt_bias` and the norm
+/// weight, in the Operator's shapes. Returns the gated RMSNorm output
+/// `[tokens, value_heads * value_dim]`, which the output projection
+/// consumes, and the next convolution and recurrent states: the same
+/// values [`gated_delta_mixer`] computes from the same projections.
+pub fn gated_delta_mixer_from_projections(
+    projections: [&[f32]; 4],
+    tokens: u64,
+    states: [&HostTensor; 2],
+    weights: [&HostTensor; 4],
+    config: GatedDeltaMixer,
+) -> Result<[HostTensor; 3], ReferenceCpuError> {
+    let kh = config.key_heads as u64;
+    let vh = config.value_heads as u64;
+    let kd = config.key_dim as u64;
+    let vd = config.value_dim as u64;
+    let kernel = config.conv_kernel as u64;
+    let value_width = vh
+        .checked_mul(vd)
+        .ok_or_else(|| invalid("geometry overflow"))?;
+    let channels = kh
+        .checked_mul(kd)
+        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| value.checked_add(value_width))
+        .ok_or_else(|| invalid("geometry overflow"))?;
+    let shapes = [
+        vec![channels, kernel],
+        vec![vh, kd, vd],
+        vec![channels, kernel],
+        vec![vh],
+        vec![vh],
+        vec![vd],
+    ];
+    for (input, shape) in states.iter().chain(&weights).zip(&shapes) {
+        check(input, shape)?;
+    }
+    let [qkv, z, a, b] = projections;
+    let recurrence = mixer_recurrence_f32(
+        MixerConfig {
+            hidden: 0,
+            key_heads: config.key_heads,
+            value_heads: config.value_heads,
+            key_dim: config.key_dim,
+            value_dim: config.value_dim,
+            conv_kernel: config.conv_kernel,
+            norm_epsilon: config.epsilon,
+        },
+        usize::try_from(tokens).map_err(|_| invalid("token count too large"))?,
+        MixerProjections { qkv, z, a, b },
+        MixerGateWeights {
+            convolution: &weights[0].data,
+            a_log: &weights[1].data,
+            dt_bias: &weights[2].data,
+            norm: &weights[3].data,
+        },
+        Some(MixerState {
+            convolution: &states[0].data,
+            recurrent: &states[1].data,
+        }),
+    )
+    .map_err(|error| invalid(&error.to_string()))?;
+    Ok([
+        HostTensor::new([tokens, value_width], recurrence.normalized)?,
+        HostTensor::new(shapes[0].clone(), recurrence.convolution_state)?,
+        HostTensor::new(shapes[1].clone(), recurrence.recurrent_state)?,
+    ])
+}
+
+#[cfg(test)]
+mod tests;
