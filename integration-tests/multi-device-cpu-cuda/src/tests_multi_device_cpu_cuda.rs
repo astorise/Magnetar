@@ -1393,7 +1393,10 @@ fn two_layer_fixture() -> E2eFixture {
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    let mut config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
+    // The real Qwen Component refuses a checkpoint whose activation is not
+    // known to be `silu`.
+    config.hidden_activation = Some("silu".into());
     config
         .validate(&identity)
         .expect("2-layer config validates");
@@ -1421,6 +1424,18 @@ fn two_layer_fixture() -> E2eFixture {
         tokenizer,
         weights,
     }
+}
+
+/// The 2-layer fixture the real two-GPU test splits builds a real graph from
+/// the real Qwen Component on any host: the Component refuses a checkpoint
+/// whose activation is not known to be `silu`, which a GPU-gated test would
+/// only report on a runner with two GPUs.
+#[test]
+fn the_two_layer_fixture_builds_a_real_component_graph_without_any_gpu() {
+    register_real_qwen_component();
+    let fixture = two_layer_fixture();
+    build_first_native_graphs_from_real_qwen_component(&fixture, 3)
+        .expect("the real Qwen Component produces a real full prefill graph");
 }
 
 /// `add-real-multi-device-model-instance-placement`'s own real, two-real-
