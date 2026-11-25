@@ -7,6 +7,7 @@ use crate::{
     tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode},
 };
 
+pub use super::gated_delta_mixer_core::MixerOutputGate;
 use super::gated_delta_mixer_core::{
     MixerConfig, MixerGateWeights, MixerProjections, MixerState, MixerWeights, mixer_f32,
     mixer_recurrence_f32,
@@ -23,6 +24,8 @@ pub struct GatedDeltaMixer {
     pub value_dim: usize,
     pub conv_kernel: usize,
     pub epsilon: f32,
+    /// The gate's activation (`output_gate_type`).
+    pub output_gate: MixerOutputGate,
 }
 
 fn invalid(reason: &str) -> ReferenceCpuError {
@@ -53,6 +56,18 @@ pub fn gated_delta_mixer_from_attributes(
         value_dim: positive("value_dim")?,
         conv_kernel: positive("conv_kernel")?,
         epsilon,
+        output_gate: match attributes.get("output_gate_type") {
+            None => MixerOutputGate::Silu,
+            Some(OperatorAttributeValue::String(kind)) if kind == "silu" => MixerOutputGate::Silu,
+            Some(OperatorAttributeValue::String(kind)) if kind == "sigmoid" => {
+                MixerOutputGate::Sigmoid
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "gated-delta output_gate_type must be \"silu\" or \"sigmoid\"",
+                ));
+            }
+        },
     };
     if !config.value_heads.is_multiple_of(config.key_heads) {
         return Err(invalid(
@@ -161,6 +176,7 @@ pub fn gated_delta_mixer(
             value_dim: config.value_dim,
             conv_kernel: config.conv_kernel,
             norm_epsilon: config.epsilon,
+            output_gate: config.output_gate,
         },
         usize::try_from(*tokens).map_err(|_| invalid("token count too large"))?,
         &inputs[0].data,
@@ -239,6 +255,7 @@ pub fn gated_delta_mixer_from_projections(
             value_dim: config.value_dim,
             conv_kernel: config.conv_kernel,
             norm_epsilon: config.epsilon,
+            output_gate: config.output_gate,
         },
         usize::try_from(tokens).map_err(|_| invalid("token count too large"))?,
         MixerProjections { qkv, z, a, b },

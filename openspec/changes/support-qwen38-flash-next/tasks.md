@@ -108,7 +108,8 @@
   - The routing needs no change: Qwen3-Next's router is softmax over every expert, top-k, renormalized, with a tie to the lower expert, which `moe_route` computes with `normalize_top_k`.
   - `the_moe_block_matches_through_the_existing_operator` runs `Qwen4ExpTextSparseMoeBlock` against `moe-experts` plus a sigmoid-gated shared expert. The stacked `gate_up_proj [E, 2I, H]` and `down_proj [E, H, I]` map onto the operator's `gate`/`up [H, E*I]` and `down [I, E*H]`; the loaders do that mapping.
 - [ ] 3.6 Qwen Component: recognize `qwen4_exp` and emit its graph; refuse it explicitly until 3.2–3.5 are qualified.
-  - [ ] The gated-delta mixer's output gate takes `output_gate_type` (`silu` or `sigmoid`).
+  - [x] The `gated-delta-mixer` operator takes `output_gate_type` (`silu`, the default, or `sigmoid`), with the kernel feature `gated-delta-sigmoid-output-gate` required only for `sigmoid`. The shared semantics, both CPU Providers (`gated_delta_graph_honours_the_output_gate_type` at the Runtime, `gated_delta_mixer_reads_compact_weights` on cpu-native) and the CUDA gated norm (`gdn_gated_norm_kernel`; its conformance test runs both gates at two geometries) implement it. `sigmoid(z) * z` equals the `silu` output element by element and the two next states do not change. The CUDA kernel compiles on the GPU runner only; the hardware run is queued with the next campaign.
+  - [ ] The Component emits `output_gate_type` from the configuration (with the `model-config` 1.14.0 additions below).
   - [ ] Tiny `qwen4_exp` bundle against Transformers on the Reference CPU: layers, residual streams, the PLE layer and an indexer that prunes.
 
 ## 4. Expert and table residency

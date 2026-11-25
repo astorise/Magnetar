@@ -40,6 +40,7 @@ fn the_mixer_from_its_projections_equals_the_whole_mixer() {
         value_dim: 4,
         conv_kernel: 4,
         epsilon: 1e-6,
+        output_gate: MixerOutputGate::Silu,
     };
     let (tokens, hidden, channels, value_width) = (3u64, 12u64, 48u64, 16u64);
     let mask = HostTensor::new([tokens], vec![1.0, 0.0, 1.0]).unwrap();
@@ -100,4 +101,116 @@ fn the_mixer_from_its_projections_equals_the_whole_mixer() {
         )
         .is_err()
     );
+}
+
+/// `output_gate_type` picks the gate's activation (`support-qwen38-flash-next`,
+/// Qwen4-Exp): with `sigmoid` the normalized output is `silu`'s divided by
+/// `z`, element by element, and nothing else changes (states included).
+#[test]
+fn the_output_gate_activation_follows_output_gate_type() {
+    let silu_config = GatedDeltaMixer {
+        key_heads: 2,
+        value_heads: 4,
+        key_dim: 8,
+        value_dim: 4,
+        conv_kernel: 4,
+        epsilon: 1e-6,
+        output_gate: MixerOutputGate::Silu,
+    };
+    let sigmoid_config = GatedDeltaMixer {
+        output_gate: MixerOutputGate::Sigmoid,
+        ..silu_config
+    };
+    let (tokens, hidden, channels, value_width) = (3u64, 12u64, 48u64, 16u64);
+    let x = values(tokens * hidden, 21, 1.0);
+    let weights = [
+        tensor(&[channels, hidden], 22, 0.3),
+        tensor(&[value_width, hidden], 23, 0.3),
+        tensor(&[4, hidden], 24, 0.3),
+        tensor(&[4, hidden], 25, 0.3),
+    ];
+    let projections = [0, 1, 2, 3].map(|index| project(&x, &weights[index]));
+    let states = [tensor(&[channels, 4], 26, 0.5), tensor(&[4, 8, 4], 27, 0.2)];
+    let norm_weights = [
+        tensor(&[channels, 4], 28, 0.5),
+        tensor(&[4], 29, 0.5),
+        tensor(&[4], 30, 0.5),
+        tensor(&[4], 31, 0.2),
+    ];
+    let run = |config| {
+        gated_delta_mixer_from_projections(
+            [
+                &projections[0],
+                &projections[1],
+                &projections[2],
+                &projections[3],
+            ],
+            tokens,
+            [&states[0], &states[1]],
+            [
+                &norm_weights[0],
+                &norm_weights[1],
+                &norm_weights[2],
+                &norm_weights[3],
+            ],
+            config,
+        )
+        .unwrap()
+    };
+    let silu = run(silu_config);
+    let sigmoid = run(sigmoid_config);
+    let z = &projections[1];
+    for ((silu, sigmoid), z) in silu[0].data.iter().zip(&sigmoid[0].data).zip(z) {
+        assert!(
+            (sigmoid * z - silu).abs() <= 1e-5 * (1.0 + silu.abs()),
+            "sigmoid {sigmoid} * z {z} should be silu {silu}"
+        );
+    }
+    assert_ne!(silu[0], sigmoid[0], "the two gates differ");
+    assert_eq!(silu[1], sigmoid[1], "the convolution state is untouched");
+    assert_eq!(silu[2], sigmoid[2], "the recurrent state is untouched");
+
+    // The attribute selects the activation; an unknown one is refused.
+    let attributes = |gate: Option<&str>| {
+        let mut attributes = BTreeMap::from([
+            ("key_heads".to_string(), OperatorAttributeValue::Integer(2)),
+            (
+                "value_heads".to_string(),
+                OperatorAttributeValue::Integer(4),
+            ),
+            ("key_dim".to_string(), OperatorAttributeValue::Integer(8)),
+            ("value_dim".to_string(), OperatorAttributeValue::Integer(4)),
+            (
+                "conv_kernel".to_string(),
+                OperatorAttributeValue::Integer(4),
+            ),
+            ("epsilon".to_string(), OperatorAttributeValue::Float(1e-6)),
+        ]);
+        if let Some(gate) = gate {
+            attributes.insert(
+                "output_gate_type".into(),
+                OperatorAttributeValue::String(gate.into()),
+            );
+        }
+        attributes
+    };
+    assert_eq!(
+        gated_delta_mixer_from_attributes(&attributes(None))
+            .unwrap()
+            .output_gate,
+        MixerOutputGate::Silu
+    );
+    assert_eq!(
+        gated_delta_mixer_from_attributes(&attributes(Some("silu")))
+            .unwrap()
+            .output_gate,
+        MixerOutputGate::Silu
+    );
+    assert_eq!(
+        gated_delta_mixer_from_attributes(&attributes(Some("sigmoid")))
+            .unwrap()
+            .output_gate,
+        MixerOutputGate::Sigmoid
+    );
+    assert!(gated_delta_mixer_from_attributes(&attributes(Some("gelu"))).is_err());
 }

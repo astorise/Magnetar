@@ -37,7 +37,7 @@ pub use encoder_ops::{
     affine_layernorm, affine_layernorm_epsilon, gelu_exact, slice_last, slice_last_attributes,
 };
 pub use gated_delta_mixer::{
-    GatedDeltaMixer, gated_delta_mixer, gated_delta_mixer_from_attributes,
+    GatedDeltaMixer, MixerOutputGate, gated_delta_mixer, gated_delta_mixer_from_attributes,
     gated_delta_mixer_from_projections,
 };
 pub use gated_residual::{GatedResidual, gated_residual, gated_residual_inject, repeat_features};

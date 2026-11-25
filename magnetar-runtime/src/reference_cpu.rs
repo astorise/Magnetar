@@ -1600,7 +1600,12 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
             OperatorFamily::Attention,
         ),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
+        // Honours `output_gate_type` (Qwen4-Exp's sigmoid gate).
+        with_features(
+            "gated-delta-mixer",
+            OperatorFamily::LinearAlgebra,
+            &[crate::operator::GATED_DELTA_SIGMOID_GATE_FEATURE],
+        ),
         baseline_advertisement("gated-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("gated-residual-final", OperatorFamily::LinearAlgebra),
         baseline_advertisement("gated-residual-inject", OperatorFamily::Tensor),

@@ -375,6 +375,13 @@ pub const ATTENTION_LATENT_KV_FEATURE: &str = "attention-latent-kv";
 /// selection of `qsa-select`).
 pub const ATTENTION_TOKEN_SELECTION_FEATURE: &str = "attention-token-selection";
 
+/// Kernel feature a `gated-delta-mixer` Kernel advertises when it honours
+/// `output_gate_type = "sigmoid"`: the gated normalization multiplies by
+/// `sigmoid(z)` instead of `silu(z)` (Qwen4-Exp's linear-attention layers,
+/// `support-qwen38-flash-next`). A Kernel that ignored it would scale
+/// every mixer output by the wrong gate.
+pub const GATED_DELTA_SIGMOID_GATE_FEATURE: &str = "gated-delta-sigmoid-output-gate";
+
 /// Kernel feature a `concat` Kernel advertises when it honours `axis =
 /// "heads"`: the inputs joined head by head instead of row after row.
 pub const CONCAT_HEADS_FEATURE: &str = "concat-heads";
@@ -428,6 +435,14 @@ pub fn required_kernel_features(
             }
             if present("latent_kv_width") || (input_count > 3 && !present("token_selection")) {
                 features.push(ATTENTION_LATENT_KV_FEATURE);
+            }
+        }
+        "gated-delta-mixer" => {
+            if matches!(
+                attributes.get("output_gate_type"),
+                Some(OperatorAttributeValue::String(kind)) if kind != "silu"
+            ) {
+                features.push(GATED_DELTA_SIGMOID_GATE_FEATURE);
             }
         }
         "concat" => {
@@ -1995,6 +2010,10 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "epsilon",
                 OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "output_gate_type",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
             ),
         "mamba2-mixer" => OperatorAttributeSchema::default()
             .with_rule(
