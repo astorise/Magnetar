@@ -99,7 +99,7 @@
 - [x] 6.1 Both CPU Providers advertise `gated-matmul` with the Runtime's Reference semantics, so the Runtime folds a gated MLP's two matmuls and `silu-mul` into one node. The optimized CPU Provider computes both products as the matmul family does (packed, compact or f32) and applies the activation in place. Test: `gated_matmuls_match_the_reference_cpu` (compact, f32 and packed weights; 1 and 5 rows). Locally, over 64 tokens: the same text, 0.602 ms per layer against 0.614 ms for the two matmuls and `silu-mul` (providers/cpu 6ec6040).
 - [x] 6.2 A real 64-token profile puts the decode step at its kernels' sum: 34.9 ms against a TPOT of 37.5 ms. The effective bandwidths are about 29 GB/s for gate/up, 30 GB/s for o and down, 40 GB/s for the LM head (6.9 ms per token) and 14 GB/s for the small q, k and v products. The isolated streaming diagnostic reads 400 MB per shape, part of which stays in this host's 260 MB L3, so it overstates those figures.
 - [x] 6.4 Prefill tiles in blocks of 8 weight rows. A real 2-token profile split by row count put a replayed 5-row prefill's `gated-matmul` at 1.08 ms per layer, against 0.67 ms for one row. The isolated diagnostic had hidden it, since it reused one weight held in cache. Streamed from memory (`MAGNETAR_CPU_BENCH_ROWS` sets the streamed diagnostic's rows), a 5-row gate projection took 0.45 ms with blocks of 32 rows and 0.36 ms with 8. Locally, TTFT went from 66.3 to 62.6-63.9 ms, with the same tokens (providers/cpu 03706fb).
-- [ ] 6.3 The CPU benchmark streams each decode shape on the runner, with the default kernels and with AVX2 only (step "CPU kernel bandwidth"). The kernel choices (rows per pass, outputs per tile, vector width) are then checked on each runner CPU model, Zen 4 first. First sample: run 45383670846, Intel Xeon 6973P-C, 2 cores × 2 threads, providers/cpu 6ec6040.
+- [x] 6.3 The CPU benchmark streams each decode shape on the runner, with the default kernels and with AVX2 only (step "CPU kernel bandwidth"). The kernel choices (rows per pass, outputs per tile, vector width) are then checked on each runner CPU model, Zen 4 first. First sample: run 45383670846, Intel Xeon 6973P-C, 2 cores × 2 threads, providers/cpu 6ec6040.
   - In the stored orientations, input-major gate/up streams at 33.0 GB/s and output-major down at 31.7 GB/s. The other layout of each reaches 23 GB/s.
   - AVX2 and AVX-512 are equal within noise on every shape, so a one-row step is bound by memory on this host.
   - All engines in one job, the same tokens:
@@ -135,6 +135,11 @@
 
   On Intel, the 8-row blocks moved the prefill on 4 threads from 80.2 ms (run 45383670846, Xeon 6973P-C) to 49.6 ms, now ahead of one thread per core. Magnetar leads llama-server and Ollama by about 24% per request on this host. The Xeon 8370C runner has no kernel diagnostic sample yet.
 
+  Conclusion, closed on the samples the hosted pool has drawn since the diagnostic exists: Intel Xeon 6973P-C and 6975P-C, AMD EPYC 9V74 (Zen 4) and 9V45 (Zen 5), Intel Xeon Platinum 8573C.
+  - The stored orientations were the faster ones, and AVX2 equal to AVX-512, on the first three samples above (6973P-C, 9V74, 6975P-C). The later samples recorded the stored orientations' bandwidth only: 30.1 and 29.3 GB/s on the 8573C, 38-42 GB/s on every shape on the 9V45.
+  - No kernel choice (rows per pass, outputs per tile, vector width) depends on the CPU model. What differs between models is the bandwidth the kernels reach (29-42 GB/s), which task 7.10 follows.
+  - The Xeon 8370C was drawn only before the diagnostic step existed (run 45353462271) and has no sample. The hosted pool does not let a run choose its CPU model, so this stays unmeasured rather than open; a later sample on it reopens the check.
+
 ## 7. Decode step streaming (Ollama's decode on Zen 4)
 
 Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally, the replayed step ran its dense products at their kernels' streaming speed, but the small ones at half the large ones' bandwidth, with about 6 ms per token outside the products.
@@ -145,7 +150,7 @@ Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally,
 - [x] 7.4 `gated-matmul`'s two products in one pool run, then the sums and activation across the pool. Test: `gated_matmuls_match_the_reference_cpu` now also checks bit-for-bit equality with the two products then `silu_times`, for weights held as written and transposed.
 - [x] 7.5 Bias and residual sums in place; a block scan for greedy selection, its block maximum in sixteen lanes (264 to 47.5 us for the 151,936 logits; test: `greedy_columns_match_a_one_by_one_scan`); borrowed invocations at replay.
 - [x] 7.6 Locally, 8 interleaved runs of a 64-token profile per version: TPOT median 37.6 ms before, 34.3 ms after (paired difference -3.9 ms on average), with the same tokens (providers/cpu 2e523a4).
-- [ ] 7.7 The CPU benchmark on the runners, Zen 4 first: Magnetar against llama-server and Ollama per token.
+- [x] 7.7 The CPU benchmark on the runners, Zen 4 first: Magnetar against llama-server and Ollama per token. Measured on five hosts; the result per host is in the table after the fourth sample, and the gap it shows on AMD is task 7.10.
 
   First sample: run 45406355532, Intel Xeon 6975P-C (AMX), 2 cores × 2 threads, Magnetar d16a71c, providers/cpu 2e523a4, against run 45387956437 on the same CPU model (providers/cpu 03706fb). The same 16 tokens.
 
@@ -188,7 +193,25 @@ Ollama decoded about 4.7 ms per token faster on the Zen 4 runner (6.3). Locally,
   Fourth sample, the same CPU model: run 45447623233, AMD EPYC 9V45, Magnetar 7ade9ad. The same 16 tokens. Magnetar 460 ms per request, TTFT 37.3 ms, 28.4 ms per token (26.4 on one thread per core; 27.1 decoding on 2 threads with the prefill on 4); llama-server 380 ms and 22.9 ms per token; Ollama 370 ms and 21.8 ms per token.
   - Its kernel step added llama.cpp's row-at-a-time pattern (`row_streamed_matmul_costs`), but the test harness ran both streaming diagnostics at once, sharing the memory bandwidth (their lines interleave): no conclusion. The step now runs them one at a time (`--test-threads=1`).
 
-- [ ] 7.8 A decode pool of its own: `MAGNETAR_CPU_DECODE_THREADS=N` runs one-row Kernels (dense and packed products, gated sums, attention over one query) on N threads, Kernels of several rows on the main pool (test: `one_row_kernels_run_on_the_decode_pool`; providers/cpu c2967a3). The CPU benchmark measures it on one thread per physical core (step "Magnetar decoding on one thread per physical core"). Whether it becomes the default on hosts with two threads per core is decided on a Zen 4 sample. First samples disagree: one thread per core decoded faster on the Xeon 6975P-C (32.5 against 34.2 ms), slower on the Xeon Platinum 8573C (39.8 against 37.9 ms).
+  Per token, Magnetar's default (every logical CPU) against the other two engines on the same host, the same 16 tokens:
+
+  | Host (run) | Magnetar | llama-server | Ollama | Magnetar against the faster of the two |
+  | --- | --- | --- | --- | --- |
+  | Xeon 6975P-C (45406355532) | 34.2 ms | 45.0 ms | 43.3 ms | 21% faster |
+  | Xeon Platinum 8573C (45435917000) | 37.9 ms | 43.7 ms | 46.4 ms | 13% faster |
+  | EPYC 9V45, Zen 5 (45442269420) | 27.0 ms | 22.7 ms | 21.4 ms | 26% slower |
+  | EPYC 9V45, Zen 5 (45447623233) | 28.4 ms | 22.9 ms | 21.8 ms | 30% slower |
+  | EPYC 9V74, Zen 4 (45387558163, before this section's changes) | 34.0 ms | 33.9 ms | 29.3 ms | 16% slower |
+
+  Magnetar leads on the two Intel hosts and trails on AMD. There is no sample on the Zen 4 host with this section's changes.
+
+- [x] 7.8 A decode pool of its own: `MAGNETAR_CPU_DECODE_THREADS=N` runs one-row Kernels (dense and packed products, gated sums, attention over one query) on N threads, Kernels of several rows on the main pool (test: `one_row_kernels_run_on_the_decode_pool`; providers/cpu c2967a3). The CPU benchmark measures it on one thread per physical core (step "Magnetar decoding on one thread per physical core"). Whether it becomes the default on hosts with two threads per core is decided on a Zen 4 sample. First samples disagree: one thread per core decoded faster on the Xeon 6975P-C (32.5 against 34.2 ms), slower on the Xeon Platinum 8573C (39.8 against 37.9 ms).
+  - Decision: the default stays every logical CPU; `MAGNETAR_CPU_DECODE_THREADS` stays an opt-in. Decoding on one thread per core against every logical CPU, per token: Xeon 6975P-C 32.5 against 34.2 ms; Xeon Platinum 8573C 39.8 against 37.9 ms; EPYC 9V45 26.6 against 27.0 ms and 26.4 against 28.4 ms (runs 45442269420 and 45447623233); EPYC 9V74 (Zen 4, before the prefetches and the pool) 34.6 against 34.0 ms. The sign changes from one CPU model to the next, and the prefill prefers every logical CPU on every host, so no default serves all of them.
+  - The pool of its own with the prefill on every logical CPU did not settle it: 39.8 ms on the 8573C (every logical CPU 37.9), 26.9 and 27.1 ms on the 9V45 (27.0 and 28.4).
+  - A post-prefetch sample on the Zen 4 host would change this only if it showed a gain on every host family; the hosted pool does not let a run choose it.
 - [x] 7.9 Small Kernels in a replayed step (rmsnorm, rope, kv-write, attention: about 170 calls per token, 9-11 us each for 896 values, about 1.8 ms per token). Timed in the model, an rmsnorm call split into its input copy (1.6 us), its weight copy (2.0), the arithmetic (2.0) and the output store with its result (2.6); a rope call computed `sin_cos` per head (448 times for a 14-head query row).
   - rope computes a row's rotations once for every head; rmsnorm and rope read their inputs where they are stored; an output keeps its slot's key; a replay builds no `KernelResult` (providers/cpu 3b22bd5). The same values and tokens.
   - Result: rope 10 -> 9 us, rmsnorm unchanged at 9-10 us. The copies' cost moved into cache misses: the input was just written by other cores' pool tasks, the norm weight last read a step ago. What remains is memory latency on the step's critical path, not instructions.
+- [ ] 7.10 Decode on AMD: on the EPYC 9V45 (Zen 5) llama-server and Ollama stream the same 988 MB per token at 44-46 GB/s, Magnetar at 37 GB/s, and Magnetar's per-token time is 19-24% above llama-server's and 26-30% above Ollama's (task 7.7's table). On the Zen 4 host Ollama was 4.7 ms faster per token before this section's changes. The goal is Magnetar's per-token time at or below llama-server's on both AMD hosts.
+  - Lever to test: llama.cpp's row-at-a-time pattern (`row_streamed_matmul_costs`), compared with the Provider's kernels one diagnostic at a time (`--test-threads=1`, which the fourth sample of 7.7 lacked).
+  - Evidence needed: a CPU benchmark run on an AMD host after the change, since the hosted pool does not let a run choose its CPU model. Not dispatched yet.
