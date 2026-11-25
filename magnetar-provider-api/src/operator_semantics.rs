@@ -15,6 +15,7 @@ mod encoder_ops;
 mod gated_delta_core;
 mod gated_delta_mixer;
 mod gated_delta_mixer_core;
+mod gated_residual;
 mod mamba2_mixer;
 mod mamba3_core;
 mod mamba3_mimo;
@@ -35,6 +36,7 @@ pub use gated_delta_mixer::{
     GatedDeltaMixer, gated_delta_mixer, gated_delta_mixer_from_attributes,
     gated_delta_mixer_from_projections,
 };
+pub use gated_residual::{GatedResidual, gated_residual, gated_residual_inject, repeat_features};
 pub use mamba2_mixer::{Mamba2Mixer, mamba2_mixer, mamba2_mixer_from_attributes};
 pub use mamba3_core::Geometry as Mamba3Mimo;
 pub use mamba3_mimo::{mamba3_mimo, mamba3_mimo_from_attributes};
