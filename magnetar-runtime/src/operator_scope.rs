@@ -464,7 +464,7 @@ fn validate_first_scope_attributes(
     }
 }
 
-const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 48] = [
+const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 55] = [
     required_now("embedding", OperatorFamily::Tensor, true),
     required_now("matmul", OperatorFamily::LinearAlgebra, true),
     required_now("rmsnorm", OperatorFamily::Normalization, true),
@@ -483,6 +483,14 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 48] = [
     first_decoder_optional("moe-experts", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba2-mixer", OperatorFamily::LinearAlgebra),
     first_decoder_optional("gated-delta-mixer", OperatorFamily::LinearAlgebra),
+    // `support-qwen38-flash-next` lot 3: Qwen4-Exp's blocks.
+    first_decoder_optional("gated-residual", OperatorFamily::LinearAlgebra),
+    first_decoder_optional("gated-residual-final", OperatorFamily::LinearAlgebra),
+    first_decoder_optional("gated-residual-inject", OperatorFamily::Tensor),
+    first_decoder_optional("repeat-features", OperatorFamily::Tensor),
+    first_decoder_optional("qsa-select", OperatorFamily::Tensor),
+    first_decoder_optional("ngram-embedding", OperatorFamily::Tensor),
+    first_decoder_optional("ngram-ple", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba3-mimo", OperatorFamily::LinearAlgebra),
     first_decoder_optional("mamba3-mixer", OperatorFamily::LinearAlgebra),
     first_decoder_optional("token-shift", OperatorFamily::Tensor),

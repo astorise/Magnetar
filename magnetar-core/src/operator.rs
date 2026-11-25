@@ -1602,6 +1602,63 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         // and inventing one for a single deliberately-minimal proof
         // operator is not warranted.
         ("split", OperatorFamily::Tensor, 1, 2, ShapeRule::Split),
+        // `support-qwen38-flash-next` lot 3: Qwen4-Exp's blocks, defined by
+        // Transformers' `qwen4_exp` (design D7). `ShapeRule::Any`: the
+        // Reference semantics validate every shape, and no existing rule
+        // expresses these.
+        // The residual's `hc_count` streams mixed into a block's input and
+        // the per-stream write weights, or (`-final`) the mixed input only.
+        (
+            "gated-residual",
+            OperatorFamily::LinearAlgebra,
+            5,
+            2,
+            ShapeRule::Any,
+        ),
+        (
+            "gated-residual-final",
+            OperatorFamily::LinearAlgebra,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
+        // A block's output written back into every stream.
+        (
+            "gated-residual-inject",
+            OperatorFamily::Tensor,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        // `[T, H]` repeated along the features: the embedding becoming the
+        // streams.
+        (
+            "repeat-features",
+            OperatorFamily::Tensor,
+            1,
+            1,
+            ShapeRule::Any,
+        ),
+        // QSA's token selection: queries, raw index keys, the key norm's
+        // weight, and the kept token positions per query.
+        ("qsa-select", OperatorFamily::Tensor, 3, 1, ShapeRule::Any),
+        // The hashed n-gram rows of a token sequence and the next context.
+        (
+            "ngram-embedding",
+            OperatorFamily::Tensor,
+            3,
+            2,
+            ShapeRule::Any,
+        ),
+        // The PLE gate and dilated convolution, with the convolution's
+        // history as an explicit state.
+        (
+            "ngram-ple",
+            OperatorFamily::LinearAlgebra,
+            9,
+            2,
+            ShapeRule::Any,
+        ),
     ] {
         let mut spec = OperatorSpec::new(OperatorId::magnetar(name, 1, family), inputs, outputs)
             .with_shape_rule(shape)
@@ -1653,6 +1710,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             "encoder-attention"
                 | "mamba2-mixer"
                 | "gated-delta-mixer"
+                | "gated-residual"
+                | "gated-residual-final"
+                | "gated-residual-inject"
+                | "repeat-features"
+                | "qsa-select"
+                | "ngram-embedding"
+                | "ngram-ple"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -1794,6 +1858,106 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "zero_centered_norm",
                 OperatorAttributeRule::required(OperatorAttributeKind::Boolean),
+            ),
+        "gated-residual" | "gated-residual-final" => OperatorAttributeSchema::default()
+            .with_rule(
+                "hc_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            ),
+        "repeat-features" => OperatorAttributeSchema::default().with_rule(
+            "count",
+            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+        ),
+        "qsa-select" => OperatorAttributeSchema::default()
+            .with_rule(
+                "head_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "compress_ratio",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "budget",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "rotary_dim",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "rope_base",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            ),
+        "ngram-embedding" => OperatorAttributeSchema::default()
+            .with_rule(
+                "ngram_size",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "heads_per_ngram",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "vocab_size",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "vocab_base",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "layer_index",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "seed",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "eos_token_id",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            ),
+        "ngram-ple" => OperatorAttributeSchema::default()
+            .with_rule(
+                "hc_count",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_kernel",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "conv_dilation",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "epsilon",
+                OperatorAttributeRule::required(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "weight_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
             ),
         "gated-delta-mixer" => OperatorAttributeSchema::default()
             .with_rule(

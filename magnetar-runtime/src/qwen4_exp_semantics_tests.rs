@@ -10,106 +10,106 @@ use magnetar_provider_api::{
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct Flat {
-    shape: Vec<u64>,
-    data: Vec<f32>,
+pub(crate) struct Flat {
+    pub(crate) shape: Vec<u64>,
+    pub(crate) data: Vec<f32>,
 }
 
 impl Flat {
-    fn tensor(&self) -> HostTensor {
+    pub(crate) fn tensor(&self) -> HostTensor {
         HostTensor::new(self.shape.clone(), self.data.clone()).unwrap()
     }
 }
 
 #[derive(Deserialize)]
-struct GatedResidualCase {
-    norm_weight: Flat,
-    down: Flat,
-    up: Flat,
-    inject: Flat,
-    input: Flat,
-    mixed: Flat,
-    injection: Flat,
-    block_output: Flat,
-    after_block: Flat,
-    final_mixed: Flat,
-    embedding: Flat,
-    repeated: Flat,
+pub(crate) struct GatedResidualCase {
+    pub(crate) norm_weight: Flat,
+    pub(crate) down: Flat,
+    pub(crate) up: Flat,
+    pub(crate) inject: Flat,
+    pub(crate) input: Flat,
+    pub(crate) mixed: Flat,
+    pub(crate) injection: Flat,
+    pub(crate) block_output: Flat,
+    pub(crate) after_block: Flat,
+    pub(crate) final_mixed: Flat,
+    pub(crate) embedding: Flat,
+    pub(crate) repeated: Flat,
 }
 
 #[derive(Deserialize)]
-struct QsaCase {
-    head_count: usize,
-    head_dim: usize,
-    budget: usize,
-    compress_ratio: usize,
-    rotary_dim: usize,
-    rope_base: f32,
-    key_norm_weight: Flat,
-    queries: Flat,
-    keys: Flat,
+pub(crate) struct QsaCase {
+    pub(crate) head_count: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) budget: usize,
+    pub(crate) compress_ratio: usize,
+    pub(crate) rotary_dim: usize,
+    pub(crate) rope_base: f32,
+    pub(crate) key_norm_weight: Flat,
+    pub(crate) queries: Flat,
+    pub(crate) keys: Flat,
     /// The `[T, K]` mask the module builds, one per query.
-    selected: Flat,
+    pub(crate) selected: Flat,
 }
 
 #[derive(Deserialize)]
-struct PleCase {
-    ngram_size: usize,
-    heads_per_ngram: usize,
-    vocab_size: u64,
-    vocab_base: u64,
-    layer_index: u64,
-    seed: u64,
-    eos_token_id: i64,
-    conv_kernel: usize,
-    conv_dilation: usize,
-    token_ids: Vec<f32>,
-    table: Flat,
-    head_vocab_sizes: Vec<u64>,
-    multipliers: Vec<i64>,
-    embeddings: Flat,
-    hidden: Flat,
-    key_proj: Flat,
-    value_proj: Flat,
-    norm_key: Flat,
-    norm_query: Flat,
-    norm_conv: Flat,
-    conv: Flat,
-    output: Flat,
-    chunked_output: Flat,
+pub(crate) struct PleCase {
+    pub(crate) ngram_size: usize,
+    pub(crate) heads_per_ngram: usize,
+    pub(crate) vocab_size: u64,
+    pub(crate) vocab_base: u64,
+    pub(crate) layer_index: u64,
+    pub(crate) seed: u64,
+    pub(crate) eos_token_id: i64,
+    pub(crate) conv_kernel: usize,
+    pub(crate) conv_dilation: usize,
+    pub(crate) token_ids: Vec<f32>,
+    pub(crate) table: Flat,
+    pub(crate) head_vocab_sizes: Vec<u64>,
+    pub(crate) multipliers: Vec<i64>,
+    pub(crate) embeddings: Flat,
+    pub(crate) hidden: Flat,
+    pub(crate) key_proj: Flat,
+    pub(crate) value_proj: Flat,
+    pub(crate) norm_key: Flat,
+    pub(crate) norm_query: Flat,
+    pub(crate) norm_conv: Flat,
+    pub(crate) conv: Flat,
+    pub(crate) output: Flat,
+    pub(crate) chunked_output: Flat,
 }
 
 #[derive(Deserialize)]
-struct MoeCase {
-    experts: u64,
-    top_k: u64,
-    norm_topk_prob: bool,
-    input: Flat,
-    router: Flat,
-    gate_up_proj: Flat,
-    down_proj: Flat,
-    shared_gate_proj: Flat,
-    shared_up_proj: Flat,
-    shared_down_proj: Flat,
-    shared_expert_gate: Flat,
-    output: Flat,
+pub(crate) struct MoeCase {
+    pub(crate) experts: u64,
+    pub(crate) top_k: u64,
+    pub(crate) norm_topk_prob: bool,
+    pub(crate) input: Flat,
+    pub(crate) router: Flat,
+    pub(crate) gate_up_proj: Flat,
+    pub(crate) down_proj: Flat,
+    pub(crate) shared_gate_proj: Flat,
+    pub(crate) shared_up_proj: Flat,
+    pub(crate) shared_down_proj: Flat,
+    pub(crate) shared_expert_gate: Flat,
+    pub(crate) output: Flat,
 }
 
 #[derive(Deserialize)]
-struct Fixture {
-    moe_block: MoeCase,
-    hc_count: usize,
-    epsilon: f32,
-    gated_residual: GatedResidualCase,
-    qsa_indexer: QsaCase,
-    ngram_ple: PleCase,
+pub(crate) struct Fixture {
+    pub(crate) moe_block: MoeCase,
+    pub(crate) hc_count: usize,
+    pub(crate) epsilon: f32,
+    pub(crate) gated_residual: GatedResidualCase,
+    pub(crate) qsa_indexer: QsaCase,
+    pub(crate) ngram_ple: PleCase,
 }
 
-fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     serde_json::from_str(include_str!("../fixtures/qwen4-exp-reference.json")).unwrap()
 }
 
-fn assert_matches(actual: &HostTensor, expected: &Flat, what: &str) {
+pub(crate) fn assert_matches(actual: &HostTensor, expected: &Flat, what: &str) {
     assert_eq!(actual.shape, expected.shape, "{what} shape");
     for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
         assert!(

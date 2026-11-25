@@ -580,6 +580,76 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        // Qwen4-Exp's blocks (`support-qwen38-flash-next` lot 3). Their output
+        // shapes follow from their inputs and attributes.
+        name @ ("gated-residual"
+        | "gated-residual-final"
+        | "gated-residual-inject"
+        | "repeat-features"
+        | "qsa-select"
+        | "ngram-embedding"
+        | "ngram-ple") => {
+            let input_shapes: Vec<Vec<u64>> =
+                inputs.iter().map(|value| value.shape().to_vec()).collect();
+            let shapes = crate::operator_semantics::qwen4_exp_output_shapes(
+                name,
+                &input_shapes,
+                &node.attributes,
+            )
+            .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                reason: format!("graph node '{node_id}' ({name}): {error}"),
+            })?;
+            if node.outputs.len() != shapes.len() {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' ({name}) declares {} output edge(s), not {}",
+                        node.outputs.len(),
+                        shapes.len()
+                    ),
+                });
+            }
+            if let Some(graph) = ctx.graph.as_ref() {
+                for (index, (edge_id, shape)) in node.outputs.iter().zip(&shapes).enumerate() {
+                    let edge = graph.graph().edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("graph node '{node_id}' has a missing output edge"),
+                        }
+                    })?;
+                    if &edge.descriptor.shape.dimensions != shape {
+                        return Err(InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph node '{node_id}' output {index} has the wrong shape"
+                            ),
+                        });
+                    }
+                }
+            }
+            let mut targets = vec![output_target];
+            for edge_id in &node.outputs[1..] {
+                targets.push((
+                    ctx.edge_resource(edge_id.as_str()),
+                    resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                    ctx.output_owner(kv_cache_id),
+                ));
+            }
+            let family = if matches!(
+                name,
+                "gated-residual" | "gated-residual-final" | "ngram-ple"
+            ) {
+                OperatorFamily::LinearAlgebra
+            } else {
+                OperatorFamily::Tensor
+            };
+            dispatch_pure_operator_outputs(
+                ctx,
+                node_id,
+                dispatch_operator_id(name, family),
+                inputs,
+                targets,
+                &shapes,
+                node.attributes.clone(),
+            )
+        }
         name @ ("mamba2-mixer" | "gated-delta-mixer") => {
             let valid_inputs = if name == "mamba2-mixer" {
                 (10..=13).contains(&inputs.len())
@@ -1852,6 +1922,13 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "moe-experts"
                 | "mamba2-mixer"
                 | "gated-delta-mixer"
+                | "gated-residual"
+                | "gated-residual-final"
+                | "gated-residual-inject"
+                | "repeat-features"
+                | "qsa-select"
+                | "ngram-embedding"
+                | "ngram-ple"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -1939,6 +2016,13 @@ pub(super) fn execute_first_native_graph_nodes(
             node.operator.name(),
             "mamba2-mixer"
                 | "gated-delta-mixer"
+                | "gated-residual"
+                | "gated-residual-final"
+                | "gated-residual-inject"
+                | "repeat-features"
+                | "qsa-select"
+                | "ngram-embedding"
+                | "ngram-ple"
                 | "mamba3-mimo"
                 | "mamba3-mixer"
                 | "token-shift"
@@ -2752,6 +2836,8 @@ mod mamba3_tests;
 mod modernbert_graph_tests;
 #[cfg(test)]
 mod projected_differential_attention_tests;
+#[cfg(test)]
+mod qwen4_exp_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

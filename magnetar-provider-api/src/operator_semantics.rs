@@ -23,6 +23,7 @@ mod mamba3_mixer;
 mod ngram_ple;
 mod projected_differential_attention;
 mod qsa_select;
+mod qwen4_exp_operators;
 mod sigmoid_routing;
 mod token_shift;
 pub use differential_attention::{
@@ -49,6 +50,11 @@ pub use projected_differential_attention::{
     projected_differential_attention_from_attributes,
 };
 pub use qsa_select::{QsaSelect, qsa_select};
+pub use qwen4_exp_operators::{
+    QWEN4_EXP_OPERATORS, gated_residual_from_attributes, ngram_embedding_from_attributes,
+    ngram_ple_from_attributes, qsa_select_from_attributes, qwen4_exp_operator,
+    qwen4_exp_output_shapes,
+};
 pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,
