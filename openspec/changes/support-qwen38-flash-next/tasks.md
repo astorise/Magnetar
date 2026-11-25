@@ -102,7 +102,7 @@
 - [ ] 3.4 N-gram PLE: hashed row lookup from a disk-resident table, added at layer 2; Reference semantics and fixtures.
   - [x] `ngram_embedding` (hash, EOS-delimited segments, next context) and `ngram_ple` (gate, dilated convolution, history) Reference semantics. The head primes and the hash multipliers equal Transformers' exactly; embeddings and output match on a second PLE layer, and two chunks carrying the context and history equal the whole sequence (`the_ngram_ple_matches_the_pinned_transformers_layer`).
   - [x] `ngram-embedding` (ids and context in, embeddings and next context out) and `ngram-ple` (with its convolution history as an explicit state) are in the catalog and run as first-native graph nodes, carrying both states between two runs (`the_ngram_ple_runs_as_graph_nodes_with_its_states`).
-  - [ ] The table is a weight read by row and never admitted whole (4.4). Today the operator takes it as a dense input.
+  - [ ] The table is a weight read by row and never admitted whole (4.4, design D8). Today the operator takes it as a dense input.
   - [ ] f32 tensors cannot hold the real table's row numbers (about 320M, past 2^24), so the lookup stays one operator from token ids to rows.
 - [x] 3.5 MoE 512 / top-10 with a gated shared expert on the existing MoE operator.
   - The routing needs no change: Qwen3-Next's router is softmax over every expert, top-k, renormalized, with a tie to the lower expert, which `moe_route` computes with `normalize_top_k`.
@@ -121,7 +121,11 @@
 - [ ] 4.1 Disk-mapped and RAM expert tiers under the residency budget (task #41, `operate-budgeted-weight-residency`).
 - [ ] 4.2 Adaptive GPU expert cache sized to free VRAM, with hit-rate observations.
 - [ ] 4.3 CPU computation of expert misses in place (`enforce-local-multigpu-and-expert-placement`).
-- [ ] 4.4 N-gram table rows read on demand, never admitted whole.
+- [ ] 4.4 N-gram table rows read on demand, never admitted whole (design D8).
+  - [ ] `ngram-embedding` takes `gathered_rows` (feature `ngram-embedding-gathered-rows`): Reference semantics, catalog, the two CPU Providers; a test that the dense and gathered forms give the same bytes and that the Runtime's row ids equal the operator's.
+  - [ ] `RowTable`: Model Loading registers the tensors of `layers.{L}.ple.table` instead of staging them, retains the payload source as an `Arc` and verifies the table's digest in bounded chunks.
+  - [ ] The first-native executor gathers the rows of an `ngram-embedding` node whose table is a row table and dispatches the gathered form.
+  - [ ] The `ple` bundle matches `transformers` with its table row-addressed; the instance holds no resource for it; reads per step are bounded by `T * heads`.
 
 ## 5. Loaders
 

@@ -27,3 +27,18 @@ The `gated-delta-mixer` Operator SHALL accept twelve inputs, without the trailin
 
 - **WHEN** the mixer runs on tokens whose mask is all ones, once with the mask and once without it
 - **THEN** its output and both states are identical
+
+### Requirement: N-gram embedding gathered rows
+
+The `ngram-embedding` operator SHALL accept an optional boolean attribute `gathered_rows`. When it is `true`, the third input SHALL be the table rows the step reads, `[T * heads, head_dim]` in (token, head) order, and the operator SHALL return them as `[T, heads * head_dim]` with the next context, without a lookup. A Kernel SHALL declare the feature `ngram-embedding-gathered-rows` to receive such a node, and the Runtime SHALL NOT send it to a Provider that does not. The rows named by the dense form and by the gathered form SHALL be the same, and the two forms SHALL return the same values.
+
+#### Scenario: Dense and gathered forms agree
+
+- **WHEN** the rows a step reads from a table are gathered in (token, head) order and given to a node with `gathered_rows` set
+- **THEN** its outputs equal those of the dense node over the whole table, bit for bit
+
+#### Scenario: A Provider without the feature
+
+- **WHEN** a Provider does not declare `ngram-embedding-gathered-rows`
+- **THEN** the Runtime does not dispatch a gathered node to it
+
