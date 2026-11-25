@@ -16,6 +16,7 @@ mod gated_delta_core;
 mod gated_delta_mixer;
 mod gated_delta_mixer_core;
 mod gated_residual;
+mod hyper_stream_operators;
 mod mamba2_mixer;
 mod mamba3_core;
 mod mamba3_mimo;
@@ -23,7 +24,6 @@ mod mamba3_mixer;
 mod ngram_ple;
 mod projected_differential_attention;
 mod qsa_select;
-mod qwen4_exp_operators;
 mod sigmoid_routing;
 mod token_shift;
 pub use differential_attention::{
@@ -40,6 +40,11 @@ pub use gated_delta_mixer::{
     gated_delta_mixer_from_projections,
 };
 pub use gated_residual::{GatedResidual, gated_residual, gated_residual_inject, repeat_features};
+pub use hyper_stream_operators::{
+    HYPER_STREAM_OPERATORS, gated_residual_from_attributes, hyper_stream_operator,
+    hyper_stream_output_shapes, ngram_embedding_from_attributes, ngram_ple_from_attributes,
+    qsa_select_from_attributes,
+};
 pub use mamba2_mixer::{Mamba2Mixer, mamba2_mixer, mamba2_mixer_from_attributes};
 pub use mamba3_core::Geometry as Mamba3Mimo;
 pub use mamba3_mimo::{mamba3_mimo, mamba3_mimo_from_attributes};
@@ -50,11 +55,6 @@ pub use projected_differential_attention::{
     projected_differential_attention_from_attributes,
 };
 pub use qsa_select::{QsaSelect, qsa_select};
-pub use qwen4_exp_operators::{
-    QWEN4_EXP_OPERATORS, gated_residual_from_attributes, ngram_embedding_from_attributes,
-    ngram_ple_from_attributes, qsa_select_from_attributes, qwen4_exp_operator,
-    qwen4_exp_output_shapes,
-};
 pub use sigmoid_routing::{
     ExpertGroupSelection, SigmoidNormalization, SigmoidRouting, sigmoid_moe_route,
     sigmoid_routing_from_attributes,

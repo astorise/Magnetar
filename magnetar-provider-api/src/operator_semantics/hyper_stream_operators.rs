@@ -1,6 +1,6 @@
 //! The Qwen4-Exp Operators' attribute parsing and shared entry point
 //! (`support-qwen38-flash-next`): every Provider runs these through
-//! [`qwen4_exp_operator`], so each reads its attributes the same way.
+//! [`hyper_stream_operator`], so each reads its attributes the same way.
 
 use std::collections::BTreeMap;
 
@@ -14,8 +14,8 @@ use super::{
     ngram_embedding, ngram_ple, qsa_select, repeat_features,
 };
 
-/// The Operators [`qwen4_exp_operator`] runs.
-pub const QWEN4_EXP_OPERATORS: [&str; 7] = [
+/// The Operators [`hyper_stream_operator`] runs.
+pub const HYPER_STREAM_OPERATORS: [&str; 7] = [
     "gated-residual",
     "gated-residual-final",
     "gated-residual-inject",
@@ -119,7 +119,7 @@ pub fn ngram_ple_from_attributes(attributes: &Attributes) -> Result<NgramPle, Re
 
 /// The shapes of `name`'s outputs, from its inputs' shapes and attributes,
 /// without computing them: what a graph executor needs to admit them.
-pub fn qwen4_exp_output_shapes(
+pub fn hyper_stream_output_shapes(
     name: &str,
     input_shapes: &[Vec<u64>],
     attributes: &Attributes,
@@ -177,7 +177,7 @@ pub fn qwen4_exp_output_shapes(
 
 /// Runs one Qwen4-Exp Operator on host tensors and returns its outputs in
 /// order.
-pub fn qwen4_exp_operator(
+pub fn hyper_stream_operator(
     name: &str,
     inputs: &[HostTensor],
     attributes: &Attributes,

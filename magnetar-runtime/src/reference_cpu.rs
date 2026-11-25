@@ -3022,7 +3022,7 @@ impl ReferenceCpuExecutor {
                 let inputs = (0..invocation.inputs.len())
                     .map(|index| self.input_tensor(invocation, index))
                     .collect::<Result<Vec<_>, _>>()?;
-                let computed = crate::operator_semantics::qwen4_exp_operator(
+                let computed = crate::operator_semantics::hyper_stream_operator(
                     name,
                     &inputs,
                     &invocation.attributes,

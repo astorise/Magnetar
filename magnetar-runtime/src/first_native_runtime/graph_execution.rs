@@ -591,7 +591,7 @@ pub(super) fn dispatch_first_native_graph_node(
         | "ngram-ple") => {
             let input_shapes: Vec<Vec<u64>> =
                 inputs.iter().map(|value| value.shape().to_vec()).collect();
-            let shapes = crate::operator_semantics::qwen4_exp_output_shapes(
+            let shapes = crate::operator_semantics::hyper_stream_output_shapes(
                 name,
                 &input_shapes,
                 &node.attributes,
