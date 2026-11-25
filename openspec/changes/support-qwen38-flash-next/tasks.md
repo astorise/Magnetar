@@ -54,7 +54,7 @@
     - `gated_delta_mixer_reads_compact_weights` checks the outputs and both states against the Reference over a masked prefill and a decode step, with nothing expanded to f32.
     - Real 0.8B-Base: 16 tokens in 2.2 s instead of 22.6 s, still 16/16 equal to `transformers` (max |logit diff| 3.1e-5).
   - [ ] Parallel recurrence (heads across the pool) and a chunked prefill form, once long prompts are measured.
-- [ ] 2.6 CUDA: the same forms (norm offset, per-head split, both mixer forms), qualified on the GPU runner.
+- [x] 2.6 CUDA: the same forms (norm offset, per-head split, both mixer forms), qualified on the GPU runner.
   - [x] Kernels:
     - the `rmsnorm` weight offset;
     - `split` per head, through a multi-output dispatch path;
@@ -62,9 +62,11 @@
 
     All three are advertised.
   - [x] A CPU emulation of the `.cu` Kernels matches `gated_delta_mixer` exactly, all three outputs, at the test geometry and at 0.8B's (16/16 heads of 128). The case is a masked five-token prefill, then a decode step from the returned states.
-  - [ ] On the GPU runner: the conformance tests (`qwen3_5_norm_offset_and_per_head_split_match_reference_cpu`, `gated_delta_mixer_matches_reference_cpu_across_steps`) and the real-checkpoint qualification (2.7). The workflow `gpu-runner-smoke.yml` has a `hybrid` group for this.
-  - [ ] Decode speed: `[out, in]` projections go through the generic matmul. A row-per-warp GEMV (or transposing them at upload) comes after qualification.
-- [ ] 2.7 Qualify Qwen3.5-0.8B-Base (revision dc7cdfe…, digest pinned) on Reference CPU, cpu-native and CUDA:
+  - [x] GPU runner, run 45535601445 (RTX 3060, `gpu-runner-smoke.yml`'s `hybrid` group):
+    - `qwen3_5_norm_offset_and_per_head_split_match_reference_cpu` and `gated_delta_mixer_matches_reference_cpu_across_steps` pass. The latter covers f32 weights and a 512-wide geometry read compact (bf16).
+    - The first run (45534147734) caught `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`: the delta rule's register-held state column does not fit 1024-thread blocks. It now runs in 64-thread blocks with `__launch_bounds__`.
+  - [x] The mixer's `[out, in]` projections use `gdn_project_kernel`: one warp per output column reads its contiguous weight row, f32 or bf16. The generic matmul read it with a stride of `k`. Packed weights keep the matmul path.
+- [x] 2.7 Qualify Qwen3.5-0.8B-Base (revision dc7cdfe…, digest pinned) on Reference CPU, cpu-native and CUDA:
   - last-position logits against Transformers;
   - 16 greedy tokens equal;
   - evidence recorded here.
@@ -77,9 +79,10 @@
     | Reference CPU | 3.2e-5 | 16/16 equal | 74.6 s |
     | cpu-native (4 threads) | 2.8e-5 | 16/16 equal | 22.6 s |
     | cpu-native, native mixer (2.5) | 3.1e-5 | 16/16 equal | 2.2 s |
+    | CUDA, RTX 3060 (run 45535601445) | 1.5e-5 | 16/16 equal | 484 ms |
 
     Output: `[11751, 13, 561, 6511, 314, 31868, 369, 35938, 13, 561, 6511, 314, 279, 24844, 369, 36492]` (2026-11-25, x86-64 container).
-  - [ ] CUDA, on the GPU runner (after 2.6).
+  - [x] CUDA, on the GPU runner: in the table above. The same run gave cpu-native 2.9e-5, 16/16 tokens, 2.1 s on the runner's CPU.
 
 ## 3. Qwen3.8-Flash-Next blocks
 
