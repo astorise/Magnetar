@@ -134,6 +134,14 @@
 ## 5. Loaders
 
 - [ ] 5.1 GGUF: the ISTA-DASLab Qwen3.8-Flash-Next export (architecture keys, tensor types, n-gram file).
+  - [x] The export's headers read and recorded (design D9): metadata keys, the 1,224 tensors and their types, the two files, and what the F32 data shows (`ssm_a` is `-exp(A_log)`; norm weights are effective multipliers). `tools/gguf_inventory.py` reproduces it from the first 48 MiB of a file or URL.
+  - [x] The n-gram hash and row layout equal the operator's derivation (primes, offsets, multipliers for seed 1234, vocabulary 248,320).
+  - [ ] `loaders/gguf` reads a split file set (`split.no`, `split.count`): the n-gram table lives in the second file.
+  - [ ] `loaders/gguf` reads the `qwen4exp` keys into the architecture configuration (`hyper-connections`, `ngram-embeddings`, `token-selection`, `linear-attention-gate`, experts with a shared expert, the layer pattern from `full_attention_interval`) and checks the three hash arrays against the derivation.
+  - [ ] Its tensors take the names `loaders/huggingface` gives the same weights (`linear_attn.in_qkv`, `attn_hyper.down`, `ple.key`...), with the conversions: `a_log = ln(-ssm_a)`, the norm offset subtracted where the Component adds it, the fused `attn_q` split as the Component reads it, the stacked experts restacked as the Hugging Face path does.
+  - [ ] A tiny `qwen4_exp` GGUF written from the Hugging Face fixtures (`fixtures/qwen4_exp/`, same weights, the export's conventions) generates the same tokens as the Hugging Face bundle and matches Transformers' logits (`tests_qwen4_exp_logits`).
+  - [ ] Packed formats the export needs and Magnetar lacks: Strata's `Q2_0` (type 42, 64 values in 18 bytes) and `IQ1_M`: format, dequantization, loader, CPU kernels (CUDA with 3.2's kernels).
+  - [ ] The n-gram table read by row from a packed `IQ4_NL` tensor (`RowTable` today converts `f32`, `f16` and `bf16` rows).
 - [ ] 5.2 Hugging Face: `qwen4_exp` configuration and tensor names.
   - [x] Configuration (residual streams, n-gram embeddings, indexer, gate, experts in every layer with the default routing; no dense MLP width) and the names of the stream mixers, indexer, shared expert and its gate (which is read as `[in, out]`), checked on a Transformers `save_pretrained` bundle with per-expert tensors.
   - [x] The n-gram embedding's table shards stacked in order into one table, its projections, norms and depthwise convolution named and shaped, and its integer hash buffers (`layer_multipliers`, `ngram_heads_offsets`, `ngram_heads_vocab_sizes`) left out: the operator derives them from the configuration, and its primes and multipliers equal Transformers' (3.4).
