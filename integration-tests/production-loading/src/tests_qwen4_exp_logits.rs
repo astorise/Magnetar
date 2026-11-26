@@ -11,7 +11,8 @@
 //! decode step, and KV history for the attention layers only.
 
 use crate::logit_comparison::{
-    Format, compare_on, compare_with_mapped_tables, compare_with_reference, cpu_providers,
+    Format, TableAccess, Timings, compare_on, compare_with_reference, compare_with_tables,
+    cpu_providers,
 };
 
 #[test]
@@ -62,14 +63,16 @@ fn a_qwen4_exp_ngram_embedding_bundle_matches_transformers() {
 fn a_qwen4_exp_ngram_table_read_by_row_matches_transformers() {
     use std::sync::atomic::Ordering;
     for (provider, label) in cpu_providers() {
-        let (difference, usage) = compare_with_mapped_tables(
+        let (difference, usage, _) = compare_with_tables(
             provider,
             label,
             "qwen4_exp",
             "ple",
             "qwen4_exp_text",
-            ".ple.table",
+            TableAccess::Mapped(".ple.table"),
+            false,
         );
+        let usage = usage.expect("the tables were counted");
         let mapped = usage.mapped.lock().unwrap().clone();
         assert_eq!(
             mapped.len(),
@@ -109,6 +112,124 @@ fn a_qwen4_exp_ngram_table_read_by_row_matches_transformers() {
              {reads} row reads ({} bytes), {prefetches} prefetches",
             usage.bytes_read.load(Ordering::Relaxed)
         );
+    }
+}
+
+/// The same checkpoint through the loader's real mapping, with nothing
+/// standing between the Runtime and the loader (`support-qwen38-flash-next`
+/// task 4.4): the loader maps the n-gram table from the bundle's weight
+/// files, stacked from its shards, the Runtime never reads it whole, and the
+/// logits are `transformers`'.
+#[test]
+fn a_qwen4_exp_ngram_table_is_mapped_from_the_bundle_files() {
+    for (provider, label) in cpu_providers() {
+        let (difference, usage, _) = compare_with_tables(
+            provider,
+            label,
+            "qwen4_exp",
+            "ple",
+            "qwen4_exp_text",
+            TableAccess::Observed(".ple.table"),
+            false,
+        );
+        let usage = usage.expect("the tables were observed");
+        let mapped = usage.mapped.lock().unwrap().clone();
+        assert_eq!(
+            mapped.len(),
+            1,
+            "{label}: the loader maps the one n-gram table: {mapped:?}"
+        );
+        assert!(
+            usage.read_whole.lock().unwrap().is_empty(),
+            "{label}: no table is read whole: {:?}",
+            usage.read_whole.lock().unwrap()
+        );
+        eprintln!(
+            "n-gram table mapped by the loader, {label}: max |logit difference| {difference:.3e}"
+        );
+    }
+}
+
+fn milliseconds(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
+fn report(label: &str, what: &str, timings: &Timings) {
+    let decode = &timings.steps[1..];
+    let mean = decode.iter().map(|step| milliseconds(*step)).sum::<f64>() / decode.len() as f64;
+    let worst = decode
+        .iter()
+        .map(|step| milliseconds(*step))
+        .fold(0.0, f64::max);
+    eprintln!(
+        "{label:32} {what:20} ingest {:7.0} ms  load {:7.1} ms  prefill {:6.1} ms  decode mean {mean:6.2} ms  worst {worst:6.2} ms",
+        milliseconds(timings.ingest),
+        milliseconds(timings.load),
+        milliseconds(timings.steps[0]),
+    );
+}
+
+/// What reading an n-gram table by row costs, against the same table staged
+/// whole (`support-qwen38-flash-next` task 4.4, design D8). Needs bundles of
+/// tables of millions of rows, made where they are measured:
+///
+/// ```text
+/// make_tiny_qwen4_exp.py <dir> big 120000   # 245 MB: under the operator's element cap
+/// make_tiny_qwen4_exp.py <dir> big          # 820 MB: past it
+/// qwen4_exp_reference_logits.py <dir> 12 <dir>/reference.json <prompt ids>
+/// ```
+///
+/// `MAGNETAR_QWEN4_EXP_MID_PLE` names the first (read by row, cold and warm,
+/// and staged whole) and `MAGNETAR_QWEN4_EXP_BIG_PLE` the second (only a
+/// table read by row can run it: the Reference semantics refuse a tensor of
+/// more than 67 million elements). Every run matches `transformers`; the
+/// numbers go to the output.
+#[test]
+#[ignore = "needs MAGNETAR_QWEN4_EXP_MID_PLE and/or MAGNETAR_QWEN4_EXP_BIG_PLE: bundles of tables of millions of rows"]
+fn an_ngram_table_read_by_row_is_measured_against_one_staged_whole() {
+    let mid = std::env::var("MAGNETAR_QWEN4_EXP_MID_PLE").ok();
+    let big = std::env::var("MAGNETAR_QWEN4_EXP_BIG_PLE").ok();
+    assert!(
+        mid.is_some() || big.is_some(),
+        "name a bundle with MAGNETAR_QWEN4_EXP_MID_PLE or MAGNETAR_QWEN4_EXP_BIG_PLE"
+    );
+    for (provider, label) in cpu_providers() {
+        for (directory, staged_too) in [(mid.as_deref(), true), (big.as_deref(), false)] {
+            let Some(directory) = directory else { continue };
+            let run = |access: TableAccess, cold: bool| {
+                compare_with_tables(
+                    provider.clone(),
+                    label,
+                    "qwen4_exp",
+                    directory,
+                    "qwen4_exp_text",
+                    access,
+                    cold,
+                )
+            };
+            let size = if staged_too { "245 MB" } else { "820 MB" };
+
+            let (_, usage, timings) = run(TableAccess::Observed(".ple.table"), true);
+            let usage = usage.unwrap();
+            assert_eq!(usage.mapped.lock().unwrap().len(), 1, "the table is mapped");
+            assert!(usage.read_whole.lock().unwrap().is_empty());
+            report(label, &format!("{size} by row, cold"), &timings);
+
+            let (_, _, warm) = run(TableAccess::Observed(".ple.table"), false);
+            report(label, &format!("{size} by row, warm"), &warm);
+
+            if staged_too {
+                let (_, usage, staged) = run(TableAccess::Dense(".ple.table"), false);
+                let usage = usage.unwrap();
+                assert!(usage.mapped.lock().unwrap().is_empty());
+                assert_eq!(
+                    usage.read_whole.lock().unwrap().len(),
+                    1,
+                    "the baseline reads the table whole"
+                );
+                report(label, &format!("{size} staged whole"), &staged);
+            }
+        }
     }
 }
 
