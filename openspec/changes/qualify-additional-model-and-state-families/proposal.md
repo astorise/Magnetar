@@ -26,8 +26,8 @@ None by default; profile-specific replacements, where required, are enumerated i
 Owning layer: Model Components and loaders; generic Runtime validation; Provider operators. Implementation may span Magnetar and the appropriate pinned Component, Provider, Format or Loader repositories; submodule revisions are updated only after their own validation. No runtime code, dependencies, WIT or canonical specifications are changed by this proposal.
 
 Existing contracts to reuse:
-- [`llama-model-component`](../../specs/llama-model-component/spec.md)
-- [`qwen-model-component`](../../specs/qwen-model-component/spec.md)
+- [`llama-model-component`](https://github.com/astorise/Magnetar-component-Llama/blob/HEAD/openspec/specs/llama-model-component/spec.md)
+- [`qwen-model-component`](https://github.com/astorise/Magnetar-component-Qwen/blob/HEAD/openspec/specs/qwen-model-component/spec.md)
 - [`model-component-graph-contract`](../../specs/model-component-graph-contract/spec.md)
 - [`production-model-ingestion`](../../specs/production-model-ingestion/spec.md)
 - [`kv-cache`](../../specs/kv-cache/spec.md)

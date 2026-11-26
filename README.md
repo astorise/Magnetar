@@ -77,6 +77,43 @@ Detailed architecture notes:
 - [Scheduler](docs/architecture/scheduler.md)
 - [Runtime observability](docs/architecture/runtime-observability.md)
 
+## Repositories
+
+Magnetar is the Runtime: the core crates, their tests, the tooling and the release pipeline. Model families, hardware, checkpoint loading and formats live in repositories of their own, pinned here as submodules (the two shared crates are git dependencies of the Components, pinned by commit).
+
+| Path | Repository | Role |
+| --- | --- | --- |
+| `components/deepseek` | [Magnetar-component-DeepSeek](https://github.com/astorise/Magnetar-component-DeepSeek) | Model Component: DeepSeek (MLA, mixture of experts) |
+| `components/gemma` | [Magnetar-component-Gemma](https://github.com/astorise/Magnetar-component-Gemma) | Model Component: Gemma 4 |
+| `components/glm` | [Magnetar-component-GLM](https://github.com/astorise/Magnetar-component-GLM) | Model Component: GLM |
+| `components/kev` | [Magnetar-component-Kev](https://github.com/astorise/Magnetar-component-Kev) | Model Component: Kev |
+| `components/kimi` | [Magnetar-component-Kimi](https://github.com/astorise/Magnetar-component-Kimi) | Model Component: Kimi |
+| `components/laya` | [Magnetar-component-Laya](https://github.com/astorise/Magnetar-component-Laya) | Model Component: Laya |
+| `components/llama` | [Magnetar-component-Llama](https://github.com/astorise/Magnetar-component-Llama) | Model Component: Llama |
+| `components/mistral` | [Magnetar-component-Mistral](https://github.com/astorise/Magnetar-component-Mistral) | Model Component: Mistral |
+| `components/modernbert` | [Magnetar-component-ModernBERT](https://github.com/astorise/Magnetar-component-ModernBERT) | Model Component: ModernBERT (encoder) |
+| `components/nemotron` | [Magnetar-component-Nemotron](https://github.com/astorise/Magnetar-component-Nemotron) | Model Component: Nemotron |
+| `components/olala` | [Magnetar-component-Olala](https://github.com/astorise/Magnetar-component-Olala) | Model Component: Olala |
+| `components/olmo` | [Magnetar-component-OLMo](https://github.com/astorise/Magnetar-component-OLMo) | Model Component: OLMo 3 |
+| `components/qwen` | [Magnetar-component-Qwen](https://github.com/astorise/Magnetar-component-Qwen) | Model Component: Qwen |
+| `components/smollm` | [Magnetar-component-SmolLM](https://github.com/astorise/Magnetar-component-SmolLM) | Model Component: SmolLM |
+| `providers/cpu` | [Magnetar-provider-CPU](https://github.com/astorise/Magnetar-provider-CPU) | Provider: CPU (optimized native kernels, packed weights) |
+| `providers/cuda` | [Magnetar-provider-CUDA](https://github.com/astorise/Magnetar-provider-CUDA) | Provider: NVIDIA CUDA |
+| `providers/metal` | [Magnetar-provider-Metal](https://github.com/astorise/Magnetar-provider-Metal) | Provider: Apple Metal |
+| `providers/openvino` | [Magnetar-provider-OpenVINO](https://github.com/astorise/Magnetar-provider-OpenVINO) | Provider: OpenVINO and NPU (formerly Magnetar-provider-NPU) |
+| `providers/qnn` | [Magnetar-provider-qnn](https://github.com/astorise/Magnetar-provider-qnn) | Provider: Qualcomm QNN |
+| `providers/rocm` | [Magnetar-provider-ROCm](https://github.com/astorise/Magnetar-provider-ROCm) | Provider: AMD ROCm |
+| `providers/tpu` | [Magnetar-provider-TPU](https://github.com/astorise/Magnetar-provider-TPU) | Provider: TPU |
+| `providers/wgpu` | [Magnetar-provider-WGPU](https://github.com/astorise/Magnetar-provider-WGPU) | Provider: WGPU (Vulkan, Metal, DX12) |
+| `loaders/gguf` | [Magnetar-loader-GGUF](https://github.com/astorise/Magnetar-loader-GGUF) | Loader: GGUF checkpoints |
+| `loaders/huggingface` | [Magnetar-loader-HuggingFace](https://github.com/astorise/Magnetar-loader-HuggingFace) | Loader: Hugging Face checkpoints |
+| `formats/gguf` | [Magnetar-format-GGUF](https://github.com/astorise/Magnetar-format-GGUF) | Format: GGUF |
+| `formats/safetensors` | [Magnetar-format-safetensors](https://github.com/astorise/Magnetar-format-safetensors) | Format: safetensors |
+| - | [magnetar-component-sdk](https://github.com/astorise/magnetar-component-sdk) | Shared crate for Model Components: the graph description, the sink and its adapter (git dependency pinned by commit, not a submodule) |
+| - | [magnetar-component-api](https://github.com/astorise/magnetar-component-api) | The Model Component contract: every released version of `magnetar:model-component-graph` and its guest bindings (git dependency pinned by commit, not a submodule) |
+
+Each repository has its own `openspec/` directory with the specifications and changes that belong to it, and the agent folders (`.agent`, `.claude`, `.codex/skills`, `.gemini`, `.opencode`) that drive them. A change that also reaches the core is coordinated by a change of the same name in `openspec/changes/` here, which links to its companion in the other repository.
+
 ## Current Status
 
 Implemented today:

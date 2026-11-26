@@ -29,3 +29,9 @@ The change delivers in lots, each with its own exit gate:
 - Magnetar: magnetar-graph planner, first-native Runtime (graph execution, prepared plans, KV transaction), benchmarks.
 - Qwen Component, CPU and CUDA Providers, and the GGUF and Hugging Face loaders, in their own repositories, pinned after validation.
 - No WIT change for lots 1–2. The WIT 1.11.0 recurrent functions are used as declared. Later lots add operators additively.
+
+## Companion changes
+
+The delta to a capability that now lives in its own repository moved there, with a companion change of the same name; this change keeps the rest.
+
+- `qwen-model-component`: the delta is in https://github.com/astorise/Magnetar-component-Qwen/tree/HEAD/openspec/changes/support-qwen38-flash-next/ (companion change of the same name)
