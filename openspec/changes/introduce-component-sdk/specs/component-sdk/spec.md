@@ -46,11 +46,16 @@ A Component that moves from its own copies to the crate SHALL emit, for every co
 - **WHEN** a Component's types, trait and adapter are replaced by the crate's
 - **THEN** its golden graphs, recorded before the change, are equal to the graphs it builds after it
 
-### Requirement: The crate is mounted beside the Components that use it
+### Requirement: Components depend on the crate by a pinned revision
 
-Magnetar SHALL pin the crate as a submodule at `components/sdk`. Components SHALL depend on it by the relative path `../sdk`, and the Magnetar integration jobs SHALL build every Component against the pinned revision.
+While the crate is in development, a Component SHALL depend on it as a git dependency pinned by commit (`rev`), and its committed `Cargo.lock` SHALL record that commit. A Component SHALL NOT depend on a branch or a tag, which move. Once the crate is published, a Component SHALL depend on it by version.
 
-#### Scenario: A Component in its own repository
+#### Scenario: A Component builds on its own
 
-- **WHEN** a Component's repository runs its checks inside a Magnetar checkout
-- **THEN** `../sdk` resolves to the crate at the revision Magnetar pins
+- **WHEN** a Component's repository runs its checks without a Magnetar checkout
+- **THEN** the dependency resolves to the pinned commit and the checks run
+
+#### Scenario: A floating reference
+
+- **WHEN** a Component's manifest names a branch or a tag of the crate instead of a commit
+- **THEN** the change is refused in review, since the Component's build would change when the branch moves

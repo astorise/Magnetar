@@ -38,7 +38,7 @@ The Component's own code lives in its repository and is not in this table. A new
 **Non-Goals**
 - Removing the family knowledge from the core: it is the follow-up list below, each its own change, since each changes a contract.
 - Choosing a contract version for every Component: the contract is additive, and each Component keeps targeting the version it needs.
-- Publishing the crate to crates.io before the API has been through the Components.
+- Publishing the crate to crates.io before the API has been through the Components (it is published once stable).
 
 ## Decisions
 
@@ -56,9 +56,11 @@ The generated bindings are types of the Component's own crate: the same interfac
 
 Checked against the real bindings: Mistral's types and adapter replaced by the crate's, on a scratch copy, pass its five tests with the `bindings` feature.
 
-### D4. Mounted at `components/sdk`
+### D4. A git dependency pinned by commit, then crates.io
 
-No script enumerates `components/*` as model Components, and the Components depend on the crate by `../sdk` the way the loaders depend on the Runtime by `../../magnetar-runtime`. A Component's own CI builds inside a Magnetar checkout with `siblings: components/sdk`, at the revision Magnetar pins.
+A Component's repository runs its own checks without a Magnetar checkout (its graph and Component Model build, validated with `wasm-tools`), so a relative path to a sibling crate would not resolve there. While the API settles, a Component names the crate as `magnetar-component-sdk = { git = "https://github.com/astorise/magnetar-component-sdk", rev = "<commit>" }`, its `Cargo.lock` records the commit, and moving to a newer one is a pull request of the Component's own. A branch or a tag is refused: they move. Once the crate has been through the Components and is stable, it is published to crates.io and Components depend on it by version.
+
+Not a submodule: nothing builds the crate beside a Component, so Magnetar has nothing to pin. `cargo-deny` runs on the root workspace and three Providers, none of which depends on a Component, so `deny.toml` needs no `allow-git` today; a graph it covers that came to include the crate would need one for that repository alone.
 
 ### D5. A migration is proved by a golden graph
 
@@ -77,6 +79,6 @@ Normalization, rotary embedding, attention, gated MLP, mixture of experts and th
 
 ## Risks / Trade-offs
 
-- **A change to the crate touches every Component.** Mitigated by additive changes (defaults on new methods), a version Magnetar pins, and the golden graphs, which fail where a change alters a graph.
-- **Components drifting to different crate versions.** They cannot: Magnetar pins one revision, and a Component's CI builds against it.
+- **A change to the crate touches every Component.** Mitigated by additive changes (defaults on new methods), the pinned revision (a Component takes a change when it chooses to), and the golden graphs, which fail where a change alters a graph.
+- **Components on different crate revisions.** They can be, since each pins its own. The crate keeps its changes additive (defaults on new methods) so an older revision keeps working, and a Component moves to a newer one in a pull request of its own.
 - **The macro hides the adapter.** It is the point, and its tests (against a stand-in of the bindings) and the real-bindings check above show what it expands to.

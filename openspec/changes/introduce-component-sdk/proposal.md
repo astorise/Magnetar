@@ -9,7 +9,7 @@ Without a shared crate, a core that lacks what a Component needs absorbs it inst
 ## What Changes
 
 1. **`magnetar-component-sdk`**, a new repository and crate with no dependency, holding what Components share: the graph description (`Phase`, `KvRole`, `Value`, `Attr`, `Kv`, `Node`), the `GraphSink` trait a Component's host-independent graph code is written against, the `wit_graph_sink!` macro that implements it on the generated WIT bindings, and `RecordingSink`, the test double.
-2. **Mounted as a submodule at `components/sdk`**, beside the Components that depend on it by relative path.
+2. **Used as a git dependency pinned by commit** while the API settles, and published to crates.io once it is stable: `magnetar-component-sdk = { git = "https://github.com/astorise/magnetar-component-sdk", rev = "…" }`. Each Component's own `Cargo.lock` records it, so a Component's standalone CI needs nothing beside its own repository.
 3. **Components move to it one at a time**, each emitting the same graph as before, proved by a golden graph recorded from its current code before it changes. Mistral, OLMo and Gemma first (their adapters are the same code), then SmolLM and Llama, then Qwen and DeepSeek, which call the bindings directly and need the sink to carry nodes with several outputs and recurrent state.
 4. **The decoder blocks they share** (normalization, rotary embedding, attention, gated MLP, mixture of experts, LM head) and the configuration helpers move into the crate after the types, under the same golden-graph discipline.
 
@@ -27,6 +27,6 @@ None. `project-architecture`'s requirement that Components live in their own rep
 
 ## Impact
 
-- New repository `magnetar-component-sdk`; new submodule `components/sdk`; `SUBMODULES.md`.
+- New repository `magnetar-component-sdk` (not a submodule: Components depend on it by pinned revision, then by version).
 - Component repositories, one pull request each: their `plan.rs` and `component.rs` lose their copies of the types, the trait and the adapter.
 - No change to the Runtime, the contract or any Provider.

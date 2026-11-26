@@ -6,10 +6,11 @@
 - [x] 1.4 Standalone CI: format, Clippy, tests, documentation with warnings denied, build for `wasm32-wasip2`.
 - [x] 1.5 Checked against the real bindings: Mistral's types and adapter replaced by the crate's on a scratch copy, its tests pass with the `bindings` feature.
 
-## 2. Mounting
+## 2. Dependency form
 
-- [ ] 2.1 A default branch for the crate's repository, and a first pull request merged.
-- [ ] 2.2 `components/sdk` pinned in `.gitmodules`, listed in `SUBMODULES.md`, built by the component integration job.
+- [x] 2.1 A `main` branch for the crate's repository (its default branch is still the session's; the owner switches it in the repository's settings).
+- [ ] 2.2 Each migrated Component names the crate as a git dependency pinned by commit, and its `Cargo.lock` records it.
+- [ ] 2.3 Publish `magnetar-component-sdk` to crates.io once its API has been through the Components, and move the Components to a version.
 
 ## 3. Components move to it, each with its golden graphs
 
