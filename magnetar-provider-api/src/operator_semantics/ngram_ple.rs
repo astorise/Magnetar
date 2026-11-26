@@ -4,6 +4,9 @@
 //! of Transformers' `Qwen4ExpTextNGramEmbedding` and `Qwen4ExpTextPLELayer`,
 //! pinned in design D7.
 
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 use crate::tensor::{HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
 
 const MAX_ELEMENTS: u64 = 67_108_864;
@@ -86,16 +89,29 @@ fn is_prime(value: u64) -> bool {
     true
 }
 
-/// The `count`-th prime above `start`.
-fn nth_prime_after(start: u64, count: u64) -> u64 {
-    let mut prime = start;
-    for _ in 0..count {
-        prime += 1;
-        while !is_prime(prime) {
-            prime += 1;
+/// The first `count` primes above `start`, in order.
+///
+/// A layer's heads take consecutive primes of one sequence that every layer
+/// shares, so the sequence is kept as far as any caller has asked for it
+/// (one entry per distinct `start`): finding a head's prime is a lookup,
+/// not a trial-division search from `start` again. A search is the cost of
+/// a layer's whole step otherwise, and it grows with the layer's index.
+fn primes_after(start: u64, count: usize) -> Vec<u64> {
+    static SEQUENCES: OnceLock<Mutex<BTreeMap<u64, Vec<u64>>>> = OnceLock::new();
+    let mut sequences = SEQUENCES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let primes = sequences.entry(start).or_default();
+    let mut candidate = primes.last().copied().unwrap_or(start);
+    while primes.len() < count {
+        candidate += 1;
+        while !is_prime(candidate) {
+            candidate += 1;
         }
+        primes.push(candidate);
     }
-    prime
+    primes[..count].to_vec()
 }
 
 impl NgramEmbedding {
@@ -128,10 +144,9 @@ impl NgramEmbedding {
     /// Each head's row count, a distinct prime above `vocab_base`; the
     /// heads' rows follow one another in the table.
     pub fn head_vocab_sizes(&self) -> Vec<u64> {
-        let heads = self.heads() as u64;
-        (0..heads)
-            .map(|head| nth_prime_after(self.vocab_base - 1, self.layer_index * heads + head + 1))
-            .collect()
+        let heads = self.heads();
+        let before = self.layer_index as usize * heads;
+        primes_after(self.vocab_base - 1, before + heads).split_off(before)
     }
 
     /// The table row each head reads for every token of `tokens`, given the

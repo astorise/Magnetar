@@ -89,6 +89,7 @@ mod prefill_chunks;
 mod prepared_plans;
 mod production;
 mod recurrent_state;
+mod row_gather;
 mod segments;
 mod weights;
 

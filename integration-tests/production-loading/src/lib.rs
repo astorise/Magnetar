@@ -23,6 +23,8 @@
 #[cfg(test)]
 mod logit_comparison;
 #[cfg(test)]
+mod mapped_tables;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests_chunked_prefill;

@@ -16,7 +16,7 @@ use magnetar_loader_gguf::{GgufIngestor, GgufTokenizer};
 use magnetar_loader_huggingface::{HuggingFaceIngestor, HuggingFaceTokenizer};
 use magnetar_runtime::model::ModelTrustStore;
 use magnetar_runtime::production_model_ingestion::{
-    ProductionModelArtifactIngestor, ProductionModelSource,
+    ProductionArtifactPayloadSource, ProductionModelArtifactIngestor, ProductionModelSource,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
@@ -132,14 +132,71 @@ fn compare_configured(
         Option<magnetar_runtime::ComponentDigest>,
     ),
 ) -> (f32, ProductionLoadedModel) {
+    let (difference, model, _) = compare_mapping(
+        provider,
+        provider_label,
+        family_directory,
+        variant,
+        format,
+        family,
+        options,
+        None,
+    );
+    (difference, model)
+}
+
+/// [`compare_on`] with the tables whose names end in `suffix` mapped by the
+/// payload source instead of read and staged by the Runtime
+/// (`support-qwen38-flash-next` task 4.4): the largest logit difference, and
+/// what the Runtime asked of the tables.
+pub(crate) fn compare_with_mapped_tables(
+    provider: Arc<dyn Provider>,
+    provider_label: &str,
+    family_directory: &str,
+    variant: &str,
+    family: &str,
+    suffix: &'static str,
+) -> (f32, Arc<crate::mapped_tables::TableUse>) {
+    let (difference, _, usage) = compare_mapping(
+        provider,
+        provider_label,
+        family_directory,
+        variant,
+        Format::HuggingFace,
+        family,
+        (|_| {}, None),
+        Some(suffix),
+    );
+    (difference, usage.expect("tables were mapped"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_mapping(
+    provider: Arc<dyn Provider>,
+    provider_label: &str,
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+    options: (
+        impl FnOnce(&mut ProductionLoadedModel),
+        Option<magnetar_runtime::ComponentDigest>,
+    ),
+    mapped_suffix: Option<&'static str>,
+) -> (
+    f32,
+    ProductionLoadedModel,
+    Option<Arc<crate::mapped_tables::TableUse>>,
+) {
     let (configure, component) = options;
-    let (mut model, reference) = load_checkpoint(
+    let (mut model, reference, usage) = load_checkpoint_mapping(
         provider,
         family_directory,
         variant,
         format,
         family,
         component,
+        mapped_suffix,
     );
     configure(&mut model);
     let mut recorder = LogitRecorder::default();
@@ -176,7 +233,7 @@ fn compare_configured(
         reference.generated_token_ids,
         comparison.failures
     );
-    (comparison.max_abs_difference, model)
+    (comparison.max_abs_difference, model, usage)
 }
 
 /// Compare on the Reference CPU using an explicitly registered Component.
@@ -308,6 +365,34 @@ fn load_checkpoint(
     family: &str,
     component: Option<magnetar_runtime::ComponentDigest>,
 ) -> (ProductionLoadedModel, LogitReference) {
+    let (model, reference, _) = load_checkpoint_mapping(
+        provider,
+        family_directory,
+        variant,
+        format,
+        family,
+        component,
+        None,
+    );
+    (model, reference)
+}
+
+/// [`load_checkpoint`] with the tensors whose names end in `mapped_suffix`
+/// mappable by the payload source (`mapped_tables`), and what the Runtime
+/// asked of them.
+fn load_checkpoint_mapping(
+    provider: Arc<dyn Provider>,
+    family_directory: &str,
+    variant: &str,
+    format: Format,
+    family: &str,
+    component: Option<magnetar_runtime::ComponentDigest>,
+    mapped_suffix: Option<&'static str>,
+) -> (
+    ProductionLoadedModel,
+    LogitReference,
+    Option<Arc<crate::mapped_tables::TableUse>>,
+) {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join(family_directory)
@@ -360,13 +445,21 @@ fn load_checkpoint(
         tokenizer,
     )
     .expect("the production fixture builds");
+    let (source, usage): (Arc<dyn ProductionArtifactPayloadSource>, _) = match mapped_suffix {
+        Some(suffix) => {
+            let (source, usage) =
+                crate::mapped_tables::MappedTables::new(ingested.payload_source.clone(), suffix);
+            (Arc::new(source), Some(usage))
+        }
+        None => (ingested.payload_source.clone(), None),
+    };
     let model = ProductionLoadedModel::load_with_component(
         fixture,
-        ingested.payload_source.as_ref(),
+        source.as_ref(),
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone()),
         provider,
         Some(component),
     )
     .unwrap_or_else(|error| panic!("{variant} loads with its Component: {error}"));
-    (model, reference)
+    (model, reference, usage)
 }

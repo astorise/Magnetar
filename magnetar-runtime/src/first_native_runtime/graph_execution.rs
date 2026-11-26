@@ -1,6 +1,7 @@
 //! Execution of first-native prefill and decode graphs, node by node.
 
 use super::*;
+use crate::RowTableHandle;
 
 // ---------------------------------------------------------------------
 // Generic graph executor
@@ -1689,13 +1690,14 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     // immutable borrow and the mutable `memory_mut()` borrow below at once;
     // the actual weight tensors are read from Provider storage through
     // `resolve_first_native_weight_edge`, by resource id, per node (task 6.3/6.4).
-    let weight_bindings = runtime
-        .model_instance(model_instance)
-        .map_err(InferenceApiError::from)?
-        .definition
-        .resource_bindings
-        .weights
-        .clone();
+    let (weight_bindings, row_tables) = {
+        let bindings = &runtime
+            .model_instance(model_instance)
+            .map_err(InferenceApiError::from)?
+            .definition
+            .resource_bindings;
+        (bindings.weights.clone(), bindings.row_tables.clone())
+    };
     runtime
         .phase_ledger_mut()
         .record(prepare_clock, StepPhase::GraphPrepare);
@@ -1715,6 +1717,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
         runtime,
         fixture,
         &weight_bindings,
+        &row_tables,
         kv_cache_id,
         fingerprinted,
         prepared_plan,
@@ -1753,6 +1756,7 @@ pub(super) fn execute_first_native_graph_nodes(
     runtime: &mut Runtime,
     fixture: &E2eFixture,
     weight_bindings: &BTreeMap<String, TensorResourceId>,
+    row_tables: &BTreeMap<String, RowTableHandle>,
     kv_cache_id: &KvCacheId,
     fingerprinted: FingerprintedGraph<'_>,
     prepared_plan: &mut PreparedExecutionPlan,
@@ -1780,6 +1784,15 @@ pub(super) fn execute_first_native_graph_nodes(
         &mut initial_bindings,
         &mut resident_bindings,
     )?;
+    // Tables read by row (`support-qwen38-flash-next` task 4.4): each
+    // reading node's rows, named by this step's tokens, are hinted to their
+    // mappings now, every layer's at once, and read when the node runs.
+    let row_gather = super::row_gather::RowGather::plan(graph, row_tables, |node, hash| {
+        super::row_gather::step_tokens(node, hash, &initial_bindings, &resident_bindings, executor)
+    })?;
+    if let Some(gather) = &row_gather {
+        gather.prefetch();
+    }
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph
@@ -1976,7 +1989,25 @@ pub(super) fn execute_first_native_graph_nodes(
         );
         let inputs_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let mut inputs = Vec::with_capacity(node.inputs.len());
-        for edge_id in &node.inputs {
+        // A node reading a row table takes its rows as the table input,
+        // and runs in its gathered form.
+        let gathered_node;
+        let (node, gathers_rows) = match &row_gather {
+            Some(gather) if gather.reads(node_id) => {
+                gathered_node = super::row_gather::gathered_form(node);
+                (&gathered_node, true)
+            }
+            _ => (node, false),
+        };
+        for (input_index, edge_id) in node.inputs.iter().enumerate() {
+            if gathers_rows
+                && input_index == 2
+                && let Some(gather) = &row_gather
+            {
+                // The read is part of resolving the node's inputs.
+                inputs.push(NodeValue::Host(gather.gather(node_id)?));
+                continue;
+            }
             let value = match bindings.get(edge_id) {
                 Some((resource_id, shape)) => {
                     let value = dispatch_ctx
