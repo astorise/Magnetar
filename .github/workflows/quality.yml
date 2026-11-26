@@ -636,6 +636,15 @@ jobs:
         run: tools/repositories.sh fetch
       - name: Every checkout is at its pin
         run: tools/repositories.sh status
+      - name: The Component qualification script parses and knows only pinned Components
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n tools/qualify_component.sh
+          for name in $(tools/qualify_component.sh list | awk '/^[a-z]/ { print $1 }'); do
+            grep -q "^components/$name " repositories.lock || { echo "::error::$name is not a pinned Component"; exit 1; }
+            echo "$name: pinned"
+          done
 
   # Full conformance (task 15.9): the original, unsplit job -- fetches every
   # pinned repository (`tools/repositories.sh fetch`) and re-runs the same

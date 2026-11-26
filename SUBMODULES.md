@@ -102,6 +102,8 @@ Two levels of checks cover a module (the `submodule-ci` specification):
 |---|---|---|
 | Module CI | the module's repository, on each pull request and push to `main` | does this module change pass its own checks against the current Runtime? |
 | Integration jobs | this repository's `quality.yml`, on each pull request | does the combination this repository pins work together? |
+| Component qualification | the Component's repository, on each pull request (`component-qualification.yml`, defined here) | does the Runtime accept the artifact this Component builds? |
+| Kernel timings | the Provider's repository, on dispatch (`submodule-gpu-timings.yml`, defined here) | how long does each kernel of this Provider take on real hardware? |
 | Daily GPU run | this repository's `gpu-runner-smoke.yml` | does the pinned combination work on real hardware, long campaigns included? |
 
 Module CI is one reusable workflow, `.github/workflows/submodule-ci.yml`
@@ -127,6 +129,22 @@ path, and runs formatting, Clippy, `cargo test --locked` and
   `arc-gpu-magnetar-provider-cuda`, registered for the CUDA Provider
   repository; the job uses the same container image as
   `gpu-runner-smoke.yml` unless the caller names another one.
+- **Qualification of a Component.** A Component repository's own checks
+  see only its graph code. `component-qualification.yml` checks Magnetar out,
+  puts the Component of the pull request at its path in place of the pinned
+  one, builds it for the Component Model and runs the Runtime's tests that
+  read it (`tools/qualify_component.sh list` says which, for each Component).
+  The tests stay here; the Component repository only calls the workflow with
+  its name. It can also be dispatched here with a Component repository and a
+  branch, to qualify a branch before the repository calls it. The
+  Components it knows today are `llama` and `smollm`; adding one is a `case`
+  in `tools/qualify_component.sh`.
+- **Kernel timings of a Provider.** The numbers a Provider alone can give
+  (the Device time of each kernel, against the bytes it reads) are measured in
+  its own repository: `providers/cuda`'s `kernel-timings.yml` dispatches
+  `submodule-gpu-timings.yml` on the repository's GPU runner, with the
+  ignored tests to run. They are no longer steps of `gpu-runner-smoke.yml`,
+  which keeps what needs the combination.
 - **Components.** `components/qwen` and `components/llama` call the
   workflow with Clippy off: their package names
   (`magnetar-component-Qwen`, `magnetar-component-Llama`) trip the

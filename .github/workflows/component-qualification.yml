@@ -1,0 +1,166 @@
+name: Component qualification
+
+# Reusable workflow (`submodule-ci` specification): does this Runtime accept the
+# artifact a Model Component repository builds? A Component repository tests
+# its graph code on the host (golden graphs, refusals); it cannot see the
+# Runtime. This checks Magnetar out, puts the Component under test at its path
+# in place of the one Magnetar pins, builds it for the Component Model and runs
+# the Runtime's tests that consume it (`tools/qualify_component.sh`, which
+# lists what it runs for each Component). Defined once here; a Component
+# repository calls it from a short workflow of its own:
+#
+#   jobs:
+#     qualification:
+#       uses: astorise/Magnetar/.github/workflows/component-qualification.yml@main
+#       with:
+#         component: llama
+#
+# The Magnetar revision is the branch named like the Component's branch when it
+# exists, otherwise `main`, as in `submodule-ci.yml`. The Component under test is
+# the caller's checkout (a pull request's merge commit, or a push).
+#
+# It can also be dispatched here, on a Magnetar branch, to qualify a Component
+# repository's branch before the Component repository calls it:
+#
+#   component: llama
+#   component-repository: astorise/Magnetar-component-Llama
+#   component-ref: <a branch or commit>
+#
+# This runs on a GitHub-hosted runner: the tests are the CPU ones, against the
+# Reference CPU Provider. What needs a GPU is `gpu-runner-smoke.yml`, which
+# qualifies the combination Magnetar pins.
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: >-
+          The Component's name, as `tools/qualify_component.sh list` gives it
+          (llama, smollm).
+        required: true
+        type: string
+      component-repository:
+        description: >-
+          owner/name of the repository holding the Component under test. The
+          caller's own repository when empty.
+        required: false
+        type: string
+        default: ""
+      component-ref:
+        description: >-
+          Branch, tag or commit of the Component under test. The caller's own
+          revision when empty.
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      component:
+        description: >-
+          The Component's name, as `tools/qualify_component.sh list` gives it
+          (llama, smollm).
+        required: true
+        type: string
+      component-repository:
+        description: owner/name of the repository holding the Component under test.
+        required: true
+        type: string
+      component-ref:
+        description: Branch, tag or commit of the Component under test.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qualify:
+    name: qualify
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check the Component's name
+        env:
+          COMPONENT: ${{ inputs.component }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$COMPONENT" =~ ^[a-z0-9_-]+$ ]] || { echo "::error::not a Component name: $COMPONENT"; exit 1; }
+      - name: Select the Magnetar revision
+        id: magnetar
+        # The branch name reaches the shell through the environment, never
+        # through expression interpolation.
+        env:
+          MODULE_BRANCH: ${{ github.head_ref || github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          OWN_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref=main
+          if [ "$EVENT" = workflow_dispatch ]; then
+            # Dispatched in Magnetar itself: this workflow's own commit.
+            ref="$OWN_COMMIT"
+          elif [ "$MODULE_BRANCH" != main ] && git ls-remote --exit-code --heads \
+              https://github.com/astorise/Magnetar.git "refs/heads/$MODULE_BRANCH" > /dev/null 2>&1; then
+            ref="$MODULE_BRANCH"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Testing against Magnetar: $ref"
+      - name: Checkout Magnetar
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar
+          ref: ${{ steps.magnetar.outputs.ref }}
+          path: Magnetar
+      - name: Fetch every other pinned repository
+        # The Runtime's workspace depends, by relative path, on the Providers,
+        # Loaders, Formats and the other Components; the Component under test
+        # replaces the one Magnetar pins at its path.
+        working-directory: Magnetar
+        env:
+          COMPONENT: ${{ inputs.component }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths="$(awk -v skip="components/$COMPONENT" '$1 !~ /^#/ && NF >= 3 && $1 != skip { print $1 }' repositories.lock)"
+          # shellcheck disable=SC2086 # one path per word, by design
+          tools/repositories.sh fetch $paths
+      - name: Checkout the Component under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ inputs.component-repository || github.repository }}
+          ref: ${{ inputs.component-ref }}
+          path: Magnetar/components/${{ inputs.component }}
+      - name: Report the revisions under test
+        working-directory: Magnetar
+        env:
+          COMPONENT: ${{ inputs.component }}
+          MAGNETAR_REF: ${{ steps.magnetar.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Magnetar: $(git rev-parse HEAD) ($MAGNETAR_REF)"
+          echo "components/$COMPONENT: $(git -C "components/$COMPONENT" rev-parse HEAD)"
+      - name: Install pinned Rust toolchain
+        working-directory: Magnetar
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            Magnetar
+            Magnetar/submodule-workspace
+            Magnetar/components/${{ inputs.component }}
+      - name: Install wasm-tools
+        uses: taiki-e/install-action@745319f1cc9062cb0c2e6e30639b5180392b1951 # wasm-tools
+      - name: Qualify the Component
+        working-directory: Magnetar
+        env:
+          COMPONENT: ${{ inputs.component }}
+        run: tools/qualify_component.sh "$COMPONENT"
