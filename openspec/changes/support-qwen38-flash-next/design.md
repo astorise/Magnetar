@@ -118,7 +118,7 @@ Choices here follow performance: a decode step must not wait on the disk.
 - `ngram-embedding` takes the table as a dense input, and its Reference semantics cap every tensor at 67,108,864 elements.
 - The payload source is only borrowed (`&dyn ProductionArtifactPayloadSource`) during the load, so nothing could read a row later.
 
-**What a step costs.** Every layer with an n-gram embedding reads `heads` rows per token: with 16 to 48 heads and tens of such layers, one decode token reads on the order of 1,000 to 1,700 random rows of a few hundred bytes. The Strata reference decodes at 23 tokens/s, 43 ms per token, so the lookup has to hide behind compute. Measured on this development VM's virtual disk with a 1 GiB file of 256-byte rows (indicative only: a real NVMe is faster, the ranking is what matters), cold cache, 1,728 rows:
+**What a step costs.** Every layer with an n-gram embedding reads `heads` rows per token, `(ngram_size - 1) * heads_per_ngram`: 16 to 48. The real model has one such layer (D7), so a decode token reads 16 to 48 random rows of a few hundred bytes, and a prefill chunk `chunk * heads`; a model with tens of such layers would read up to about 1,700. The Strata reference decodes at 23 tokens/s, 43 ms per token, so the lookup has to hide behind compute. Measured on this development VM's virtual disk with a 1 GiB file of 256-byte rows (indicative only: a real NVMe is faster, the ranking is what matters), cold cache, 1,728 rows:
 
 | Access | Time |
 |---|---|
@@ -129,6 +129,20 @@ Choices here follow performance: a decode step must not wait on the disk.
 | any of them, warm (page cache) | 0.2 to 1 ms |
 
 A batched `WILLNEED` queues every read at once, so the kernel keeps the device's queue full without any threads of ours; it is 6 times faster than the best threaded `pread` and 18 times faster than faulting page by page. Hot n-grams stay in the page cache, which makes a Runtime row cache pointless until a measurement says otherwise.
+
+**Measured through the whole stack** (`an_ngram_table_read_by_row_is_measured_against_one_staged_whole`; the tiny model, 18 prompt tokens and 11 decoded, unoptimized build, 16 heads of 32 values, tables of 245 MB and 820 MB made by `make_tiny_qwen4_exp.py ... big`; every run matches `transformers`):
+
+| Table | Provider | Decode, mean per token | Load of the model (Runtime) |
+|---|---|---|---|
+| 245 MB read by row, page cache dropped after the loader read the bundle | Reference CPU / optimized CPU | 24 ms / 19 ms | 24 ms |
+| 245 MB read by row, warm | same | 28 ms / 21 ms | 26 to 32 ms |
+| 245 MB staged whole | same | **704 ms / 520 ms** | 1.3 to 1.5 s |
+| 820 MB read by row, cold / warm | same | 22 ms / 20 ms (cold), 32 ms / 19 ms (warm) | 24 to 27 ms |
+| 820 MB staged whole | not possible: the operator refuses a table of more than 67 million elements | | |
+
+Reading by row is 27 to 29 times faster per decoded token than staging the table, even for a table that fits: the dense operator takes the whole table as an input at every step and checks every element finite, work that grows with the table and not with the rows a step reads. It is the only way to run the full-size table at all. A cold page cache is not measurable at 16 rows a token: the difference between cold and warm is within the noise (a few milliseconds either way), as the micro-benchmark above predicts (16 rows at about 0.1 ms each, with the hint issued a step ahead). The prefetch is therefore cheap insurance, not what makes the difference: it matters for a prefill chunk or a model with many such layers.
+
+**What the measurement also showed, and does not fix.** The loader hashes every tensor while it reads the bundle (in 64 KiB blocks, so memory stays bounded): 6 s for 245 MB and 19 s for 820 MB in an unoptimized build, which is by far the larger part of loading and has nothing to do with how the Runtime reads the table. For the real checkpoint's table that is a full read of its weights at every load. The Runtime's mapping cannot avoid it; hashing a table lazily, once, or by sampling is a separate decision (task 4.4, last item).
 
 **Options.**
 - *A. A row-addressed resource in every Provider* (a new `TensorValue` or resource kind). Rejected: the largest blast radius for a weight read a few dozen times per token, and each Provider would reimplement the I/O.

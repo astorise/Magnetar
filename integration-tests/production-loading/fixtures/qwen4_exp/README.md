@@ -62,3 +62,7 @@ tokens as `dense`.
 On the Reference CPU Provider the largest logit difference is 1.7e-6 (`dense`)
 2.1e-6 (`sigmoid`), 3.0e-7 (`ple`), 1.2e-6 (`prune`) and 1.7e-6 (`stacked`), and on the
 optimized CPU Provider 4.5e-6, 1.9e-6, 2.6e-6, 1.8e-6 and 4.5e-6.
+
+## A table too large to check in (`big`)
+
+`make_tiny_qwen4_exp.py <dir> big [ngram_vocab_size_base]` makes the `ple` bundle again with a table of millions of rows of 32 values (`ple_embed_dim` 512): 1.9 million rows and 245 MB with a base of 120000, which is under the Reference semantics' cap of 67 million elements, and 6.4 million rows and 820 MB with the default base of 400000, which is past it (only a table read by row can run it). They are not checked in. `qwen4_exp_reference_logits.py <dir> 12 <dir>/reference.json <the prompt above>` gives their reference, and the ignored test `an_ngram_table_read_by_row_is_measured_against_one_staged_whole` runs them (`MAGNETAR_QWEN4_EXP_MID_PLE`, `MAGNETAR_QWEN4_EXP_BIG_PLE`), matching `transformers` every time.

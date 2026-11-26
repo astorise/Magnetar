@@ -5,6 +5,13 @@ Variants:
           (`output_gate_type`), and other weights.
   ple     The `dense` bundle with an n-gram embedding in layer 0 (`ple_layer_ids`
           [1]: 16 hashed heads of 2 values, convolution kernel 4 and dilation 3).
+  big     The `ple` bundle with a table of millions of rows of 32 values
+          (`ple_embed_dim` 512; `ngram_vocab_size_base` is the optional third
+          argument, 400000 by default: 6.4 million rows, 820 MB, past the
+          Reference semantics' 67 million element cap, so only a table read by
+          row can run it; 120000 gives 1.9 million rows, 245 MB, under it), to
+          time a table read by row against one staged whole. Not checked in:
+          generate it where it is measured.
   prune   The `dense` bundle with an indexer that prunes (budget 8 in blocks of
           2: a query keeps at most 9 tokens, so attention is sparse from the
           10th visible token), and other weights.
@@ -14,7 +21,7 @@ Variants:
           head rotating, 4 residual streams (low rank 6), 4 experts (top 2)
           with a gated shared expert. The indexer keeps whole sequences
           (budget 32 in blocks of 4: dense up to 35 tokens).
-Usage: make_tiny_qwen4_exp.py <out_dir> <variant>
+Usage: make_tiny_qwen4_exp.py <out_dir> <variant> [ngram_vocab_size_base (big)]
 """
 import json, os, sys
 import torch
@@ -24,13 +31,16 @@ from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextCo
 VOCAB = 64
 
 
-def config(variant):
-    if variant not in ("dense", "sigmoid", "ple", "prune"):
+def config(variant, ngram_base=400000):
+    if variant not in ("dense", "sigmoid", "ple", "prune", "big"):
         raise SystemExit(f"unknown variant {variant}")
-    ple = {"ple_layer_ids": [1], "ple_embed_dim": 32, "ple_conv_kernel_size": 4,
-           "ngram_size": 3, "heads_per_ngram": 8, "ngram_vocab_size_base": 40,
+    big = variant == "big"
+    ple = {"ple_layer_ids": [1], "ple_embed_dim": 512 if big else 32,
+           "ple_conv_kernel_size": 4,
+           "ngram_size": 3, "heads_per_ngram": 8,
+           "ngram_vocab_size_base": ngram_base if big else 40,
            "make_ngram_vocab_size_divisible_by": 8, "seed": 1234,
-           "split_ngram_parts": 4} if variant == "ple" else {}
+           "split_ngram_parts": 4} if variant in ("ple", "big") else {}
     return Qwen4ExpTextConfig(
         **ple,
         output_gate_type="sigmoid" if variant == "sigmoid" else None,
@@ -79,9 +89,10 @@ def scaled_init(model, seed):
 
 def main():
     out, variant = sys.argv[1], sys.argv[2]
+    ngram_base = int(sys.argv[3]) if len(sys.argv) > 3 else 400000
     torch.manual_seed(0)
-    model = Qwen4ExpForCausalLM(config(variant)).float().eval()
-    scaled_init(model, {"dense": 1, "sigmoid": 2, "ple": 3, "prune": 4}[variant])
+    model = Qwen4ExpForCausalLM(config(variant, ngram_base)).float().eval()
+    scaled_init(model, {"dense": 1, "sigmoid": 2, "ple": 3, "prune": 4, "big": 5}[variant])
     model.save_pretrained(out, safe_serialization=True)
     vocab = {f"t{i}": i for i in range(VOCAB)}
     tokenizer = {
