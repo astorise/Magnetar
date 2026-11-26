@@ -10,7 +10,8 @@ context: |
   `tools/layering-check`. A second workspace,
   `submodule-workspace`, contains `magnetar-cli`, `inference-components`, and
   production-loading, CUDA-first-native, and multi-device integration tests.
-  External Components, Providers, Formats, and Loaders are pinned submodules.
+  External Components, Providers, Formats, and Loaders are pinned by commit in `repositories.lock` (`tools/repositories.sh fetch` puts them at their paths), each with its own
+  `openspec/` directory holding the specifications and changes that belong to it.
   Reference CPU execution, Wasmtime Component execution, first-native Qwen
   inference, production Qwen artifact loading, and Ed25519 Component/Model
   Artifact verification are implemented. Hardware-specific support and

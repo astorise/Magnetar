@@ -1248,7 +1248,7 @@ Architecture Freeze #1 status SHALL remain candidate until P0 first-native causa
 
 ### Requirement: Model Components, Providers, and Formats Are Externalized
 
-Model-architecture Components, Providers beyond one minimal built-in reference baseline, and Model Artifact Format parsers SHALL live in repositories separate from the Magnetar Core repository, pinned into it as git submodules.
+Model-architecture Components, Providers beyond one minimal built-in reference baseline, and Model Artifact Format parsers SHALL live in repositories separate from the Magnetar Core repository, pinned into it by commit (`repositories.lock`, put at their paths by `tools/repositories.sh fetch`).
 
 The Core repository SHALL have zero compile-time dependency on the concrete implementation crate of any such externalized module.
 
@@ -1260,7 +1260,7 @@ Given a new model family (for example Llama) gains a real Component implementati
 
 When that implementation is added to the project
 
-Then it lives in its own repository, pinned into the Core repository as a git submodule
+Then it lives in its own repository, pinned into the Core repository by commit (`repositories.lock`)
 
 And the Core repository's own crate does not depend on it.
 
@@ -1270,7 +1270,7 @@ Given a new hardware Provider (for example CUDA) gains a real implementation
 
 When that implementation is added to the project
 
-Then it lives in its own repository, pinned into the Core repository as a git submodule
+Then it lives in its own repository, pinned into the Core repository by commit (`repositories.lock`)
 
 And the Core repository's own crate does not depend on it.
 
@@ -1290,7 +1290,7 @@ Given a new Model Artifact format (for example a new quantization container) gai
 
 When that parser is added to the project
 
-Then it lives in its own repository, pinned into the Core repository as a git submodule
+Then it lives in its own repository, pinned into the Core repository by commit (`repositories.lock`)
 
 And the Core repository's own crate does not depend on it.
 

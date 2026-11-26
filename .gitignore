@@ -6,3 +6,32 @@
 .artifacts/*
 __pycache__/
 *.pyc
+
+# Repositories pinned by `repositories.lock` and put here by `tools/repositories.sh fetch`:
+# they are checkouts of other repositories, not part of this one.
+/components/deepseek/
+/components/gemma/
+/components/glm/
+/components/kev/
+/components/kimi/
+/components/laya/
+/components/llama/
+/components/mistral/
+/components/modernbert/
+/components/nemotron/
+/components/olala/
+/components/olmo/
+/components/qwen/
+/components/smollm/
+/formats/gguf/
+/formats/safetensors/
+/loaders/gguf/
+/loaders/huggingface/
+/providers/cpu/
+/providers/cuda/
+/providers/metal/
+/providers/openvino/
+/providers/qnn/
+/providers/rocm/
+/providers/tpu/
+/providers/wgpu/

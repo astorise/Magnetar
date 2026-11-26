@@ -157,7 +157,7 @@ The commands above cover the root `[workspace]`
 `magnetar-engine`; `roadmap-contracts`;
 the tools) --
 crates with no dependency on an externalized submodule, so a plain checkout
-without `submodules: recursive` can build them.
+without the pinned repositories fetched (`tools/repositories.sh fetch`) can build them.
 
 `magnetar-cli`, `inference-components`, and the three `integration-tests/*`
 crates depend on a submodule that is not present in every checkout
@@ -165,7 +165,7 @@ crates depend on a submodule that is not present in every checkout
 so they live in a second workspace instead: `submodule-workspace/Cargo.toml`
 (#64). Run the same commands against it with `--manifest-path
 submodule-workspace/Cargo.toml --workspace` in place of `--workspace` alone,
-after checking out submodules (`git submodule update --init --recursive`
+after fetching the pinned repositories (`tools/repositories.sh fetch`
 covers this whole workspace's dependencies):
 
 ```bash
@@ -190,7 +190,7 @@ submodules, not first-party code, so they are not members of this workspace
 Each Component, Provider, Format and Loader repository runs its own checks
 through the reusable workflow `.github/workflows/submodule-ci.yml` (see
 [SUBMODULES.md](../SUBMODULES.md), "Module CI"). To reproduce them locally,
-from a Magnetar checkout with the module at its submodule path:
+from a Magnetar checkout with the module at its path:
 
 ```bash
 cargo fmt --manifest-path providers/cpu/Cargo.toml -- --check
@@ -200,8 +200,8 @@ cargo deny --manifest-path providers/cpu/Cargo.toml check
 ```
 
 Replace `providers/cpu` with the module's path. A module that depends on
-another one by path needs it checked out too (`git submodule update --init
--- formats/safetensors` for `loaders/huggingface`).
+another one by path needs it fetched too (`tools/repositories.sh fetch
+formats/safetensors` for `loaders/huggingface`).
 
 ## Coverage Policy
 

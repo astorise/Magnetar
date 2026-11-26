@@ -1,0 +1,169 @@
+name: Module GPU timings
+
+# Reusable workflow (`submodule-ci` specification): the timing diagnostics of a
+# Provider repository, run on its own self-hosted GPU runner. A diagnostic is
+# an `#[ignore]`d test of the module that prints the Device time of a kernel
+# (and what it reads or writes); it measures, it does not gate, and the
+# numbers are in the job's log. Defined once here; a Provider repository calls
+# it from a short workflow of its own, dispatched by hand:
+#
+#   jobs:
+#     timings:
+#       uses: astorise/Magnetar/.github/workflows/submodule-gpu-timings.yml@main
+#       with:
+#         module-path: providers/cuda
+#         siblings: providers/cpu
+#         tests: decode_matmul_bandwidth moe_decode_kernel_times
+#         gpu-runner: <the repository's runner label>
+#
+# The module is built inside a Magnetar checkout, at its path, exactly as
+# `submodule-ci.yml` builds it: the Magnetar branch named like the module's
+# branch when it exists, otherwise `main`.
+#
+# What needs the combination (the Runtime, the Components, the Loaders and a
+# real checkpoint) is not here: it stays in Magnetar's `gpu-runner-smoke.yml`.
+on:
+  workflow_call:
+    inputs:
+      module-path:
+        description: The module's path in Magnetar, e.g. providers/cuda.
+        required: true
+        type: string
+      siblings:
+        description: >-
+          Space-separated module paths this module depends on by relative
+          path, checked out at the commits Magnetar pins.
+        required: false
+        type: string
+        default: ""
+      tests:
+        description: >-
+          Space-separated names of the module's ignored tests to run, each as
+          a `cargo test` filter, in this order. One that fails or runs past
+          its limit fails the job, after the others have run.
+        required: true
+        type: string
+      timeout-minutes:
+        description: The limit of each test, in minutes.
+        required: false
+        type: number
+        default: 15
+      gpu-runner:
+        description: Label of the self-hosted GPU runner.
+        required: true
+        type: string
+      gpu-container-image:
+        description: Container image for the GPU job.
+        required: false
+        type: string
+        default: nvidia/cuda:13.5.0-cudnn-devel-ubuntu24.04
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  timings:
+    name: timings
+    # A self-hosted runner executes the code it is given, so this job runs
+    # for a dispatch or a push of the module repository's own branches, never
+    # for a pull request from a fork.
+    if: >-
+      ${{ github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ inputs.gpu-runner }}
+    timeout-minutes: 180
+    container:
+      image: ${{ inputs.gpu-container-image }}
+      options: --gpus all
+    # One runner: queue the runs instead of cancelling a test in flight. The
+    # group is the one `submodule-ci.yml`'s `gpu` job uses, so a timing run
+    # and a pull request's hardware tests of this repository take turns.
+    concurrency:
+      group: module-gpu-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Check the test names
+        env:
+          TESTS: ${{ inputs.tests }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${TESTS// /}" ] || { echo "::error::no test to run"; exit 1; }
+          for name in $TESTS; do
+            [[ "$name" =~ ^[A-Za-z0-9_:]+$ ]] || { echo "::error::not a test name: $name"; exit 1; }
+          done
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends git curl build-essential ca-certificates
+      - name: Select the Magnetar revision
+        id: magnetar
+        env:
+          MODULE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref=main
+          if [ "$MODULE_BRANCH" != main ] && git ls-remote --exit-code --heads \
+              https://github.com/astorise/Magnetar.git "refs/heads/$MODULE_BRANCH" > /dev/null 2>&1; then
+            ref="$MODULE_BRANCH"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Testing against Magnetar branch: $ref"
+      - name: Checkout Magnetar
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar
+          ref: ${{ steps.magnetar.outputs.ref }}
+          path: Magnetar
+      - name: Checkout sibling modules at the commits Magnetar pins
+        if: ${{ inputs.siblings != '' }}
+        env:
+          SIBLINGS: ${{ inputs.siblings }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The container's git refuses a workspace it does not own.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/Magnetar"
+          cd Magnetar
+          # shellcheck disable=SC2086 # one path per word, by design
+          tools/repositories.sh fetch $SIBLINGS
+      - name: Checkout the module under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: Magnetar/${{ inputs.module-path }}
+      - name: Verify a GPU is visible
+        # Fails the job when there is no GPU: a timing of nothing is no timing.
+        run: |
+          set -eux
+          nvidia-smi
+          command -v nvcc
+          nvcc --version
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install pinned Rust toolchain
+        working-directory: Magnetar
+        run: rustup show
+      - name: Run the timing tests
+        working-directory: Magnetar
+        env:
+          MODULE_PATH: ${{ inputs.module-path }}
+          TESTS: ${{ inputs.tests }}
+          TEST_MINUTES: ${{ inputs.timeout-minutes }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          for name in $TESTS; do
+            echo "::group::$name"
+            if ! timeout "${TEST_MINUTES}m" cargo test --locked --release \
+                --manifest-path "$MODULE_PATH/Cargo.toml" "$name" -- --ignored --nocapture; then
+              echo "::error::$name failed, or ran past ${TEST_MINUTES} minutes"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"

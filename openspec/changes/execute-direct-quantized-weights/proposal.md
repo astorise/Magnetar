@@ -26,9 +26,9 @@ None by default; profile-specific replacements, where required, are enumerated i
 Owning layer: Formats and loaders; Providers; Runtime validation. Implementation may span Magnetar and the appropriate pinned Component, Provider, Format or Loader repositories; submodule revisions are updated only after their own validation. No runtime code, dependencies, WIT or canonical specifications are changed by this proposal.
 
 Existing contracts to reuse:
-- [`gguf-format`](../../specs/gguf-format/spec.md)
-- [`gguf-model-ingestion`](../../specs/gguf-model-ingestion/spec.md)
-- [`huggingface-model-ingestion`](../../specs/huggingface-model-ingestion/spec.md)
+- [`gguf-format`](https://github.com/astorise/Magnetar-format-GGUF/blob/HEAD/openspec/specs/gguf-format/spec.md)
+- [`gguf-model-ingestion`](https://github.com/astorise/Magnetar-loader-GGUF/blob/HEAD/openspec/specs/gguf-model-ingestion/spec.md)
+- [`huggingface-model-ingestion`](https://github.com/astorise/Magnetar-loader-HuggingFace/blob/HEAD/openspec/specs/huggingface-model-ingestion/spec.md)
 - [`tensor`](../../specs/tensor/spec.md)
 - [`provider-roadmap`](../../specs/provider-roadmap/spec.md)
 
