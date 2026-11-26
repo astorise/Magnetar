@@ -9,14 +9,14 @@
 ## 2. Dependency form
 
 - [x] 2.1 A `main` branch for the crate's repository (its default branch is still the session's; the owner switches it in the repository's settings).
-- [ ] 2.2 Each migrated Component names the crate as a git dependency pinned by commit, and its `Cargo.lock` records it (Mistral and OLMo: done; the others as they move).
+- [ ] 2.2 Each migrated Component names the crate as a git dependency pinned by commit, and its `Cargo.lock` records it (Mistral, OLMo and Gemma: done; the others as they move).
 - [ ] 2.3 Publish `magnetar-component-sdk` to crates.io once its API has been through the Components, and move the Components to a version.
 
 ## 3. Components move to it, each with its golden graphs
 
 - [x] 3.1 Mistral: golden graphs recorded (7 scenarios, before the change), `plan.rs` types and `component.rs` adapter replaced; `main` of `magnetar-component-mistral` carries it, pinned by commit 4e2e556.
 - [x] 3.2 OLMo, same: seven golden graphs recorded before the change (YaRN on full-attention layers only, the published 7B geometry), then moved; pinned on its branch `claude/charming-lamport-1b9m74` (its `main` does not carry the code yet: Codex's pull request is open).
-- [ ] 3.3 Gemma, same (its adapter differs from the other two in names only).
+- [x] 3.3 Gemma, same (its adapter differed from the other two in argument names only): twelve golden tests (13 recorded graphs: the dense miniature, shared K/V, per-layer inputs, routed experts, and slices of the real 31B, E2B and 26B-A4B geometries) recorded before the change, then moved; its 45 unit tests pass unchanged.
 - [ ] 3.4 SmolLM and Llama, which share a graph builder (`llama_graph`): one builder, in the crate or in a Component both depend on.
 - [ ] 3.5 `GraphSink` with nodes of several outputs and recurrent state, as methods that default to a refusal.
 - [ ] 3.6 Qwen and DeepSeek, which call the bindings directly, move onto the sink.

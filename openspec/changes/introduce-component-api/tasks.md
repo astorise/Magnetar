@@ -10,7 +10,7 @@
 ## 2. Components move to it, each under its golden graphs
 
 - [x] 2.1 Mistral (contract 1.8.0): `wit/` and the `generate!` call replaced by the dependency and the `v1_8` feature; the golden graphs pass unchanged, and so do the Component Model validation and Magnetar's own build path (`wasm32-unknown-unknown` then `wasm-tools component new`). Magnetar's independent-logits check runs on this PR.
-- [ ] 2.2 OLMo (1.8.0; done, with its SDK move, same golden graphs), Gemma, Llama (1.8.0), SmolLM (1.9.0), DeepSeek (1.10.0), ModernBERT (1.12.0), Qwen (1.14.0), each with its own golden graphs.
+- [ ] 2.2 OLMo and Gemma (1.8.0; done, with their SDK moves, same golden graphs), Llama (1.8.0), SmolLM (1.9.0), DeepSeek (1.10.0), ModernBERT (1.12.0), Qwen (1.14.0), each with its own golden graphs.
 - [ ] 2.3 Each Component's `Cargo.lock` records the pinned commit, and no Component carries a `wit/model-component-graph.wit`.
 
 ## 3. The Runtime
