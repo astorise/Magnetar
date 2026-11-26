@@ -9,12 +9,12 @@
 ## 2. Dependency form
 
 - [x] 2.1 A `main` branch for the crate's repository (its default branch is still the session's; the owner switches it in the repository's settings).
-- [ ] 2.2 Each migrated Component names the crate as a git dependency pinned by commit, and its `Cargo.lock` records it.
+- [ ] 2.2 Each migrated Component names the crate as a git dependency pinned by commit, and its `Cargo.lock` records it (Mistral: done; the others as they move).
 - [ ] 2.3 Publish `magnetar-component-sdk` to crates.io once its API has been through the Components, and move the Components to a version.
 
 ## 3. Components move to it, each with its golden graphs
 
-- [ ] 3.1 Mistral: golden graphs recorded, `plan.rs` types and `component.rs` adapter replaced.
+- [x] 3.1 Mistral: golden graphs recorded (7 scenarios, before the change), `plan.rs` types and `component.rs` adapter replaced; `main` of `magnetar-component-mistral` carries it, pinned by commit 4e2e556.
 - [ ] 3.2 OLMo, same.
 - [ ] 3.3 Gemma, same (its adapter differs from the other two in names only).
 - [ ] 3.4 SmolLM and Llama, which share a graph builder (`llama_graph`): one builder, in the crate or in a Component both depend on.
