@@ -259,6 +259,47 @@ pub trait ProductionArtifactPayloadSource: Send + Sync {
         &self,
         range: &ProductionPayloadRange,
     ) -> Result<Vec<u8>, ProductionIngestionError>;
+
+    /// Maps `range` for random reads instead of reading it whole
+    /// (`support-qwen38-flash-next`, design D8): a table too large to hold
+    /// in memory, such as a Qwen4-Exp n-gram table, is read a few rows at a
+    /// time through the returned mapping. `Ok(None)` when this source
+    /// cannot map the range (the caller then reads it with
+    /// [`Self::read_payload`], or refuses it). An implementation SHALL
+    /// verify `range.digest` (when declared) before returning success,
+    /// reading the range in bounded chunks rather than whole, and SHALL own
+    /// whatever file the mapping reads: the Runtime never sees a path, a
+    /// handle or a pointer.
+    fn map_payload(
+        &self,
+        _range: &ProductionPayloadRange,
+    ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+        Ok(None)
+    }
+}
+
+/// A read-only mapping of one payload range, owned by the source that made
+/// it (`support-qwen38-flash-next`, design D8). It is the Runtime's only
+/// view of a table that is never held whole: reads copy bytes out, and a
+/// prefetch hint lets the operating system queue many reads at once.
+pub trait MappedPayload: Send + Sync + std::fmt::Debug {
+    /// The mapped range's length in bytes.
+    fn len(&self) -> u64;
+
+    /// Whether the mapped range is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copies `out.len()` bytes starting at `offset` into `out`, or fails
+    /// with [`ProductionIngestionError::PayloadOutOfBounds`] when the span
+    /// leaves the range.
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), ProductionIngestionError>;
+
+    /// Hints that these `(offset, length)` byte spans will be read soon, so
+    /// that the operating system may start reading them all at once. It
+    /// never blocks, never fails, and may do nothing.
+    fn prefetch(&self, spans: &[(u64, u64)]);
 }
 
 // ---------------------------------------------------------------------

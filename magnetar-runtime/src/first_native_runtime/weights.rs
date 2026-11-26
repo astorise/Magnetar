@@ -1,6 +1,7 @@
 //! Weight binding and transactional weight materialization for a Model Instance.
 
 use super::*;
+use crate::{ProductionPayloadRange, RowTable, RowTableDType, RowTableHandle};
 
 /// Rejects a weight payload whose bytes do not match the known-correct
 /// digest (task 6.5: artifact byte changes / digest rejection) before this
@@ -176,8 +177,48 @@ pub fn stream_materialize_model_instance_weights(
     tensors: &[ModelTensorMetadata],
     payload_source: &dyn ProductionArtifactPayloadSource,
 ) -> Result<(), InferenceApiError> {
+    stream_materialize_model_instance_weights_with_row_tables(
+        runtime,
+        instance,
+        artifact_owner,
+        tensors,
+        payload_source,
+        &BTreeSet::new(),
+    )
+}
+
+/// [`stream_materialize_model_instance_weights`], reading the tensors named
+/// in `row_addressed` by row instead of staging them
+/// (`support-qwen38-flash-next`, design D8): each is mapped through the
+/// payload source (`map_payload`, which verifies its digest in bounded
+/// chunks) and registered as a [`RowTable`] on the instance, with no Provider
+/// copy and no Memory Manager allocation. A source that cannot map a tensor
+/// stages it as usual, so a bundle loads through any source; whether that
+/// is acceptable for a table too large to hold is the caller's call.
+pub fn stream_materialize_model_instance_weights_with_row_tables(
+    runtime: &mut Runtime,
+    instance: &ModelInstanceId,
+    artifact_owner: &str,
+    tensors: &[ModelTensorMetadata],
+    payload_source: &dyn ProductionArtifactPayloadSource,
+    row_addressed: &BTreeSet<String>,
+) -> Result<(), InferenceApiError> {
     let mut transaction = WeightMaterializationTransaction::begin(runtime, instance)?;
     for tensor in tensors {
+        if row_addressed.contains(&tensor.name) {
+            match stage_row_table(&mut transaction, tensor, payload_source) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    transaction.abort(runtime);
+                    if let Ok(model_instance) = runtime.model_instances_mut().instance_mut(instance)
+                    {
+                        let _ = model_instance.transition_to(ModelInstanceLifecycleState::Failed);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         let stage_result = stream_stage_tensor(
             &mut transaction,
             runtime,
@@ -239,6 +280,54 @@ pub(super) fn stream_stage_tensor(
     )
 }
 
+/// Registers `tensor` as a table read by row on `transaction`: `Ok(true)`
+/// when the source mapped it, `Ok(false)` when it cannot (the caller stages
+/// the tensor the usual way).
+fn stage_row_table(
+    transaction: &mut WeightMaterializationTransaction,
+    tensor: &ModelTensorMetadata,
+    payload_source: &dyn ProductionArtifactPayloadSource,
+) -> Result<bool, InferenceApiError> {
+    let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
+    let (offset, length) = match (tensor.offset_bytes, tensor.size_bytes) {
+        (Some(offset), Some(length)) => (offset, length),
+        _ => {
+            return Err(failed(format!(
+                "table '{}' has no declared byte range to map",
+                tensor.name
+            )));
+        }
+    };
+    let (Some(dtype), [rows, columns]) = (
+        RowTableDType::from_model(tensor.storage_dtype),
+        tensor.shape.as_slice(),
+    ) else {
+        // Not a plain `[rows, columns]` table: only a dense stage reads it.
+        return Ok(false);
+    };
+    let range = ProductionPayloadRange {
+        identity: tensor.name.clone(),
+        offset,
+        length,
+        digest: tensor.digest.clone(),
+    };
+    let mapped = payload_source.map_payload(&range).map_err(|error| {
+        failed(format!(
+            "table '{}' could not be mapped: {error:?}",
+            tensor.name
+        ))
+    })?;
+    let Some(mapped) = mapped else {
+        return Ok(false);
+    };
+    let table = RowTable::new(mapped, *rows, *columns, dtype)
+        .map_err(|error| failed(format!("table '{}': {error}", tensor.name)))?;
+    transaction
+        .row_tables
+        .push((tensor.name.clone(), RowTableHandle(Arc::new(table))));
+    Ok(true)
+}
+
 /// Stages weight materialization one resource at a time -- Memory Manager
 /// admission, then Provider write, then residency registration, each
 /// step's error propagated rather than discarded -- and either rolls back
@@ -252,6 +341,10 @@ pub(super) struct WeightMaterializationTransaction {
     pub(super) provider_binding: ProviderBinding,
     pub(super) executor: Arc<dyn ProviderExecutionApi>,
     pub(super) staged: Vec<StagedWeight>,
+    /// Tables registered to be read by row instead of staged
+    /// (`support-qwen38-flash-next`, design D8); published by `commit`,
+    /// dropped by `abort`.
+    pub(super) row_tables: Vec<(String, RowTableHandle)>,
 }
 
 pub(super) struct StagedWeight {
@@ -285,6 +378,7 @@ impl WeightMaterializationTransaction {
             provider_binding,
             executor,
             staged: Vec::new(),
+            row_tables: Vec::new(),
         })
     }
 
@@ -598,6 +692,13 @@ impl WeightMaterializationTransaction {
                 .model_instances_mut()
                 .instance_mut(instance)
                 .map_err(InferenceApiError::from)?;
+            for (name, table) in &self.row_tables {
+                model_instance
+                    .definition
+                    .resource_bindings
+                    .row_tables
+                    .insert(name.clone(), table.clone());
+            }
             for staged in &self.staged {
                 model_instance
                     .definition

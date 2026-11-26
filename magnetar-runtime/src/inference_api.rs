@@ -539,7 +539,16 @@ pub(crate) fn derive_effective_readiness_checks(
             .definition
             .required_weight_names
             .iter()
-            .all(|required| bindings.contains_key(required));
+            // A table read by row is bound without a resource
+            // (`support-qwen38-flash-next`, design D8).
+            .all(|required| {
+                bindings.contains_key(required)
+                    || model_instance
+                        .definition
+                        .resource_bindings
+                        .row_tables
+                        .contains_key(required)
+            });
     let provider_ready = checks.provider_ready
         && match &model_instance.definition.placement.provider {
             None => true,

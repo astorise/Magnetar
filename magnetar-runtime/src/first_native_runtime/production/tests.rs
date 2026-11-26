@@ -1397,6 +1397,33 @@ fn latent_attention_and_mixed_expert_layers_derive_their_weight_shapes() {
 /// norms with each block's gated residual (checkpoint `[out, in]` order)
 /// and the final mix, and an indexed attention layer adds its indexer's
 /// projection and norms.
+/// `support-qwen38-flash-next`, design D8: the tables a model keeps and reads
+/// by row are the n-gram embedding tables of the layers that declare one.
+#[test]
+fn the_row_addressed_tables_are_the_ngram_tables_of_the_declared_layers() {
+    assert!(row_addressed_tables(None).is_empty());
+    let mut config = crate::ModelArchitectureConfig::default();
+    assert!(row_addressed_tables(Some(&config)).is_empty());
+    config.decoder_extensions.ngram_embeddings = Some(crate::NgramEmbeddingConfig {
+        layers: vec![false, true, false, true],
+        ngram_size: 3,
+        heads_per_ngram: 2,
+        embedding_dim: 8,
+        conv_kernel: 4,
+        vocabulary_base: 40,
+        vocabulary_multiple: 8,
+        seed: 1,
+        eos_token: 0,
+    });
+    assert_eq!(
+        row_addressed_tables(Some(&config)),
+        std::collections::BTreeSet::from([
+            "layers.1.ple.table".to_string(),
+            "layers.3.ple.table".to_string()
+        ])
+    );
+}
+
 #[test]
 fn qwen4_exp_residual_streams_and_indexer_derive_their_weight_shapes() {
     let config = ModelArchitectureConfig {

@@ -2502,6 +2502,180 @@ fn stream_materialize_model_instance_weights_succeeds_and_reads_each_tensor_once
     );
 }
 
+/// A [`RecordingPayloadSource`] that can also map tensors, from the same
+/// bytes: `mapped` names the tensors it maps (others return `Ok(None)`), and
+/// `mapped_calls` records each mapping request.
+struct MappingPayloadSource {
+    inner: RecordingPayloadSource,
+    mapped: std::collections::BTreeSet<String>,
+    mapped_calls: std::sync::Mutex<Vec<String>>,
+    fail_mapping: bool,
+}
+
+#[derive(Debug)]
+struct MemoryMapping(Vec<u8>);
+
+impl MappedPayload for MemoryMapping {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), ProductionIngestionError> {
+        let start = offset as usize;
+        out.copy_from_slice(self.0.get(start..start + out.len()).ok_or_else(|| {
+            ProductionIngestionError::PayloadOutOfBounds {
+                identity: "memory".into(),
+            }
+        })?);
+        Ok(())
+    }
+
+    fn prefetch(&self, _spans: &[(u64, u64)]) {}
+}
+
+impl ProductionArtifactPayloadSource for MappingPayloadSource {
+    fn read_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Vec<u8>, ProductionIngestionError> {
+        self.inner.read_payload(range)
+    }
+
+    fn map_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+        self.mapped_calls
+            .lock()
+            .unwrap()
+            .push(range.identity.clone());
+        if self.fail_mapping {
+            return Err(ProductionIngestionError::PayloadUnavailable {
+                identity: range.identity.clone(),
+            });
+        }
+        if !self.mapped.contains(&range.identity) {
+            return Ok(None);
+        }
+        let bytes = self.inner.bytes_by_name[&range.identity].clone();
+        Ok(Some(Arc::new(MemoryMapping(bytes))))
+    }
+}
+
+fn mapping_source(mapped: &[&str], fail_mapping: bool) -> MappingPayloadSource {
+    MappingPayloadSource {
+        inner: RecordingPayloadSource::new(streaming_fixture_payload_bytes()),
+        mapped: mapped.iter().map(|name| name.to_string()).collect(),
+        mapped_calls: std::sync::Mutex::new(Vec::new()),
+        fail_mapping,
+    }
+}
+
+/// `support-qwen38-flash-next`, design D8: a table named as row-addressed is
+/// mapped, not read and not staged: it becomes a row table on the instance,
+/// holds no weight resource and no Memory Manager allocation, and reads its
+/// rows from the mapping.
+#[test]
+fn a_row_addressed_table_is_mapped_and_never_staged() {
+    let (mut runtime, instance, manifest, _executor) = streaming_materialization_fixture();
+    let source = mapping_source(&["weight.b"], false);
+    let allocated_before = active_allocation_bytes(&runtime);
+
+    stream_materialize_model_instance_weights_with_row_tables(
+        &mut runtime,
+        &instance,
+        "test",
+        &manifest.tensors,
+        &source,
+        &std::collections::BTreeSet::from(["weight.b".to_string()]),
+    )
+    .expect("the table is mapped");
+
+    let model_instance = runtime.model_instance(&instance).unwrap();
+    assert_eq!(
+        model_instance.lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+    let bindings = &model_instance.definition().resource_bindings;
+    assert!(
+        !bindings.weights.contains_key("weight.b"),
+        "no weight resource"
+    );
+    assert!(bindings.weights.contains_key("weight.a"));
+    assert!(bindings.weights.contains_key("weight.c"));
+    let table = model_instance.row_table("weight.b").expect("a row table");
+    assert_eq!((table.rows(), table.columns()), (2, 2));
+    assert_eq!(table.read_rows(&[1, 0]).unwrap(), [7.0, 8.0, 5.0, 6.0]);
+    assert_eq!(
+        source.inner.call_log(),
+        vec!["weight.a", "weight.c"],
+        "the table's bytes are never read whole"
+    );
+    // Two f32 weights of four values are all that was admitted.
+    assert_eq!(active_allocation_bytes(&runtime) - allocated_before, 2 * 16);
+}
+
+/// A source that cannot map a row-addressed table stages it as usual, so the
+/// bundle still loads.
+#[test]
+fn a_row_addressed_table_a_source_cannot_map_is_staged_densely() {
+    let (mut runtime, instance, manifest, _executor) = streaming_materialization_fixture();
+    let source = mapping_source(&[], false);
+
+    stream_materialize_model_instance_weights_with_row_tables(
+        &mut runtime,
+        &instance,
+        "test",
+        &manifest.tensors,
+        &source,
+        &std::collections::BTreeSet::from(["weight.b".to_string()]),
+    )
+    .expect("the table is staged");
+
+    let model_instance = runtime.model_instance(&instance).unwrap();
+    assert!(
+        model_instance
+            .definition()
+            .resource_bindings
+            .weights
+            .contains_key("weight.b")
+    );
+    assert!(model_instance.row_table("weight.b").is_none());
+    assert_eq!(
+        source.inner.call_log(),
+        vec!["weight.a", "weight.b", "weight.c"]
+    );
+}
+
+/// A mapping that fails fails the load, and nothing it staged stays bound.
+#[test]
+fn a_failed_mapping_fails_the_load_and_binds_nothing() {
+    let (mut runtime, instance, manifest, _executor) = streaming_materialization_fixture();
+    let source = mapping_source(&["weight.b"], true);
+
+    let error = stream_materialize_model_instance_weights_with_row_tables(
+        &mut runtime,
+        &instance,
+        "test",
+        &manifest.tensors,
+        &source,
+        &std::collections::BTreeSet::from(["weight.b".to_string()]),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, InferenceApiError::ModelLoadingFailed { .. }),
+        "{error:?}"
+    );
+
+    let model_instance = runtime.model_instance(&instance).unwrap();
+    assert_eq!(
+        model_instance.lifecycle(),
+        ModelInstanceLifecycleState::Failed
+    );
+    let bindings = &model_instance.definition().resource_bindings;
+    assert!(bindings.weights.is_empty() && bindings.row_tables.is_empty());
+}
+
 /// `execute-direct-quantized-weights`: a block-quantized, transposed-storage
 /// weight is first offered packed; a Provider that declines it (Reference
 /// CPU computes only from f32) receives the dequantized weight in its
