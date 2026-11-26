@@ -1,8 +1,9 @@
 # External Modules
 
 Magnetar's Model Components, Providers, and Formats live in separate
-repositories, pinned into this repository as git submodules under
-`components/`, `providers/`, and `formats/`. This is a normative
+repositories, pinned into this repository by commit in `repositories.lock` and put
+at their paths (`components/`, `providers/`, `loaders/` and `formats/`) by
+`tools/repositories.sh fetch`. This is a normative
 requirement, not only a packaging convention -- see `project-architecture`'s
 "Model Components, Providers, and Formats Are Externalized" requirement
 (`externalize-runtime-extension-modules`), which also names the one
@@ -69,12 +70,14 @@ until those tests move out of the crate.
   the one who decides when to cut a release and what that release's
   version means for that module.
 - **Magnetar pins, not floats.** This repository never depends on a
-  module's floating branch tip; every module is a `160000` gitlink pinned
-  to one exact commit (see `reach-architecture-freeze-1` task 15.1, and
-  its own note about the `.gitmodules`-alone failure mode this pinning
-  discipline exists to prevent). Advancing a module's pin in this
+  module's floating branch tip; every module is pinned to one exact
+  commit in `repositories.lock` (see `reach-architecture-freeze-1` task
+  15.1: a pin that names only a repository, not a commit, is the failure
+  mode this discipline exists to prevent; the lock file's own check
+  rejects anything but a full commit). Advancing a module's pin in this
   repository is a change to *this* repository (a normal commit touching
-  the gitlink), reviewed the same way any other Magnetar change is,
+  the lock file, or `tools/repositories.sh bump <path> <commit>`),
+  reviewed the same way any other Magnetar change is,
   independent of whether the module repository itself calls the commit
   being pinned to a "release."
 - **This repository owns compatibility, not the module.** Whether a given
@@ -104,7 +107,7 @@ Two levels of checks cover a module (the `submodule-ci` specification):
 Module CI is one reusable workflow, `.github/workflows/submodule-ci.yml`
 in this repository, called from a short workflow in each module
 repository. It builds the module inside a Magnetar checkout, at its
-submodule path, and runs formatting, Clippy, `cargo test --locked` and
+path, and runs formatting, Clippy, `cargo test --locked` and
 `cargo-deny`.
 
 - **Which Magnetar revision.** The branch of this repository named like

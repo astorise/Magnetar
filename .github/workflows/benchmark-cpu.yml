@@ -40,7 +40,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Initialize Magnetar dependencies
-        run: git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf components/laya components/modernbert components/nemotron components/olala
+        run: tools/repositories.sh fetch providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf components/laya components/modernbert components/nemotron components/olala
       - name: Record CPU and run all engines sequentially
         shell: bash
         run: |

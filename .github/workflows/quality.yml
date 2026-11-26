@@ -381,8 +381,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Checkout Component submodules
-        run: git submodule update --init -- components/qwen components/llama components/nemotron components/gemma components/kimi components/mistral components/deepseek components/glm components/olala components/kev components/laya components/modernbert components/smollm components/olmo
+      - name: Fetch the pinned Component repositories
+        run: tools/repositories.sh fetch components/qwen components/llama components/nemotron components/gemma components/kimi components/mistral components/deepseek components/glm components/olala components/kev components/laya components/modernbert components/smollm components/olmo
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -437,7 +437,7 @@ jobs:
           MAGNETAR_MODERNBERT_TEST_COMPONENT: ${{ runner.temp }}/modernbert.component.wasm
         run: cargo test --locked -p magnetar-runtime modernbert_component_graph_matches_pinned_transformers
       - name: Checkout SmolLM2 numerical test dependencies
-        run: git submodule update --init -- providers/cpu providers/cuda loaders/huggingface loaders/gguf formats/gguf formats/safetensors
+        run: tools/repositories.sh fetch providers/cpu providers/cuda loaders/huggingface loaders/gguf formats/gguf formats/safetensors
       - name: Build activation-validated Qwen, Llama and DeepSeek components
         shell: bash
         run: |
@@ -516,8 +516,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Checkout Format submodules
-        run: git submodule update --init -- formats/gguf formats/safetensors
+      - name: Fetch the pinned Format repositories
+        run: tools/repositories.sh fetch formats/gguf formats/safetensors
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -560,8 +560,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Checkout Provider submodules
-        run: git submodule update --init -- providers/cpu providers/cuda providers/rocm providers/metal providers/wgpu providers/openvino providers/tpu providers/qnn
+      - name: Fetch the pinned Provider repositories
+        run: tools/repositories.sh fetch providers/cpu providers/cuda providers/rocm providers/metal providers/wgpu providers/openvino providers/tpu providers/qnn
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -617,21 +617,41 @@ jobs:
       - name: Check the QNN (Qualcomm) Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/qnn/Cargo.toml check
 
-  # Full conformance (task 15.9): the original, unsplit job -- checks out
-  # every submodule via `submodules: recursive` and re-runs the same
+  # The repositories Magnetar pins (`repositories.lock`): the lock file is
+  # well-formed, the tool that puts each repository at its pin works, and every
+  # pinned commit can really be fetched from its repository (a pin on a commit
+  # that was force-pushed away or never pushed would otherwise show up only in
+  # the integration jobs below, as a failure to build).
+  repositories:
+    name: quality / repositories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check the lock file
+        run: tools/repositories.sh check
+      - name: Test the tool against throwaway repositories
+        run: tools/repositories_test.sh
+      - name: Fetch every pinned repository at its commit
+        run: tools/repositories.sh fetch
+      - name: Every checkout is at its pin
+        run: tools/repositories.sh status
+
+  # Full conformance (task 15.9): the original, unsplit job -- fetches every
+  # pinned repository (`tools/repositories.sh fetch`) and re-runs the same
   # build/test loop across all six, as a single comprehensive gate
   # alongside (not instead of) the three narrower tier jobs above. Some
   # redundancy with those jobs is intentional: a tier job gives fast,
   # scoped feedback when only one area changes, while this job proves the
-  # full submodule set still integrates together.
+  # full set of pinned repositories still integrates together.
   submodule-integration:
     name: quality / submodule integration
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout with submodules
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: recursive
+      - name: Fetch the pinned repositories
+        run: tools/repositories.sh fetch
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -833,10 +853,10 @@ jobs:
     name: quality / cli boundary
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout with submodules
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: recursive
+      - name: Fetch the pinned repositories
+        run: tools/repositories.sh fetch
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data

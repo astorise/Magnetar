@@ -1,0 +1,33 @@
+# Repositories pinned by Magnetar: the Components, Providers, Loaders and Formats that live in
+# repositories of their own.
+#
+# One per line: <path> <url> <commit>. `tools/repositories.sh fetch` puts each at its path, at exactly
+# that commit; `tools/repositories.sh bump <path> <commit>` moves a pin. A pin is a commit, never a
+# branch or a tag, so that a checkout of Magnetar names the exact code it was tested with.
+
+components/deepseek https://github.com/astorise/Magnetar-component-DeepSeek be4009670283b049a0cf8af2f6ed1b9be0623aea
+components/gemma https://github.com/astorise/Magnetar-component-Gemma a0143b184a5443f9a9f132d677a3f58aa51ae77b
+components/glm https://github.com/astorise/Magnetar-component-GLM f885038a8516ea2f88bc4733ded18218b1884afe
+components/kev https://github.com/astorise/Magnetar-component-Kev 8e7de89577c4ec5871ea4b70415aa1084d0574ba
+components/kimi https://github.com/astorise/Magnetar-component-Kimi 4e9f18edf647488e607207c5b0b9d5b8fdee61e0
+components/laya https://github.com/astorise/Magnetar-component-Laya ec1699369332bfdd65f9b5aa7954d99a7643a8e9
+components/llama https://github.com/astorise/Magnetar-component-Llama 89ff287e582d2bb46123a73074f8e256dd8595d9
+components/mistral https://github.com/astorise/Magnetar-component-Mistral f1c22dc8d0c7f37fc75d2b30aeab0ff20fd6ed35
+components/modernbert https://github.com/astorise/Magnetar-component-ModernBERT eaec4c3aebd7b13cdb9f51a8fd3cf160bd05c1d6
+components/nemotron https://github.com/astorise/Magnetar-component-Nemotron 160f0aa5db98744f04a95e084f6582aad0c63877
+components/olala https://github.com/astorise/Magnetar-component-Olala 12e85aa1bdc449ad43ee61f931c5389f2a4f221f
+components/olmo https://github.com/astorise/Magnetar-component-OLMo 74f3ffdb02b63b76b9545a5f69f7f61901591c57
+components/qwen https://github.com/astorise/Magnetar-component-Qwen 5d3dc034723f36d2222e0596bedd6681df58f43b
+components/smollm https://github.com/astorise/Magnetar-component-SmolLM c7e602af48f1d87cafdbfe73bd530fb7c4cff259
+formats/gguf https://github.com/astorise/Magnetar-format-GGUF 6c6d19efb4576685c34d01cc17f3f65872e24708
+formats/safetensors https://github.com/astorise/Magnetar-format-safetensors aef492537e5655b7fe7443f5a5c32dc26a0d1b23
+loaders/gguf https://github.com/astorise/Magnetar-loader-GGUF 5820df15d797d86528df3147d216aae0329169e8
+loaders/huggingface https://github.com/astorise/Magnetar-loader-HuggingFace 1cffbadaae54f9117f569af849c75579bc82fcd0
+providers/cpu https://github.com/astorise/Magnetar-provider-CPU a388648444af8ca44d20e4c48f2940fb411c0f22
+providers/cuda https://github.com/astorise/Magnetar-provider-CUDA 0ef2e72948e9dd9971bdef13b5099a076b68431e
+providers/metal https://github.com/astorise/Magnetar-provider-Metal fe2228869d41945c6fafdfa8ca8eb91ae2711026
+providers/openvino https://github.com/astorise/Magnetar-provider-OpenVINO a2080f712ec04610db10a15e00d36d5de1dc9052
+providers/qnn https://github.com/astorise/Magnetar-provider-qnn 6ae055123a12a4e20fd455c7011f86582a84651e
+providers/rocm https://github.com/astorise/Magnetar-provider-ROCm a8c53a65306c672c7146d31c37cb7d297cf174f3
+providers/tpu https://github.com/astorise/Magnetar-provider-TPU 6740bf376a11dbba2a05f3dc7dbd60d5e2370b90
+providers/wgpu https://github.com/astorise/Magnetar-provider-WGPU a5c91aef3020304d085cbc2075d0166003b8ea04

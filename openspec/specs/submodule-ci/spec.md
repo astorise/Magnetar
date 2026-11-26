@@ -33,7 +33,7 @@ The checks SHALL be defined once, in a reusable workflow in the Magnetar reposit
 
 ### Requirement: Magnetar Revision Used By Module Checks
 
-A module that depends on the Runtime SHALL be built inside a Magnetar checkout, at its submodule path. The checkout SHALL use Magnetar's branch with the same name as the pull request's head branch when it exists, and Magnetar's default branch otherwise. The run SHALL state which Magnetar revision it used.
+A module that depends on the Runtime SHALL be built inside a Magnetar checkout, at its path. The checkout SHALL use Magnetar's branch with the same name as the pull request's head branch when it exists, and Magnetar's default branch otherwise. The run SHALL state which Magnetar revision it used.
 
 #### Scenario: Module-only change
 

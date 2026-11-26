@@ -79,7 +79,7 @@ Detailed architecture notes:
 
 ## Repositories
 
-Magnetar is the Runtime: the core crates, their tests, the tooling and the release pipeline. Model families, hardware, checkpoint loading and formats live in repositories of their own, pinned here as submodules (the two shared crates are git dependencies of the Components, pinned by commit).
+Magnetar is the Runtime: the core crates, their tests, the tooling and the release pipeline. Model families, hardware, checkpoint loading and formats live in repositories of their own, pinned here by commit in [`repositories.lock`](repositories.lock) (the two shared crates are git dependencies of the Components, pinned by commit too).
 
 | Path | Repository | Role |
 | --- | --- | --- |
@@ -109,8 +109,16 @@ Magnetar is the Runtime: the core crates, their tests, the tooling and the relea
 | `loaders/huggingface` | [Magnetar-loader-HuggingFace](https://github.com/astorise/Magnetar-loader-HuggingFace) | Loader: Hugging Face checkpoints |
 | `formats/gguf` | [Magnetar-format-GGUF](https://github.com/astorise/Magnetar-format-GGUF) | Format: GGUF |
 | `formats/safetensors` | [Magnetar-format-safetensors](https://github.com/astorise/Magnetar-format-safetensors) | Format: safetensors |
-| - | [magnetar-component-sdk](https://github.com/astorise/magnetar-component-sdk) | Shared crate for Model Components: the graph description, the sink and its adapter (git dependency pinned by commit, not a submodule) |
-| - | [magnetar-component-api](https://github.com/astorise/magnetar-component-api) | The Model Component contract: every released version of `magnetar:model-component-graph` and its guest bindings (git dependency pinned by commit, not a submodule) |
+| - | [magnetar-component-sdk](https://github.com/astorise/magnetar-component-sdk) | Shared crate for Model Components: the graph description, the sink and its adapter (git dependency of the Components, pinned by commit) |
+| - | [magnetar-component-api](https://github.com/astorise/magnetar-component-api) | The Model Component contract: every released version of `magnetar:model-component-graph` and its guest bindings (git dependency of the Components, pinned by commit) |
+
+To work on the whole tree, put every pinned repository at its path with
+
+```bash
+tools/repositories.sh fetch
+```
+
+(or `fetch components/qwen providers/cpu` for some of them). Each one is a normal clone, at exactly the commit the lock file names; `tools/repositories.sh status` says whether they still are, `tools/repositories.sh bump <path> <commit>` moves a pin, and a checkout with local changes is never overwritten. CI uses the same tool, so a Magnetar revision names the exact code it was tested with.
 
 Each repository has its own `openspec/` directory with the specifications and changes that belong to it, and the agent folders (`.agent`, `.claude`, `.codex/skills`, `.gemini`, `.opencode`) that drive them. A change that also reaches the core is coordinated by a change of the same name in `openspec/changes/` here, which links to its companion in the other repository.
 
