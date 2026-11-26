@@ -1,7 +1,7 @@
 # submodule-ci Specification
 
 ## Purpose
-This specification defines the checks each Component, Provider, Format and Loader repository runs in its own CI, the Magnetar revision those checks build against, the runners they use, and how they relate to Magnetar's own integration jobs.
+This specification defines the checks each Component, Provider, Format and Loader repository runs in its own CI, the Magnetar revision those checks build against, the runners they use, and how they relate to Magnetar's own integration jobs. It covers the Provider kernel timings and the Component qualification against the Runtime, which are defined once in Magnetar and run from the module repositories.
 ## Requirements
 ### Requirement: Module Repositories Run Their Own Tests
 
@@ -33,7 +33,7 @@ The checks SHALL be defined once, in a reusable workflow in the Magnetar reposit
 
 ### Requirement: Magnetar Revision Used By Module Checks
 
-A module that depends on the Runtime SHALL be built inside a Magnetar checkout, at its submodule path. The checkout SHALL use Magnetar's branch with the same name as the pull request's head branch when it exists, and Magnetar's default branch otherwise. The run SHALL state which Magnetar revision it used.
+A module that depends on the Runtime SHALL be built inside a Magnetar checkout, at its path. The checkout SHALL use Magnetar's branch with the same name as the pull request's head branch when it exists, and Magnetar's default branch otherwise. The run SHALL state which Magnetar revision it used.
 
 #### Scenario: Module-only change
 
@@ -68,6 +68,44 @@ The CUDA Provider repository SHALL run its tests, including the hardware-gated o
 
 - **WHEN** the GPU job starts and no GPU is visible
 - **THEN** the job fails
+
+### Requirement: Provider Kernel Timings Run In The Provider Repository
+
+The checks that exercise a Provider alone and measure rather than gate, such as the Device time of its kernels, SHALL run in that Provider's own repository, on its own GPU runner, through one reusable workflow defined in Magnetar. They SHALL run on dispatch, SHALL NOT be steps of Magnetar's scheduled run of the pinned combination, and SHALL report their numbers in the job's log.
+
+#### Scenario: Timings dispatched in a Provider repository
+
+- **WHEN** the timing workflow of a Provider repository is dispatched
+- **THEN** each named ignored test of the Provider runs in release mode on the repository's GPU runner and prints its timings in the log
+
+#### Scenario: One timing fails
+
+- **WHEN** a timing test fails or runs past its limit
+- **THEN** the remaining timing tests still run and the job fails at the end
+
+#### Scenario: No GPU on the runner
+
+- **WHEN** the timing job starts and no GPU is visible
+- **THEN** the job fails
+
+### Requirement: Component Qualification Against The Runtime
+
+A Component repository SHALL be able to learn, on its pull requests, whether the Runtime accepts the artifact the Component builds. One reusable workflow defined in Magnetar SHALL check Magnetar out, put the Component under test at its path in place of the pinned one, build it for the Component Model, validate it, and run the Runtime's tests that consume it. Those tests SHALL stay in Magnetar. The workflow SHALL refuse a Component it has no tests for.
+
+#### Scenario: Pull request in a Component repository
+
+- **WHEN** a pull request is opened or updated in a Component repository that calls the workflow
+- **THEN** the Component of that pull request is built, validated and run through the Runtime's tests, and the result reports on that pull request
+
+#### Scenario: Component the workflow does not know
+
+- **WHEN** the workflow is called for a Component that has no entry in the qualification script
+- **THEN** it fails and names the Components it knows
+
+#### Scenario: Branch qualified before the Component repository calls the workflow
+
+- **WHEN** the workflow is dispatched in Magnetar with a Component repository and a branch
+- **THEN** that branch is qualified exactly as a pull request in the Component repository would be
 
 ### Requirement: Module Checks Use No Secret
 

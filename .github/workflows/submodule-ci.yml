@@ -11,7 +11,7 @@ name: Module CI
 #       with:
 #         module-path: providers/cpu
 #
-# A module is built inside a Magnetar checkout, at its submodule path: the
+# A module is built inside a Magnetar checkout, at its path: the
 # modules that depend on the Runtime do so by relative path
 # (`../../magnetar-runtime`), and the Rust toolchain is the one Magnetar
 # pins. Magnetar is checked out at the branch named like the module's branch
@@ -24,12 +24,12 @@ on:
   workflow_call:
     inputs:
       module-path:
-        description: The module's submodule path in Magnetar, e.g. providers/cpu.
+        description: The module's path in Magnetar, e.g. providers/cpu.
         required: true
         type: string
       siblings:
         description: >-
-          Space-separated submodule paths this module depends on by relative
+          Space-separated module paths this module depends on by relative
           path, checked out at the commits Magnetar pins.
         required: false
         type: string
@@ -107,7 +107,12 @@ jobs:
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086 # one path per word, by design
-          git submodule update --init -- $SIBLINGS
+          if [ -x tools/repositories.sh ]; then
+            tools/repositories.sh fetch $SIBLINGS
+          else
+            # A Magnetar revision from before the repositories were pinned in a lock file.
+            git submodule update --init -- $SIBLINGS
+          fi
       - name: Checkout the module under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -219,7 +224,12 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/Magnetar"
           cd Magnetar
           # shellcheck disable=SC2086 # one path per word, by design
-          git submodule update --init -- $SIBLINGS
+          if [ -x tools/repositories.sh ]; then
+            tools/repositories.sh fetch $SIBLINGS
+          else
+            # A Magnetar revision from before the repositories were pinned in a lock file.
+            git submodule update --init -- $SIBLINGS
+          fi
       - name: Checkout the module under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

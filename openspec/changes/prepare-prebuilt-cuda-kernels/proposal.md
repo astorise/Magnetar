@@ -80,3 +80,9 @@ Loading a precompiled CUBIN is not compiling a source, and the RFC asks to keep 
 - Unloading a module in use, hot swap or rollback beyond the registry's existing generation calls (lot 2).
 - Kernels whose launch geometry cannot be expressed declaratively (a kernel needing host-side planning stays built in).
 - Any claim of speedup before the measurement.
+
+## Companion changes
+
+The delta to a capability that now lives in its own repository moved there, with a companion change of the same name; this change keeps the rest.
+
+- `cuda-provider`: the delta is in https://github.com/astorise/Magnetar-provider-CUDA/tree/HEAD/openspec/changes/prepare-prebuilt-cuda-kernels/ (companion change of the same name)

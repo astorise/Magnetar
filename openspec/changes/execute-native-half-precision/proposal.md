@@ -29,7 +29,7 @@ Existing contracts to reuse:
 - [`tensor`](../../specs/tensor/spec.md)
 - [`model-loading`](../../specs/model-loading/spec.md)
 - [`execution-graph`](../../specs/execution-graph/spec.md)
-- [`cuda-provider`](../../specs/cuda-provider/spec.md)
+- [`cuda-provider`](https://github.com/astorise/Magnetar-provider-CUDA/blob/HEAD/openspec/specs/cuda-provider/spec.md)
 - [`reference-cpu`](../../specs/reference-cpu/spec.md)
 - [`first-native-execution-profile`](../../specs/first-native-execution-profile/spec.md)
 

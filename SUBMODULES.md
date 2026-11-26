@@ -1,8 +1,9 @@
 # External Modules
 
 Magnetar's Model Components, Providers, and Formats live in separate
-repositories, pinned into this repository as git submodules under
-`components/`, `providers/`, and `formats/`. This is a normative
+repositories, pinned into this repository by commit in `repositories.lock` and put
+at their paths (`components/`, `providers/`, `loaders/` and `formats/`) by
+`tools/repositories.sh fetch`. This is a normative
 requirement, not only a packaging convention -- see `project-architecture`'s
 "Model Components, Providers, and Formats Are Externalized" requirement
 (`externalize-runtime-extension-modules`), which also names the one
@@ -69,12 +70,14 @@ until those tests move out of the crate.
   the one who decides when to cut a release and what that release's
   version means for that module.
 - **Magnetar pins, not floats.** This repository never depends on a
-  module's floating branch tip; every module is a `160000` gitlink pinned
-  to one exact commit (see `reach-architecture-freeze-1` task 15.1, and
-  its own note about the `.gitmodules`-alone failure mode this pinning
-  discipline exists to prevent). Advancing a module's pin in this
+  module's floating branch tip; every module is pinned to one exact
+  commit in `repositories.lock` (see `reach-architecture-freeze-1` task
+  15.1: a pin that names only a repository, not a commit, is the failure
+  mode this discipline exists to prevent; the lock file's own check
+  rejects anything but a full commit). Advancing a module's pin in this
   repository is a change to *this* repository (a normal commit touching
-  the gitlink), reviewed the same way any other Magnetar change is,
+  the lock file, or `tools/repositories.sh bump <path> <commit>`),
+  reviewed the same way any other Magnetar change is,
   independent of whether the module repository itself calls the commit
   being pinned to a "release."
 - **This repository owns compatibility, not the module.** Whether a given
@@ -99,12 +102,14 @@ Two levels of checks cover a module (the `submodule-ci` specification):
 |---|---|---|
 | Module CI | the module's repository, on each pull request and push to `main` | does this module change pass its own checks against the current Runtime? |
 | Integration jobs | this repository's `quality.yml`, on each pull request | does the combination this repository pins work together? |
+| Component qualification | the Component's repository, on each pull request (`component-qualification.yml`, defined here) | does the Runtime accept the artifact this Component builds? |
+| Kernel timings | the Provider's repository, on dispatch (`submodule-gpu-timings.yml`, defined here) | how long does each kernel of this Provider take on real hardware? |
 | Daily GPU run | this repository's `gpu-runner-smoke.yml` | does the pinned combination work on real hardware, long campaigns included? |
 
 Module CI is one reusable workflow, `.github/workflows/submodule-ci.yml`
 in this repository, called from a short workflow in each module
 repository. It builds the module inside a Magnetar checkout, at its
-submodule path, and runs formatting, Clippy, `cargo test --locked` and
+path, and runs formatting, Clippy, `cargo test --locked` and
 `cargo-deny`.
 
 - **Which Magnetar revision.** The branch of this repository named like
@@ -124,6 +129,22 @@ submodule path, and runs formatting, Clippy, `cargo test --locked` and
   `arc-gpu-magnetar-provider-cuda`, registered for the CUDA Provider
   repository; the job uses the same container image as
   `gpu-runner-smoke.yml` unless the caller names another one.
+- **Qualification of a Component.** A Component repository's own checks
+  see only its graph code. `component-qualification.yml` checks Magnetar out,
+  puts the Component of the pull request at its path in place of the pinned
+  one, builds it for the Component Model and runs the Runtime's tests that
+  read it (`tools/qualify_component.sh list` says which, for each Component).
+  The tests stay here; the Component repository only calls the workflow with
+  its name. It can also be dispatched here with a Component repository and a
+  branch, to qualify a branch before the repository calls it. The
+  Components it knows today are `llama` and `smollm`; adding one is a `case`
+  in `tools/qualify_component.sh`.
+- **Kernel timings of a Provider.** The numbers a Provider alone can give
+  (the Device time of each kernel, against the bytes it reads) are measured in
+  its own repository: `providers/cuda`'s `kernel-timings.yml` dispatches
+  `submodule-gpu-timings.yml` on the repository's GPU runner, with the
+  ignored tests to run. They are no longer steps of `gpu-runner-smoke.yml`,
+  which keeps what needs the combination.
 - **Components.** `components/qwen` and `components/llama` call the
   workflow with Clippy off: their package names
   (`magnetar-component-Qwen`, `magnetar-component-Llama`) trip the

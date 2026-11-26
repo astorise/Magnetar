@@ -492,7 +492,7 @@ Il ne doit pas être archivé maintenant.
 
 Au minimum, les tâches de validation hardware/runner et OOM ne sont pas toutes closes, et l'audit ajoute surtout les écarts normatifs de résidence/mouvement ci-dessus.
 
-La spec canonique `openspec/specs/cuda-provider/spec.md` ne doit donc pas être promue comme baseline réalisée avant fermeture des P0.
+La spec canonique https://github.com/astorise/Magnetar-provider-CUDA/blob/HEAD/openspec/specs/cuda-provider/spec.md ne doit donc pas être promue comme baseline réalisée avant fermeture des P0.
 
 ---
 
