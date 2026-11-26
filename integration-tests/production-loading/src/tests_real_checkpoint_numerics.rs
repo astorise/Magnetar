@@ -495,8 +495,14 @@ fn real_checkpoint_logits_match_the_reference_corpus() {
         );
         eprintln!("[{provider_name}] {replays} of {REFERENCE_NEW_TOKENS} steps replayed");
         if provider_name == "cuda" {
-            // Prefill and the first two decode steps run per node.
-            assert_eq!(replays, REFERENCE_NEW_TOKENS as u64 - 3);
+            // This is the second request on its pooled store set, so the
+            // first one's recording is already there
+            // (`reuse-decode-captures-across-requests`): the prefill runs per
+            // node, the first decode step is before the recorded position and
+            // captures again, and every later step replays. A request that
+            // recorded its own steps ran two decode steps per node, hence
+            // three steps in all (`REFERENCE_NEW_TOKENS - 3` replays).
+            assert_eq!(replays, REFERENCE_NEW_TOKENS as u64 - 2);
         }
 
         check_lifecycle(
