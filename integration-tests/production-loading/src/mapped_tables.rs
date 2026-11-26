@@ -1,8 +1,13 @@
-//! A payload source that maps the n-gram tables of a checkpoint instead of
-//! letting the Runtime read and stage them (`support-qwen38-flash-next`,
-//! task 4.4, design D8): the Runtime then holds no copy of a table and reads
-//! only the rows a step names. The mapping serves the same bytes the
-//! loader's source reads, from memory, and counts what is asked of it.
+//! Payload sources that decide how the n-gram tables of a checkpoint reach
+//! the Runtime (`support-qwen38-flash-next`, task 4.4, design D8), and count
+//! what the Runtime asks of them:
+//! - `mapping`: the source maps the tables itself, from memory, serving the
+//!   bytes the loader's source reads, so the Runtime holds no copy of a table
+//!   and reads only the rows a step names;
+//! - `observing`: the loader's own source answers (its real file mapping),
+//!   and this one only records what was mapped and what was read whole;
+//! - `refusing`: the tables cannot be mapped, so the Runtime reads and stages
+//!   them whole, as it does for every other weight: the dense baseline.
 
 use magnetar_runtime::production_model_ingestion::{
     MappedPayload, ProductionArtifactPayloadSource, ProductionIngestionError,
@@ -29,27 +34,62 @@ pub(crate) struct TableUse {
     pub(crate) prefetched_spans: AtomicU64,
 }
 
-/// `inner`, with every tensor whose name ends in `suffix` mappable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Mapping,
+    Observing,
+    Refusing,
+}
+
+/// `inner`, with every tensor whose name ends in `suffix` treated as `mode`
+/// says.
 pub(crate) struct MappedTables {
     inner: Arc<dyn ProductionArtifactPayloadSource>,
     suffix: &'static str,
+    mode: Mode,
     usage: Arc<TableUse>,
 }
 
 impl MappedTables {
-    pub(crate) fn new(
+    fn with_mode(
         inner: Arc<dyn ProductionArtifactPayloadSource>,
         suffix: &'static str,
+        mode: Mode,
     ) -> (Self, Arc<TableUse>) {
         let usage = Arc::new(TableUse::default());
         (
             Self {
                 inner,
                 suffix,
+                mode,
                 usage: Arc::clone(&usage),
             },
             usage,
         )
+    }
+
+    /// The source maps the tables itself, from memory.
+    pub(crate) fn mapping(
+        inner: Arc<dyn ProductionArtifactPayloadSource>,
+        suffix: &'static str,
+    ) -> (Self, Arc<TableUse>) {
+        Self::with_mode(inner, suffix, Mode::Mapping)
+    }
+
+    /// `inner` answers, and the tables' mappings and whole reads are counted.
+    pub(crate) fn observing(
+        inner: Arc<dyn ProductionArtifactPayloadSource>,
+        suffix: &'static str,
+    ) -> (Self, Arc<TableUse>) {
+        Self::with_mode(inner, suffix, Mode::Observing)
+    }
+
+    /// The tables cannot be mapped: they are read whole.
+    pub(crate) fn refusing(
+        inner: Arc<dyn ProductionArtifactPayloadSource>,
+        suffix: &'static str,
+    ) -> (Self, Arc<TableUse>) {
+        Self::with_mode(inner, suffix, Mode::Refusing)
     }
 }
 
@@ -107,19 +147,43 @@ impl ProductionArtifactPayloadSource for MappedTables {
         range: &ProductionPayloadRange,
     ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
         if !range.identity.ends_with(self.suffix) {
-            return Ok(None);
+            return self.inner.map_payload(range);
         }
-        self.usage
-            .mapped
-            .lock()
-            .unwrap()
-            .push(range.identity.clone());
-        // The mapping's bytes come from the loader's own source, which
-        // verifies the range's digest.
-        let bytes = self.inner.read_payload(range)?;
-        Ok(Some(Arc::new(MemoryMapping {
-            bytes,
-            usage: Arc::clone(&self.usage),
-        })))
+        match self.mode {
+            Mode::Refusing => Ok(None),
+            Mode::Observing => {
+                let mapping = self.inner.map_payload(range)?;
+                if mapping.is_some() {
+                    self.usage
+                        .mapped
+                        .lock()
+                        .unwrap()
+                        .push(range.identity.clone());
+                }
+                Ok(mapping)
+            }
+            Mode::Mapping => {
+                self.usage
+                    .mapped
+                    .lock()
+                    .unwrap()
+                    .push(range.identity.clone());
+                // The mapping's bytes come from the loader's own source,
+                // which verifies the range's digest.
+                let bytes = self.inner.read_payload(range)?;
+                Ok(Some(Arc::new(MemoryMapping {
+                    bytes,
+                    usage: Arc::clone(&self.usage),
+                })))
+            }
+        }
     }
+}
+
+/// Drops the page cache so that a table's pages are read from the disk
+/// (best effort: it needs the right to write `/proc/sys/vm/drop_caches`).
+/// Whether it worked.
+pub(crate) fn drop_page_cache() -> bool {
+    let _ = std::process::Command::new("sync").status();
+    std::fs::write("/proc/sys/vm/drop_caches", "3").is_ok()
 }

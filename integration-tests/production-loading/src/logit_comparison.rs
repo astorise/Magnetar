@@ -52,6 +52,31 @@ pub(crate) fn compare_with_reference(
     )
 }
 
+/// How the checkpoint's tables reach the Runtime (`mapped_tables`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TableAccess {
+    /// The loader's source as it is.
+    AsIngested,
+    /// The loader's source, recording what is mapped and what is read whole
+    /// from the tables whose names end in the suffix.
+    Observed(&'static str),
+    /// A test source maps the tables from memory.
+    Mapped(&'static str),
+    /// A test source refuses to map the tables: they are read and staged
+    /// whole.
+    Dense(&'static str),
+}
+
+/// Where a run's time went: the loader reading the bundle (it hashes every
+/// tensor, in blocks), the Runtime loading the model from it, then each
+/// step's logits (the prefill, then one per decoded token).
+#[derive(Debug, Default)]
+pub(crate) struct Timings {
+    pub(crate) ingest: std::time::Duration,
+    pub(crate) load: std::time::Duration,
+    pub(crate) steps: Vec<std::time::Duration>,
+}
+
 /// The two CPU Providers of `providers/cpu`, labelled: its Reference CPU
 /// Provider (packed weights expanded to f32 at load) and the optimized CPU
 /// Provider computing from the packed weights with f32 activations (its
@@ -132,7 +157,7 @@ fn compare_configured(
         Option<magnetar_runtime::ComponentDigest>,
     ),
 ) -> (f32, ProductionLoadedModel) {
-    let (difference, model, _) = compare_mapping(
+    let (difference, model, _, _) = compare_mapping(
         provider,
         provider_label,
         family_directory,
@@ -140,34 +165,48 @@ fn compare_configured(
         format,
         family,
         options,
-        None,
+        TableAccess::AsIngested,
     );
     (difference, model)
 }
 
-/// [`compare_on`] with the tables whose names end in `suffix` mapped by the
-/// payload source instead of read and staged by the Runtime
-/// (`support-qwen38-flash-next` task 4.4): the largest logit difference, and
-/// what the Runtime asked of the tables.
-pub(crate) fn compare_with_mapped_tables(
+/// [`compare_on`] with the tables whose names end in `suffix` served as
+/// `access` says (`support-qwen38-flash-next` task 4.4), with the page cache
+/// dropped before it generates when `cold`: the largest logit difference,
+/// what the Runtime asked of the tables, and the run's timings.
+pub(crate) fn compare_with_tables(
     provider: Arc<dyn Provider>,
     provider_label: &str,
     family_directory: &str,
     variant: &str,
     family: &str,
-    suffix: &'static str,
-) -> (f32, Arc<crate::mapped_tables::TableUse>) {
-    let (difference, _, usage) = compare_mapping(
+    access: TableAccess,
+    cold: bool,
+) -> (f32, Option<Arc<crate::mapped_tables::TableUse>>, Timings) {
+    // The loader hashes every tensor while it reads the bundle, which brings
+    // the table's pages into the cache: a cold run drops them again once the
+    // model is loaded, just before it generates.
+    let (difference, _, usage, timings) = compare_mapping(
         provider,
         provider_label,
         family_directory,
         variant,
         Format::HuggingFace,
         family,
-        (|_| {}, None),
-        Some(suffix),
+        (
+            |_: &mut ProductionLoadedModel| {
+                if cold {
+                    assert!(
+                        crate::mapped_tables::drop_page_cache(),
+                        "a cold run needs the right to drop the page cache"
+                    );
+                }
+            },
+            None,
+        ),
+        access,
     );
-    (difference, usage.expect("tables were mapped"))
+    (difference, usage, timings)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -182,30 +221,41 @@ fn compare_mapping(
         impl FnOnce(&mut ProductionLoadedModel),
         Option<magnetar_runtime::ComponentDigest>,
     ),
-    mapped_suffix: Option<&'static str>,
+    access: TableAccess,
 ) -> (
     f32,
     ProductionLoadedModel,
     Option<Arc<crate::mapped_tables::TableUse>>,
+    Timings,
 ) {
     let (configure, component) = options;
-    let (mut model, reference, usage) = load_checkpoint_mapping(
+    let (mut model, reference, usage, (ingest, load)) = load_checkpoint_mapping(
         provider,
         family_directory,
         variant,
         format,
         family,
         component,
-        mapped_suffix,
+        access,
     );
+    let mut timings = Timings {
+        ingest,
+        load,
+        steps: Vec::new(),
+    };
     configure(&mut model);
     let mut recorder = LogitRecorder::default();
+    let mut step_clock = std::time::Instant::now();
     let outcome = model
         .generate_streaming_with_logits(
             reference_request(&reference),
             None,
             &mut |_| ControlFlow::Continue(()),
-            &mut |logits| recorder.observe(logits),
+            &mut |logits| {
+                timings.steps.push(step_clock.elapsed());
+                step_clock = std::time::Instant::now();
+                recorder.observe(logits)
+            },
         )
         .unwrap_or_else(|error| panic!("{variant} generates: {error}"));
     let candidate = recorder.finish(
@@ -233,7 +283,7 @@ fn compare_mapping(
         reference.generated_token_ids,
         comparison.failures
     );
-    (comparison.max_abs_difference, model, usage)
+    (comparison.max_abs_difference, model, usage, timings)
 }
 
 /// Compare on the Reference CPU using an explicitly registered Component.
@@ -365,21 +415,20 @@ fn load_checkpoint(
     family: &str,
     component: Option<magnetar_runtime::ComponentDigest>,
 ) -> (ProductionLoadedModel, LogitReference) {
-    let (model, reference, _) = load_checkpoint_mapping(
+    let (model, reference, _, _) = load_checkpoint_mapping(
         provider,
         family_directory,
         variant,
         format,
         family,
         component,
-        None,
+        TableAccess::AsIngested,
     );
     (model, reference)
 }
 
-/// [`load_checkpoint`] with the tensors whose names end in `mapped_suffix`
-/// mappable by the payload source (`mapped_tables`), and what the Runtime
-/// asked of them.
+/// [`load_checkpoint`] with the tables served as `access` says
+/// (`mapped_tables`), and what the Runtime asked of them.
 fn load_checkpoint_mapping(
     provider: Arc<dyn Provider>,
     family_directory: &str,
@@ -387,12 +436,14 @@ fn load_checkpoint_mapping(
     format: Format,
     family: &str,
     component: Option<magnetar_runtime::ComponentDigest>,
-    mapped_suffix: Option<&'static str>,
+    access: TableAccess,
 ) -> (
     ProductionLoadedModel,
     LogitReference,
     Option<Arc<crate::mapped_tables::TableUse>>,
+    (std::time::Duration, std::time::Duration),
 ) {
+    let ingest_clock = std::time::Instant::now();
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join(family_directory)
@@ -432,6 +483,7 @@ fn load_checkpoint_mapping(
             (ingested, Arc::new(tokenizer))
         }
     };
+    let ingest = ingest_clock.elapsed();
     assert_eq!(ingested.manifest.architecture.family, family, "{variant}");
 
     let component = component.unwrap_or_else(|| {
@@ -445,14 +497,26 @@ fn load_checkpoint_mapping(
         tokenizer,
     )
     .expect("the production fixture builds");
-    let (source, usage): (Arc<dyn ProductionArtifactPayloadSource>, _) = match mapped_suffix {
-        Some(suffix) => {
+    let ingested_source = ingested.payload_source.clone();
+    let (source, usage): (Arc<dyn ProductionArtifactPayloadSource>, _) = match access {
+        TableAccess::AsIngested => (ingested_source, None),
+        TableAccess::Observed(suffix) => {
             let (source, usage) =
-                crate::mapped_tables::MappedTables::new(ingested.payload_source.clone(), suffix);
+                crate::mapped_tables::MappedTables::observing(ingested_source, suffix);
             (Arc::new(source), Some(usage))
         }
-        None => (ingested.payload_source.clone(), None),
+        TableAccess::Mapped(suffix) => {
+            let (source, usage) =
+                crate::mapped_tables::MappedTables::mapping(ingested_source, suffix);
+            (Arc::new(source), Some(usage))
+        }
+        TableAccess::Dense(suffix) => {
+            let (source, usage) =
+                crate::mapped_tables::MappedTables::refusing(ingested_source, suffix);
+            (Arc::new(source), Some(usage))
+        }
     };
+    let load_clock = std::time::Instant::now();
     let model = ProductionLoadedModel::load_with_component(
         fixture,
         source.as_ref(),
@@ -461,5 +525,5 @@ fn load_checkpoint_mapping(
         Some(component),
     )
     .unwrap_or_else(|error| panic!("{variant} loads with its Component: {error}"));
-    (model, reference, usage)
+    (model, reference, usage, (ingest, load_clock.elapsed()))
 }
