@@ -9,13 +9,13 @@
 
 ## 2. Components move to it, each under its golden graphs
 
-- [ ] 2.1 Mistral (contract 1.8.0): `wit/` and the `generate!` call replaced by the dependency and the `v1_8` feature; the golden graphs and the Component integration check (independent logits) pass unchanged.
+- [x] 2.1 Mistral (contract 1.8.0): `wit/` and the `generate!` call replaced by the dependency and the `v1_8` feature; the golden graphs pass unchanged, and so do the Component Model validation and Magnetar's own build path (`wasm32-unknown-unknown` then `wasm-tools component new`). Magnetar's independent-logits check runs on this PR.
 - [ ] 2.2 OLMo, Gemma, Llama (1.8.0), SmolLM (1.9.0), DeepSeek (1.10.0), ModernBERT (1.12.0), Qwen (1.14.0), each with its own golden graphs.
 - [ ] 2.3 Each Component's `Cargo.lock` records the pinned commit, and no Component carries a `wit/model-component-graph.wit`.
 
 ## 3. The Runtime
 
-- [ ] 3.1 A Magnetar CI test that `magnetar-runtime/wit/model-component-graph.wit` is byte-identical to the repository's file of the same version.
+- [x] 3.1 A Magnetar CI check (`tools/check_component_contract_copy.py`, in the `wit` job) that `magnetar-runtime/wit/model-component-graph.wit` is byte-identical to the repository's file of the same version at a pinned commit.
 - [ ] 3.2 Decide D6 (submodule or comparison) and write its delta to `wit` and `model-component-graph-contract`.
 - [ ] 3.3 The Runtime serves, and a CI test loads a Component built on each contract version it declares it serves.
 
