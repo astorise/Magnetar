@@ -198,6 +198,12 @@ jobs:
             wasm-tools parse "$wat" -o /tmp/component-fixture.wasm
             wasm-tools validate /tmp/component-fixture.wasm --features component-model
           done
+      - name: The Runtime's contract is the API repository's
+        # `magnetar-runtime/wit/model-component-graph.wit` is a copy of one
+        # released version of the contract, which lives in
+        # magnetar-component-api and never changes once released
+        # (`introduce-component-api`, task 3.1).
+        run: python3 tools/check_component_contract_copy.py
 
   openspec:
     name: quality / openspec
