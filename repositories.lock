@@ -8,7 +8,7 @@
 components/deepseek https://github.com/astorise/Magnetar-component-DeepSeek 1289817ab445ec11988b13e9a4a0a9174e7381c2
 components/gemma https://github.com/astorise/Magnetar-component-Gemma a0143b184a5443f9a9f132d677a3f58aa51ae77b
 components/glm https://github.com/astorise/Magnetar-component-GLM 4772b2e7167fab77c4eb39f03368c313c2c5226a
-components/kev https://github.com/astorise/Magnetar-component-Kev 20e0e5b85801ccec1ced2dfcef5ae2869fb465d7
+components/kev https://github.com/astorise/Magnetar-component-Kev cfd95818118169a7179cb77ae2f70ca139b0d7c4
 components/kimi https://github.com/astorise/Magnetar-component-Kimi 4e9f18edf647488e607207c5b0b9d5b8fdee61e0
 components/laya https://github.com/astorise/Magnetar-component-Laya ad1a9350bc056d84e9e81f633953e70ad44814a9
 components/llama https://github.com/astorise/Magnetar-component-Llama 10a68c30d26393e177b535cb03735b9c38141f02
