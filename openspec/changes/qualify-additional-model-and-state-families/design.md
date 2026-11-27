@@ -250,7 +250,14 @@ committed-history length while retaining the original prefill length. A real
 1.16 Component verifies that the history descriptors change with that length,
 and a previously prepared plan rejects the new graph's different fingerprint.
 This construction API does not replace the generation loop's published plan:
-safe per-step plan replacement is still required for variable-length decoding.
+the separate experimental plan-advance API validates both graphs, growing KV
+shapes and stable recurrent/KV schemas, the ready Model Instance revision,
+the original canonical plan and its Kernel bindings, Provider, guards and
+leases before publishing a new generation. It rejects custom plan policies
+instead of discarding them. Tests execute several newly prepared plans with
+committed KV and recurrent state and verify failed advances leave the old plan
+unchanged. The caller still owns session/history validation, and the production
+generation loop does not yet invoke this API for variable-length decoding.
 
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
