@@ -530,11 +530,18 @@ fn wasmtime_engine_builds_runtime_owned_kv_history_graphs() {
     let artifact = directory.join("history.component.wasm");
     std::fs::write(&artifact, KV_HISTORY_COMPONENT).unwrap();
     let capability = Arc::new(crate::GraphBuilderCapability::new());
+    let model_config = Arc::new(crate::ModelConfigCapability::new());
     let mut engine = WasmtimeComponentEngine::new().unwrap();
     let interface = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.16.0");
+    let config_interface =
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.16.0");
     engine.register_capability(
         interface.clone(),
         capability.clone() as Arc<dyn HostCapability>,
+    );
+    engine.register_capability(
+        config_interface.clone(),
+        model_config.clone() as Arc<dyn HostCapability>,
     );
     let export = WitInterface::new(
         "magnetar:model-component-graph/model-component-graph-producer",
@@ -544,6 +551,7 @@ fn wasmtime_engine_builds_runtime_owned_kv_history_graphs() {
         id: ComponentDefinitionId::new(207),
         metadata: crate::ComponentMetadata::new("history", "1", "history graph probe")
             .with_import(interface.clone())
+            .with_import(config_interface.clone())
             .with_export(export.clone()),
         artifact_path: artifact,
         manifest_path: None,
@@ -556,10 +564,29 @@ fn wasmtime_engine_builds_runtime_owned_kv_history_graphs() {
         .unwrap();
     let mut link = ComponentLinkPlan::default();
     link.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+    link.insert_for_test(crate::ComponentEndpoint::Capability {
+        interface: config_interface,
+    });
     let instance = engine.instantiate(&prepared, &link).unwrap();
     for (operation, argument, expected_rows) in
         [("build-prefill-graph", 4, 1), ("build-decode-graph", 3, 3)]
     {
+        model_config.bind_config(
+            instance.engine_key(),
+            crate::ModelArchitectureConfig {
+                hidden_size: 4,
+                intermediate_size: 8,
+                num_hidden_layers: 1,
+                num_attention_heads: 2,
+                num_key_value_heads: 2,
+                head_dim: 2,
+                vocab_size: 258,
+                rms_norm_eps: 1e-6,
+                rope_theta: 10_000.0,
+                hidden_activation: Some("silu".into()),
+                ..Default::default()
+            },
+        );
         capability.prepare_session(
             instance.engine_key(),
             crate::graph_builder_capability::SessionContext {
@@ -587,6 +614,11 @@ fn wasmtime_engine_builds_runtime_owned_kv_history_graphs() {
         let graph = capability
             .take_graph(instance.engine_key(), handle)
             .unwrap();
+        assert!(
+            model_config
+                .unread_declared_features(instance.engine_key())
+                .is_empty()
+        );
         graph.validate(&crate::default_graph_catalog()).unwrap();
         let histories = graph.kv_history_bindings().unwrap();
         assert_eq!(histories.len(), 2);

@@ -982,6 +982,91 @@ fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregister
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn component_decode_graph_can_be_built_at_a_later_history_position() {
+    let bytes = include_bytes!("../../../fixtures/components/kv-history-probe.component.wasm");
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = include_str!(
+        "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    )
+    .replace(
+        "sha256:321b42b83773544e1ba553cc7196d3d742cd9ef1e2af3f04da72b66e402a730f",
+        &digest.value,
+    )
+    .replace("magnetar.qwen.real", "magnetar.history.probe")
+    .replace("1.14.0", "1.16.0");
+    register_inference_component_artifact(
+        bytes.to_vec(),
+        manifest.into_bytes(),
+        &ComponentTrustStore::default().trust_digest(&digest.value),
+    )
+    .unwrap();
+    let fixture = e2e_fixture().unwrap();
+    let config = architecture_config_from_first_native_model_config(&fixture.config);
+    let build = |cached| {
+        build_first_native_graphs_from_named_component_for_artifact_at_decode_position(
+            &digest,
+            &config,
+            &fixture.manifest.tensors,
+            &fixture.identity,
+            4,
+            cached,
+        )
+    };
+    let (first, _, _) = build(4).unwrap();
+    let (later, _, _) = build(6).unwrap();
+    let (empty, _, _) = build(0).unwrap();
+    assert!(empty.decode.id.as_str().ends_with("-0"));
+    assert_eq!(
+        semantic_graph_fingerprint(&first.prefill),
+        semantic_graph_fingerprint(&later.prefill)
+    );
+    assert_ne!(
+        semantic_graph_fingerprint(&first.decode),
+        semantic_graph_fingerprint(&later.decode)
+    );
+    for (graph, expected) in [(&first.decode, 4), (&later.decode, 6)] {
+        let histories = graph.kv_history_bindings().unwrap();
+        assert_eq!(histories.len(), 2);
+        for history in histories {
+            assert_eq!(
+                graph.edges[&history.input_edge].descriptor.shape.dimensions,
+                [expected, 2]
+            );
+        }
+    }
+    assert!(build(u64::MAX).is_err());
+
+    // A differently sized graph must not execute through the old plan.
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut old_plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &first.decode,
+        &instance,
+        revision,
+        1,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    assert!(matches!(
+        PreparedExecutionPlanExecutor::new().prepare_node_execution(
+            &later.decode,
+            &mut old_plan,
+            runtime.kernel_registry(),
+            &first_native_plan_context(PreparedExecutionPhase::Decode, 1),
+            later.decode.nodes.keys().next().unwrap(),
+        ),
+        Err(PreparedExecutionPlanError::PlanValidationFailed)
+    ));
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn e2e_qwen_component_wasm_reported_wrong_operator_hash_fails_before_planning() {
     let wat = qwen_component_fixture_wat(
         r#"(func (export "prefill-node-count") (result i32) i32.const 19)"#,

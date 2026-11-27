@@ -6,11 +6,15 @@ use magnetar_component_api::v1_16::{
     magnetar::model_component_graph::graph_builder::{
         self as gb, GraphPhase, KvCacheRole, TensorShape,
     },
+    magnetar::model_component_graph::model_config,
 };
 
 struct Component;
 
 fn graph(phase: GraphPhase, tokens: u64, position: u64) -> String {
+    // The Runtime requires every decoder Component to acknowledge this
+    // setting, even when this synthetic graph does not use an MLP.
+    let _activation = model_config::hidden_activation();
     gb::begin_graph(phase, tokens, position);
     let shape = TensorShape {
         dimensions: vec![position.max(1), 2],

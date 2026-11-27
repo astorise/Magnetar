@@ -245,6 +245,13 @@ Variable decode lengths still need Component graph/plan handling, and the
 portable attention's element bound limits the supported window. Neither this
 test nor the internal graph form qualifies full Olala generation.
 
+The Component graph-construction API can request a decode graph at a different
+committed-history length while retaining the original prefill length. A real
+1.16 Component verifies that the history descriptors change with that length,
+and a previously prepared plan rejects the new graph's different fingerprint.
+This construction API does not replace the generation loop's published plan:
+safe per-step plan replacement is still required for variable-length decoding.
+
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
 `recurrent-input(resource-id)` and `recurrent-output(resource-id, edge-id)`.
