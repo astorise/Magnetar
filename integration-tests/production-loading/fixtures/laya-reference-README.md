@@ -9,12 +9,14 @@ padding, varying option counts and all three question types. It includes raw
 option and action logits, option probabilities and act probability.
 
 The numerical test reads a synthetic Safetensors file through the bounded
-Hugging Face loader, decodes its checkpoint-order tensors, and builds its
-encoder and head from them. No published checkpoint weights, tokenizer or
-Magnetar execution graph are involved in that numerical comparison. A separate
-test checks that the published Laya encoder configuration and derived weight
-shapes build a valid ModernBERT Component graph; it does not execute the graph
-or load the published checkpoint.
+Hugging Face loader and decodes its checkpoint-order tensors. A ModernBERT
+Component produces the encoder graph, which the Runtime executes on the
+Reference CPU using the transposed weights; its hidden states feed the Laya
+reference head and both are compared with the upstream result. The graph
+receives explicit test bindings: this is not the production model-loading or
+decision API. No published checkpoint weights or tokenizer are involved. A
+separate test checks that the published Laya encoder configuration and weight
+shapes build a valid ModernBERT Component graph without loading the checkpoint.
 The helper from the ModernBERT submodule verifies its source hash, and the
 generator verifies the Laya source hash. With both submodules checked out:
 

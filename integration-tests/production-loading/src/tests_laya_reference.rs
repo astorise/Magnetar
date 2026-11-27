@@ -1,6 +1,7 @@
 //! Synthetic ModernBERT -> Laya-head comparison with pinned PyTorch classes.
-//! The numerical test reads synthetic Safetensors, not published checkpoint
-//! weights, and evaluates the references without the Runtime execution graph.
+//! The numerical tests read synthetic Safetensors, not published checkpoint
+//! weights. They compare both a reference encoder and the Component graph
+//! executor, followed by the reference decision head, to the upstream oracle.
 
 use magnetar_component_laya::{
     Answer, Calibrator, QuestionType,
@@ -15,7 +16,7 @@ use magnetar_component_modernbert::{
 use magnetar_format_safetensors::{TensorToSerialize, serialize};
 use magnetar_loader_huggingface::discover_raw_safetensors;
 use magnetar_runtime::{
-    DecisionPrediction, DecisionResult, DecisionScore, ModelArtifactSource, ModelDType,
+    DecisionPrediction, DecisionResult, DecisionScore, HostTensor, ModelArtifactSource, ModelDType,
     ModelDigest, ProductionArtifactPayloadSource, ProductionModelSource, ProductionPayloadRange,
     host_tensors_from_artifact_bytes,
 };
@@ -40,7 +41,12 @@ fn pattern(name: &str, count: usize) -> Vec<f32> {
         .collect()
 }
 
-fn models_from_synthetic_safetensors() -> (Encoder, DecisionHead) {
+fn models_from_synthetic_safetensors() -> (
+    Encoder,
+    DecisionHead,
+    CheckpointProfile,
+    BTreeMap<String, HostTensor>,
+) {
     let config = serde_json::json!({
         "model_type": "modernbert", "hidden_size": 8, "intermediate_size": 12,
         "vocab_size": 24, "num_attention_heads": 2, "num_hidden_layers": 3,
@@ -165,27 +171,46 @@ fn models_from_synthetic_safetensors() -> (Encoder, DecisionHead) {
             );
         }
     }
+    let graph_weights = profile
+        .weights()
+        .iter()
+        .map(|spec| {
+            let values = spec
+                .graph_values(&encoder_tensors[&spec.checkpoint_name])
+                .unwrap();
+            let shape = spec
+                .graph_shape
+                .iter()
+                .map(|&size| size as u64)
+                .collect::<Vec<_>>();
+            (
+                spec.graph_name.clone(),
+                HostTensor::new(shape, values).unwrap(),
+            )
+        })
+        .collect();
     (
-        profile.into_reference(encoder_tensors).unwrap(),
+        profile.clone().into_reference(encoder_tensors).unwrap(),
         DecisionHead::from_checkpoint_tensors(8, 2, 2, head_tensors).unwrap(),
+        profile,
+        graph_weights,
     )
 }
 
-#[test]
-fn laya_checkpoint_profile_builds_a_real_modernbert_component_graph() {
+fn encoder_graph_request(
+    profile: &CheckpointProfile,
+    sequence_length: u64,
+) -> (
+    magnetar_runtime::ComponentDigest,
+    magnetar_runtime::FirstNativeEncoderGraphRequest,
+) {
     use magnetar_runtime::{
         ComponentDigest, ComponentTrustStore, EncoderGraphConfig, EncoderLayerConfig,
         FirstNativeEncoderGraphRequest, ModelArchitectureConfig, ModelComponentId,
         ModelComponentIdentity, ModelComponentImplementationKind, ModelComponentVersion,
-        build_first_native_encoder_graph_from_named_component, initial_operator_catalog,
         register_inference_component_artifact,
     };
 
-    let profile = CheckpointProfile::from_huggingface_config(
-        include_bytes!("../../../components/modernbert/tests/fixtures/laya-encoder.config.json"),
-        CheckpointNamespace::Encoder,
-    )
-    .unwrap();
     let settings = profile.graph_settings();
     let bytes = include_bytes!(
         "../../../magnetar-runtime/fixtures/components/modernbert-encoder.component.wasm"
@@ -262,8 +287,24 @@ fn laya_checkpoint_profile_builds_a_real_modernbert_component_graph() {
         )
         .trusted()
         .with_architecture_family("modernbert"),
-        sequence_length: 5,
+        sequence_length,
     };
+    (digest, request)
+}
+
+#[test]
+fn laya_checkpoint_profile_builds_a_real_modernbert_component_graph() {
+    use magnetar_runtime::{
+        build_first_native_encoder_graph_from_named_component, initial_operator_catalog,
+    };
+
+    let profile = CheckpointProfile::from_huggingface_config(
+        include_bytes!("../../../components/modernbert/tests/fixtures/laya-encoder.config.json"),
+        CheckpointNamespace::Encoder,
+    )
+    .unwrap();
+    let settings = profile.graph_settings();
+    let (digest, request) = encoder_graph_request(&profile, 5);
     let graph = build_first_native_encoder_graph_from_named_component(&digest, &request).unwrap();
     graph.validate(&initial_operator_catalog()).unwrap();
     assert_eq!(graph.phase, magnetar_runtime::ExecutionGraphPhase::Encode);
@@ -362,7 +403,7 @@ fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
         "../../../components/laya/tests/fixtures/rl_agent_config.json"
     ))
     .unwrap();
-    let (encoder, head) = models_from_synthetic_safetensors();
+    let (encoder, head, profile, graph_weights) = models_from_synthetic_safetensors();
     for case in cases {
         let ids = integers(&case, "ids")
             .into_iter()
@@ -380,8 +421,51 @@ fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
             _ => panic!("unknown question type"),
         };
         let hidden = encoder.forward(&ids, &mask, None).unwrap();
+        let (digest, request) = encoder_graph_request(&profile, ids.len() as u64);
+        let graph = magnetar_runtime::build_first_native_encoder_graph_from_named_component(
+            &digest, &request,
+        )
+        .unwrap();
+        let mut bindings: BTreeMap<_, _> = graph_weights
+            .iter()
+            .map(|(name, tensor)| {
+                (
+                    magnetar_runtime::TensorEdgeId::new(format!("weight.{name}")),
+                    tensor.clone(),
+                )
+            })
+            .collect();
+        bindings.insert(
+            magnetar_runtime::TensorEdgeId::new("input.token_ids"),
+            HostTensor::new(
+                [ids.len() as u64],
+                ids.iter().map(|&id| id as f32).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        bindings.insert(
+            magnetar_runtime::TensorEdgeId::new("input.attention_mask"),
+            HostTensor::new(
+                [mask.len() as u64],
+                mask.iter()
+                    .map(|&valid| if valid { 1.0 } else { 0.0 })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let outcome = magnetar_runtime::run_first_native_graph_with_provider_and_bindings(
+            std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+            &magnetar_runtime::e2e_fixture().unwrap(),
+            &graph,
+            &magnetar_runtime::KvCacheId::new("laya-encoder-conformance").unwrap(),
+            bindings,
+        )
+        .unwrap();
+        let graph_hidden =
+            &outcome.bindings[&magnetar_runtime::TensorEdgeId::new("hidden_states")].data;
+        close(graph_hidden, &hidden, "encoder hidden states");
         let result = head
-            .forward(&hidden, ids.len(), &mask, &markers, qtype)
+            .forward(graph_hidden, ids.len(), &mask, &markers, qtype)
             .unwrap();
         close(
             &result.option_logits,
