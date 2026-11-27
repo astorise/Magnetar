@@ -158,7 +158,7 @@ jobs:
             Magnetar/submodule-workspace
             Magnetar/components/${{ inputs.component }}
       - name: Install wasm-tools
-        uses: taiki-e/install-action@745319f1cc9062cb0c2e6e30639b5180392b1951 # wasm-tools
+        uses: taiki-e/install-action@39a0b1570a117ededf7f373a25a04e92fa1994b0 # wasm-tools
       - name: Qualify the Component
         working-directory: Magnetar
         env:
