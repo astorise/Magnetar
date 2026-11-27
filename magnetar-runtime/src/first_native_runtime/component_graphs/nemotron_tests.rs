@@ -422,6 +422,89 @@ fn nemotron_component_builds_mixed_prefill_and_decode_graphs() {
         );
     }
     execution_runtime.release_kv_cache(&reset_cache).unwrap();
+    // Run the mixed graph as two prefill passes, like production chunking.
+    // The KV stores contain all prior rows while the recurrent inputs come
+    // from the previous pass's pending state, not the caller's bindings.
+    let chunk_cache = execution_runtime
+        .create_kv_cache(KvCache::new(
+            KvCacheId::new("nemotron-hybrid-chunks").unwrap(),
+            KvCacheScope::Session,
+            KvCacheCompatibility::new(
+                GenerationModelReference::ModelInstance(instance.clone()),
+                TokenizerId::new("tokenizer").unwrap(),
+            ),
+            KvCacheLayoutMetadata::contiguous(4, 1, 5, 32, ComputeDType::Float32),
+        ))
+        .unwrap();
+    let (chunk_graphs, _, _) = build(&config, weights.clone(), 4).unwrap();
+    assert!(super::super::prefill_chunks::prefill_continues_history(
+        &chunk_graphs.prefill
+    ));
+    let mut chunk_plan = prepare_first_native_plan_for_graph(
+        &execution_runtime,
+        &chunk_graphs.prefill,
+        &instance,
+        revision,
+        4,
+        PreparedExecutionPlanGeneration::new(4),
+        &provider,
+    )
+    .unwrap();
+    let mut chunks_history = None;
+    for start in [0, 4] {
+        let (_, outputs, pending, _) = execute_first_native_graph_materializing(
+            &mut execution_runtime,
+            &execution_fixture,
+            &instance,
+            &chunk_cache,
+            &chunk_graphs.prefill,
+            &mut chunk_plan,
+            bindings(&reference.ids[start..start + 4]),
+            chunks_history.as_ref(),
+            Some(start as u64),
+            &mut Vec::new(),
+            MaterializedEdges::All,
+            None,
+            Some(KvStoreSpec::owned(8)),
+        )
+        .unwrap();
+        assert_eq!(pending[&1].rows, Some((start + 4) as u64));
+        close(
+            &outputs[&TensorEdgeId::new("logits")].data,
+            &reference.full.data[start * 24..(start + 4) * 24],
+            "chunk logits",
+        );
+        if start == 4 {
+            for slot in ["conv", "ssm"] {
+                let (edge, _) = chunk_graphs
+                    .prefill
+                    .edges
+                    .iter()
+                    .find(|(_, edge)| {
+                        edge.recurrent_state.as_ref().is_some_and(|state| {
+                            state.slot == slot
+                                && state.behavior == GraphRecurrentStateBehavior::Output
+                        })
+                    })
+                    .unwrap();
+                close(&outputs[edge].data, &final_state[slot].data, slot);
+            }
+            for (role, resource) in [("keys", &pending[&1].k), ("values", &pending[&1].v)] {
+                close(
+                    &executor.read_tensor(resource).unwrap().data,
+                    &final_state[role].data,
+                    role,
+                );
+            }
+        }
+        chunks_history = Some(pending);
+    }
+    super::super::recurrent_state::release_recurrent_state(
+        &mut execution_runtime,
+        &executor,
+        &chunk_cache,
+    );
+    execution_runtime.release_kv_cache(&chunk_cache).unwrap();
     let mut invalid = config.clone();
     invalid.rope_layers.as_mut().unwrap()[1] = true;
     assert!(build(&invalid, weights.clone(), 4).is_err());
