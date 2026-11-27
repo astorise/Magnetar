@@ -8,8 +8,9 @@ synthetic weights and token IDs, the published Laya temperature configuration,
 padding, varying option counts and all three question types. It includes raw
 option and action logits, option probabilities and act probability.
 
-The numerical test builds its encoder and head from synthetic decoded
-checkpoint-order tensors. No published checkpoint weights, tokenizer or
+The numerical test reads a synthetic Safetensors file through the bounded
+Hugging Face loader, decodes its checkpoint-order tensors, and builds its
+encoder and head from them. No published checkpoint weights, tokenizer or
 Magnetar execution graph are involved in that numerical comparison. A separate
 test checks that the published Laya encoder configuration and derived weight
 shapes build a valid ModernBERT Component graph; it does not execute the graph

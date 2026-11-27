@@ -22,7 +22,7 @@ components/smollm https://github.com/astorise/Magnetar-component-SmolLM af99a5cb
 formats/gguf https://github.com/astorise/Magnetar-format-GGUF 9d21d727072aae17c78e06c7f37af33da005ae3f
 formats/safetensors https://github.com/astorise/Magnetar-format-safetensors 29f489db2cbff784a3e3f12ac2986e368af5aed5
 loaders/gguf https://github.com/astorise/Magnetar-loader-GGUF 1938a2e0d5f86bede8231ed1ffa9de7a2862fe10
-loaders/huggingface https://github.com/astorise/Magnetar-loader-HuggingFace 69825a4b0cb9dbe9c21098622dd11b3f8e12887b
+loaders/huggingface https://github.com/astorise/Magnetar-loader-HuggingFace 4645f76e0d0ce2f555ab495f7c1a7790ff9c9c33
 providers/cpu https://github.com/astorise/Magnetar-provider-CPU aaf4810d06847ac529064f13c9d43fb1b2ec3c98
 providers/cuda https://github.com/astorise/Magnetar-provider-CUDA 902f998408a795bdb22d307cbbdf3a76d94a678a
 providers/metal https://github.com/astorise/Magnetar-provider-Metal 7101706038ad40ca7f3006509dce9c8c9ec1cf1d

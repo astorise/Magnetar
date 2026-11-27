@@ -24,6 +24,7 @@ magnetar-runtime = { path = "../../magnetar-runtime", features = ["wasmtime-comp
 magnetar-loader-huggingface = { path = "../../loaders/huggingface" }
 magnetar-loader-gguf = { path = "../../loaders/gguf" }
 magnetar-format-gguf = { path = "../../formats/gguf" }
+magnetar-format-safetensors = { path = "../../formats/safetensors" }
 magnetar-provider-cuda = { path = "../../providers/cuda" }
 magnetar-provider-cpu = { path = "../../providers/cpu" }
 magnetar-inference-qualification = { path = "../../tools/inference-qualification" }

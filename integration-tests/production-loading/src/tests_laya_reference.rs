@@ -1,15 +1,24 @@
 //! Synthetic ModernBERT -> Laya-head comparison with pinned PyTorch classes.
-//! This test does not use checkpoint weights or the Magnetar runtime graph.
+//! The numerical test reads synthetic Safetensors, not published checkpoint
+//! weights, and evaluates the references without the Runtime execution graph.
 
 use magnetar_component_laya::{
     Answer, Calibrator, QuestionType,
     head::{CheckpointTensor, DecisionHead, checkpoint_tensor_shapes},
 };
 use magnetar_component_modernbert::{
-    checkpoint::{CheckpointNamespace, CheckpointProfile, DecodedTensor},
+    checkpoint::{
+        CheckpointNamespace, CheckpointProfile, DecodedTensor, StorageDType, TensorDescriptor,
+    },
     encoder_reference::Encoder,
 };
-use magnetar_runtime::{DecisionPrediction, DecisionResult, DecisionScore};
+use magnetar_format_safetensors::{TensorToSerialize, serialize};
+use magnetar_loader_huggingface::discover_raw_safetensors;
+use magnetar_runtime::{
+    DecisionPrediction, DecisionResult, DecisionScore, ModelArtifactSource, ModelDType,
+    ModelDigest, ProductionArtifactPayloadSource, ProductionModelSource, ProductionPayloadRange,
+    host_tensors_from_artifact_bytes,
+};
 use std::collections::BTreeMap;
 
 fn pattern(name: &str, count: usize) -> Vec<f32> {
@@ -31,7 +40,7 @@ fn pattern(name: &str, count: usize) -> Vec<f32> {
         .collect()
 }
 
-fn encoder() -> Encoder {
+fn models_from_synthetic_safetensors() -> (Encoder, DecisionHead) {
     let config = serde_json::json!({
         "model_type": "modernbert", "hidden_size": 8, "intermediate_size": 12,
         "vocab_size": 24, "num_attention_heads": 2, "num_hidden_layers": 3,
@@ -48,23 +57,118 @@ fn encoder() -> Encoder {
     // The Python oracle's wrapper adds another `encoder.` level to parameter
     // names when generating its synthetic values; it is not part of the
     // actual Laya checkpoint namespace.
-    let tensors: BTreeMap<_, _> = profile
+    let mut weights: Vec<_> = profile
         .weights()
         .iter()
         .map(|spec| {
+            let values = pattern(
+                &format!("encoder.{}", spec.checkpoint_name),
+                spec.checkpoint_shape.iter().product(),
+            );
             (
                 spec.checkpoint_name.clone(),
-                DecodedTensor {
-                    shape: spec.checkpoint_shape.clone(),
-                    values: pattern(
-                        &format!("encoder.{}", spec.checkpoint_name),
-                        spec.checkpoint_shape.iter().product(),
-                    ),
+                spec.checkpoint_shape.clone(),
+                values,
+            )
+        })
+        .collect();
+    weights.extend(
+        checkpoint_tensor_shapes(8, 2, 2)
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| {
+                let values = pattern(&name, shape.iter().product());
+                (name, shape, values)
+            }),
+    );
+    let bytes: Vec<Vec<u8>> = weights
+        .iter()
+        .map(|(_, _, values)| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        })
+        .collect();
+    let descriptors: Vec<_> = weights
+        .iter()
+        .zip(&bytes)
+        .map(|((name, shape, _), bytes)| TensorToSerialize {
+            name,
+            dtype: ModelDType::F32,
+            shape: shape.iter().map(|&size| size as u64).collect(),
+            data: bytes,
+        })
+        .collect();
+    let file = serialize(&descriptors, &BTreeMap::new()).unwrap();
+    let expected_digest = ModelDigest::sha256(&file);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("model.safetensors"), file).unwrap();
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(directory.path().to_path_buf()),
+        directory.path().to_path_buf(),
+    );
+    let raw = discover_raw_safetensors(&source).unwrap();
+    assert_eq!(raw.single_file_digest.as_ref(), Some(&expected_digest));
+    let inventory = raw
+        .tensors
+        .iter()
+        .map(|tensor| {
+            (
+                tensor.name.clone(),
+                TensorDescriptor {
+                    shape: tensor.shape.iter().map(|&size| size as usize).collect(),
+                    dtype: match tensor.storage_dtype {
+                        ModelDType::F16 => StorageDType::F16,
+                        ModelDType::Bf16 => StorageDType::BF16,
+                        ModelDType::F32 => StorageDType::F32,
+                        _ => StorageDType::Unsupported,
+                    },
                 },
             )
         })
         .collect();
-    profile.into_reference(tensors).unwrap()
+    profile.validate_inventory(&inventory).unwrap();
+    let mut encoder_tensors = BTreeMap::new();
+    let mut head_tensors = BTreeMap::new();
+    for metadata in raw.tensors {
+        let range = ProductionPayloadRange {
+            identity: metadata.name.clone(),
+            offset: metadata.offset_bytes.unwrap(),
+            length: metadata.size_bytes.unwrap(),
+            digest: metadata.digest.clone(),
+        };
+        let bytes = raw.payloads.read_payload(&range).unwrap();
+        let mut bounded = metadata.clone();
+        bounded.offset_bytes = Some(0);
+        bounded.shard = None;
+        let tensor = host_tensors_from_artifact_bytes(&[bounded], &bytes, 0)
+            .unwrap()
+            .remove(&metadata.name)
+            .unwrap();
+        let shape = tensor.shape.iter().map(|&size| size as usize).collect();
+        if metadata.name.starts_with("encoder.") {
+            encoder_tensors.insert(
+                metadata.name,
+                DecodedTensor {
+                    shape,
+                    values: tensor.data,
+                },
+            );
+        } else {
+            head_tensors.insert(
+                metadata.name,
+                CheckpointTensor {
+                    shape,
+                    values: tensor.data,
+                },
+            );
+        }
+    }
+    (
+        profile.into_reference(encoder_tensors).unwrap(),
+        DecisionHead::from_checkpoint_tensors(8, 2, 2, head_tensors).unwrap(),
+    )
 }
 
 #[test]
@@ -174,16 +278,52 @@ fn laya_checkpoint_profile_builds_a_real_modernbert_component_graph() {
     assert!(build_first_native_encoder_graph_from_named_component(&digest, &malformed).is_err());
 }
 
-fn head() -> DecisionHead {
-    let tensors = checkpoint_tensor_shapes(8, 2, 2)
-        .unwrap()
-        .into_iter()
-        .map(|(name, shape)| {
-            let values = pattern(&name, shape.iter().product());
-            (name, CheckpointTensor { shape, values })
-        })
-        .collect();
-    DecisionHead::from_checkpoint_tensors(8, 2, 2, tensors).unwrap()
+#[test]
+fn raw_half_precision_checkpoint_payloads_decode_to_f32() {
+    let f16 = [0x00, 0x3c, 0x00, 0xc0];
+    let bf16 = [0x80, 0x3f, 0x00, 0xc0];
+    let file = serialize(
+        &[
+            TensorToSerialize {
+                name: "encoder.embeddings.norm.weight",
+                dtype: ModelDType::F16,
+                shape: vec![2],
+                data: &f16,
+            },
+            TensorToSerialize {
+                name: "head.layers.0.norm1.weight",
+                dtype: ModelDType::Bf16,
+                shape: vec![2],
+                data: &bf16,
+            },
+        ],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("model.safetensors"), file).unwrap();
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(directory.path().to_path_buf()),
+        directory.path().to_path_buf(),
+    );
+    let raw = discover_raw_safetensors(&source).unwrap();
+    for metadata in raw.tensors {
+        let range = ProductionPayloadRange {
+            identity: metadata.name.clone(),
+            offset: metadata.offset_bytes.unwrap(),
+            length: metadata.size_bytes.unwrap(),
+            digest: metadata.digest.clone(),
+        };
+        let bytes = raw.payloads.read_payload(&range).unwrap();
+        let mut bounded = metadata.clone();
+        bounded.offset_bytes = Some(0);
+        let tensor = host_tensors_from_artifact_bytes(&[bounded], &bytes, 0)
+            .unwrap()
+            .remove(&metadata.name)
+            .unwrap();
+        assert_eq!(tensor.shape, [2]);
+        assert_eq!(tensor.data, [1.0, -2.0]);
+    }
 }
 
 fn numbers(value: &serde_json::Value, key: &str) -> Vec<f32> {
@@ -222,8 +362,7 @@ fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
         "../../../components/laya/tests/fixtures/rl_agent_config.json"
     ))
     .unwrap();
-    let encoder = encoder();
-    let head = head();
+    let (encoder, head) = models_from_synthetic_safetensors();
     for case in cases {
         let ids = integers(&case, "ids")
             .into_iter()

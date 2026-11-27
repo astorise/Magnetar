@@ -1054,6 +1054,7 @@ dependencies = [
  "magnetar-component-nemotron",
  "magnetar-component-olala",
  "magnetar-format-gguf",
+ "magnetar-format-safetensors",
  "magnetar-inference-qualification",
  "magnetar-integration-resident-provider",
  "magnetar-loader-gguf",
