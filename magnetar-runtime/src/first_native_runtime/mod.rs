@@ -86,6 +86,8 @@ mod kv_pool;
 mod kv_state;
 mod prefill_buckets;
 mod prefill_chunks;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+mod prefill_observation;
 mod prepared_plans;
 mod production;
 mod recurrent_state;

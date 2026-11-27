@@ -1609,6 +1609,7 @@ pub(super) fn execute_first_native_graph_namespaced(
         kv_stores,
         resource_namespace,
         cleanup_on_failure,
+        None,
     )
 }
 
@@ -1673,6 +1674,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
     cleanup_on_failure: bool,
+    private_kv_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
@@ -1734,6 +1736,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     let event_start = node_events.len();
     let cleanup_failed_resources = cleanup_on_failure && resource_namespace.is_none();
     let mut written_resources = Vec::new();
+    let mut private_inputs = Vec::new();
     let result = execute_first_native_graph_nodes(
         order,
         runtime,
@@ -1752,6 +1755,8 @@ pub(super) fn execute_first_native_graph_with_resident_input(
         materialized,
         kv_stores,
         resource_namespace,
+        private_kv_namespace,
+        private_kv_namespace.map(|_| &mut private_inputs),
         cleanup_failed_resources.then_some(&mut written_resources),
     );
     if result.is_err() && cleanup_failed_resources {
@@ -1791,6 +1796,8 @@ pub(super) fn execute_first_native_graph_nodes(
     materialized: MaterializedEdges<'_>,
     kv_stores: Option<KvStoreSpec>,
     resource_namespace: Option<&str>,
+    private_kv_namespace: Option<&str>,
+    private_input_resources: Option<&mut Vec<TensorResourceId>>,
     mut written_resources: Option<&mut Vec<TensorResourceId>>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
@@ -1828,6 +1835,7 @@ pub(super) fn execute_first_native_graph_nodes(
     let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime,
         resource_namespace: resource_namespace.map(str::to_string),
+        private_input_resources,
         provider: executor.clone(),
         prepared_plan: Some(prepared_plan),
         graph: Some(fingerprinted),
@@ -1863,7 +1871,12 @@ pub(super) fn execute_first_native_graph_nodes(
     let mut bindings: BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)> = BTreeMap::new();
     let upload_clock = dispatch_ctx.runtime.phase_ledger().clock();
     for (edge_id, tensor) in initial_bindings {
-        let resource_id = TensorResourceId::new(edge_id.as_str());
+        // A private observation also initializes recurrent inputs here. Keep
+        // them separate from another request using the same Component graph.
+        let resource_id = TensorResourceId::new(match private_kv_namespace {
+            Some(namespace) => format!("{namespace}.input.{}", edge_id.as_str()),
+            None => edge_id.as_str().to_string(),
+        });
         let shape = tensor.shape.clone();
         dispatch_ctx
             .provider
@@ -2187,9 +2200,11 @@ pub(super) fn execute_first_native_graph_nodes(
                     KvRole::K => "k",
                     KvRole::V => "v",
                 };
-                let pending_resource = TensorResourceId::new(format!(
-                    "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
-                ));
+                let pending = format!("kv.{kv_cache_id}.layer{layer}.{role_str}.pending");
+                let pending_resource = TensorResourceId::new(match private_kv_namespace {
+                    Some(namespace) => format!("{namespace}.{pending}"),
+                    None => pending,
+                });
                 // In-place history (`append-kv-history-in-place`): a decode
                 // step continues the stores its history lives in; a prefill
                 // starts new stores when this execution keeps KV in place.

@@ -83,6 +83,7 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
         resource_namespace: None,
+        private_input_resources: None,
         runtime: &mut runtime,
         provider,
         prepared_plan: None,
@@ -160,6 +161,7 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
         resource_namespace: None,
+        private_input_resources: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,
@@ -262,6 +264,7 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
         resource_namespace: None,
+        private_input_resources: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,

@@ -428,6 +428,9 @@ pub(super) struct FirstNativeDispatchContext<'a> {
     /// (a recordable bucketed prefill, `replay-bucketed-prefill`). `None`:
     /// `edge.{edge}`, owned by the request's KV cache.
     pub(super) resource_namespace: Option<String>,
+    /// Fresh host inputs belonging to an isolated, non-replay execution.
+    /// They are scoped to this namespace and released after each dispatch.
+    pub(super) private_input_resources: Option<&'a mut Vec<TensorResourceId>>,
     /// Resolved generically from Runtime's provider registration through
     /// [`ProviderExecutionApi`] (Correctif 3): no downcast to a concrete
     /// Provider type is ever performed on this hot path.
@@ -639,6 +642,29 @@ pub(super) fn dispatch_reference_cpu_operator_multi(
     outputs: Vec<(TensorResourceId, TensorDescriptor)>,
     attributes: BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
+    let result = dispatch_reference_cpu_operator_multi_inner(
+        ctx,
+        operation_id,
+        operator,
+        inputs,
+        outputs,
+        attributes,
+    );
+    let cleanup = ctx.release_private_inputs();
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+fn dispatch_reference_cpu_operator_multi_inner(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
+    inputs: Vec<NodeInputResource>,
+    outputs: Vec<(TensorResourceId, TensorDescriptor)>,
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     // Correctif 17 / task group 17: this node's causal chain starts here,
     // once its inputs (written just below) are resolved and it is about to
     // be dispatched. `node` is reused for every later event this call
@@ -676,6 +702,7 @@ pub(super) fn dispatch_reference_cpu_operator_multi(
     for input in inputs {
         let resource = match input {
             NodeInputResource::Fresh(id, descriptor, tensor) => {
+                let id = ctx.private_input_id(id);
                 let resource =
                     TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
                 ctx.provider.write_tensor(id, tensor).map_err(|error| {
@@ -981,6 +1008,31 @@ pub(super) type OutputTarget = (TensorResourceId, MemoryPlacement, MemoryAllocat
 /// leaving admission to the Provider's own fallback self-admission path
 /// (`unify-provider-output-admission-and-residency`'s Decision 2).
 impl FirstNativeDispatchContext<'_> {
+    fn private_input_id(&mut self, id: TensorResourceId) -> TensorResourceId {
+        match (&self.resource_namespace, &mut self.private_input_resources) {
+            (Some(namespace), Some(resources)) => {
+                let id = TensorResourceId::new(format!("{namespace}.fresh.{id}"));
+                resources.push(id.clone());
+                id
+            }
+            _ => id,
+        }
+    }
+
+    fn release_private_inputs(&mut self) -> Result<(), InferenceApiError> {
+        let mut failure = None;
+        if let Some(resources) = &mut self.private_input_resources {
+            for id in resources.drain(..) {
+                if let Err(error) = self.provider.release_tensor(&id) {
+                    failure.get_or_insert_with(|| InferenceApiError::ProviderTensorReleaseFailed {
+                        reason: format!("could not release private input '{id}': {error}"),
+                    });
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     /// The resource a node output edge is written under.
     pub(super) fn edge_resource(&self, edge: &str) -> TensorResourceId {
         match &self.resource_namespace {
@@ -1252,6 +1304,32 @@ pub(super) fn dispatch_runtime_internal_operator<const N: usize>(
     output: (TensorResourceId, TensorDescriptor),
     attributes: BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<NodeValue, InferenceApiError> {
+    let result = dispatch_runtime_internal_operator_inner(
+        ctx,
+        operation_id,
+        real_node,
+        operator,
+        inputs,
+        output,
+        attributes,
+    );
+    let cleanup = ctx.release_private_inputs();
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_runtime_internal_operator_inner<const N: usize>(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    real_node: &ExecutionNodeId,
+    operator: OperatorId,
+    inputs: [(&str, NodeValue); N],
+    output: (TensorResourceId, TensorDescriptor),
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<NodeValue, InferenceApiError> {
     let (output_id, output_descriptor) = output;
     let affinity = resolved_resource_affinity(
         ctx.prepared_plan.as_deref(),
@@ -1271,6 +1349,7 @@ pub(super) fn dispatch_runtime_internal_operator<const N: usize>(
         let input = node_input_resource(operation_id, name, value);
         let resource = match input {
             NodeInputResource::Fresh(id, descriptor, tensor) => {
+                let id = ctx.private_input_id(id);
                 let resource =
                     TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
                 ctx.provider.write_tensor(id, tensor).map_err(|error| {

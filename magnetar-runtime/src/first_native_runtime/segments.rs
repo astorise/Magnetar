@@ -493,6 +493,7 @@ pub fn run_first_native_graph_segment_dispatch(
             None,
             None,
             false,
+            None,
         )
         .map_err(E2eConformanceError::from)?;
     Ok(FirstNativeProviderRunOutcome {
