@@ -302,10 +302,11 @@ pub fn register_inference_component_artifact(
     // mixed expert layers, expert routing and the YaRN RoPE case.
     // `1.13.0` (`support-qwen38-flash-next`) adds `linear-attention` and
     // `decoder-variants`; `1.14.0` adds `hyper-connections`,
-    // `ngram-embeddings`, `token-selection` and `linear-attention-gate`.
+    // `ngram-embeddings`, `token-selection` and `linear-attention-gate`;
+    // `1.15.0` adds an explicit ordered Mamba-2 hybrid configuration.
     for version in [
         "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
-        "1.12.0", "1.13.0", "1.14.0",
+        "1.12.0", "1.13.0", "1.14.0", "1.15.0",
     ] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),

@@ -773,6 +773,34 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     )
     .expect("a Component with no MLP may explicitly accept an unknown activation");
 
+    // This real older Component can otherwise build a graph, but cannot
+    // observe the newer hybrid schema and must never silently omit it.
+    let mut hybrid = architecture_config_from_first_native_model_config(&fixture.config);
+    hybrid.decoder_extensions.mamba2_hybrid = Some(crate::Mamba2HybridConfig {
+        layers: vec![crate::HybridDecoderBlock::Mamba2; hybrid.num_hidden_layers as usize],
+        heads: 2,
+        head_dim: 2,
+        groups: 1,
+        state_dim: 2,
+        conv_kernel: 3,
+        epsilon: 1e-5,
+        dt_min: 0.0,
+        dt_max: None,
+        conv_bias: false,
+        linear_bias: false,
+    });
+    hybrid.validate().unwrap();
+    let error = build_first_native_graphs_from_named_component(
+        &synthetic_digest,
+        &hybrid,
+        &fixture.identity,
+        prompt_token_count,
+    )
+    .map(|_| ())
+    .expect_err("an older Component must not ignore a hybrid decoder")
+    .to_string();
+    assert!(error.contains("mamba2-hybrid"), "{error}");
+
     // The pre-1.8 version of this same fixture cannot distinguish known and
     // unknown activation values. It must be rejected for both, even though
     // it could otherwise construct a graph successfully.

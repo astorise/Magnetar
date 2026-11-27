@@ -474,6 +474,18 @@ native BF16 arithmetic or a GPU Provider.
 
 Preserve existing F32 and single-Device baseline fixtures and public request semantics. Reuse current WIT and Rust contracts first. Before implementation requires new graph operators, state envelopes or result types, record their exact versioned portable schema, negotiation, unsupported behavior and migration tests; native API types are prohibited. A new precision or model profile is opt-in until its validation evidence supports promotion. Vendor implementations stay in their repositories, followed by an explicit parent submodule pin update.
 
+The additive `model-component-graph@1.15.0` configuration describes an
+ordered sequence of Mamba-2 mixers, attention, dense MLP and routed MoE
+residual blocks. Mixer head/group/state dimensions, convolution width,
+normalization, bias flags and inference-time step limits are explicit and
+bounded; checkpoint initialization limits are not inference limits. Attention
+position handling, activation and expert positions and routing are declared
+separately, never inferred from a model name. Existing Components continue to
+link, but their graphs are refused if they have not read a declared hybrid
+configuration. Each session must keep convolution and SSM state separate from
+attention KV history. The mixer and MoE operators have independent CPU/PyTorch
+comparisons; this contract alone does not qualify a complete hybrid decoder.
+
 ### Authority and isolation
 
 Tools and service/transport adapters use caller-authorized inputs and bounded operations. Inference and Components gain no ambient filesystem, network, process, source-control or secret authority. Local source streaming checks artifact ranges and identity. External campaigns/artifacts are untrusted until verified. Snapshot or distributed data remains tenant-scoped and requires authorization in addition to checksums; signing keys and credentials never enter reports.

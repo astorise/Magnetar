@@ -18,10 +18,10 @@ use std::sync::Mutex;
 
 use crate::component::{ComponentError, ComponentValue, HostCapability};
 use crate::{
-    ExpertGroupScore, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
+    ExpertGroupScore, ExpertNormalization, ExpertRoutingConfig, ExpertScoring, HybridDecoderBlock,
     HyperConnectionConfig, LatentAttentionConfig, LayerSpec, LinearAttentionConfig,
-    MixtureOfExpertsConfig, ModelArchitectureConfig, NgramEmbeddingConfig, RopeFrequencyScaling,
-    TokenSelectionConfig,
+    Mamba2HybridConfig, MixtureOfExpertsConfig, ModelArchitectureConfig, NgramEmbeddingConfig,
+    RopeFrequencyScaling, TokenSelectionConfig,
 };
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
@@ -68,7 +68,8 @@ pub struct ModelConfigCapability {
 /// when the bound configuration declares one, a Component must have read
 /// it before its graph is accepted. Activation must always be read, so a
 /// Component can distinguish an unknown activation from a supported one.
-const FEATURE_FUNCTIONS: [&str; 16] = [
+const FEATURE_FUNCTIONS: [&str; 17] = [
+    "mamba2-hybrid",
     "linear-attention",
     "decoder-variants",
     "hyper-connections",
@@ -206,6 +207,7 @@ impl ModelConfigCapability {
                         .is_some_and(|mla| mla.norm_eps.is_some()),
                     "rope-layers" => config.rope_layers.is_some(),
                     "encoder-config" => entry.encoder.is_some(),
+                    "mamba2-hybrid" => config.decoder_extensions.mamba2_hybrid.is_some(),
                     "linear-attention" => config.linear_attention.is_some(),
                     "decoder-variants" => decoder_variants_declared(config),
                     "hyper-connections" => config.decoder_extensions.hyper_connections.is_some(),
@@ -383,6 +385,54 @@ fn encode_linear_attention(linear: Option<&LinearAttentionConfig>) -> ComponentV
                 ComponentValue::S64(linear.value_head_dim as i64),
             ),
             field("conv-kernel", ComponentValue::U32(linear.conv_kernel)),
+        ]))
+    }))
+}
+
+/// `option<mamba2-hybrid-config>` (`1.15.0`).
+fn encode_mamba2_hybrid(hybrid: Option<&Mamba2HybridConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(hybrid.map(|hybrid| {
+        Box::new(ComponentValue::Record(vec![
+            field(
+                "layers",
+                ComponentValue::List(
+                    hybrid
+                        .layers
+                        .iter()
+                        .map(|layer| {
+                            ComponentValue::Enum(
+                                match layer {
+                                    HybridDecoderBlock::Mamba2 => "mamba2",
+                                    HybridDecoderBlock::Attention => "attention",
+                                    HybridDecoderBlock::DenseMlp => "dense-mlp",
+                                    HybridDecoderBlock::RoutedMoe => "routed-moe",
+                                }
+                                .into(),
+                            )
+                        })
+                        .collect(),
+                ),
+            ),
+            field("heads", ComponentValue::U32(hybrid.heads)),
+            field(
+                "head-dimension",
+                ComponentValue::S64(hybrid.head_dim as i64),
+            ),
+            field("groups", ComponentValue::U32(hybrid.groups)),
+            field(
+                "state-dimension",
+                ComponentValue::S64(hybrid.state_dim as i64),
+            ),
+            field("conv-kernel", ComponentValue::U32(hybrid.conv_kernel)),
+            field("epsilon", ComponentValue::F64(hybrid.epsilon)),
+            field("dt-min", ComponentValue::F64(hybrid.dt_min)),
+            field(
+                "dt-max",
+                ComponentValue::Option(hybrid.dt_max.map(|max| Box::new(ComponentValue::F64(max)))),
+            ),
+            field("conv-bias", ComponentValue::Bool(hybrid.conv_bias)),
+            field("linear-bias", ComponentValue::Bool(hybrid.linear_bias)),
         ]))
     }))
 }
@@ -716,6 +766,7 @@ impl HostCapability for ModelConfigCapability {
             | "expert-normalization"
             | "latent-norm-epsilon"
             | "encoder-config"
+            | "mamba2-hybrid"
             | "linear-attention"
             | "decoder-variants"
             | "hyper-connections"
@@ -749,6 +800,9 @@ impl HostCapability for ModelConfigCapability {
                     }
                     "layer-layout" => encode_layer_layout(config.layer_layout.as_deref()),
                     "encoder-config" => encode_encoder_config(entry.encoder.as_ref()),
+                    "mamba2-hybrid" => {
+                        encode_mamba2_hybrid(config.decoder_extensions.mamba2_hybrid.as_ref())
+                    }
                     "linear-attention" => encode_linear_attention(config.linear_attention.as_ref()),
                     "decoder-variants" => encode_decoder_variants(config),
                     "hyper-connections" => {

@@ -40,6 +40,91 @@ fn sample_config() -> ModelArchitectureConfig {
 }
 
 #[test]
+fn mamba2_hybrid_is_exposed_and_must_be_read_by_each_instance() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    config.num_hidden_layers = 3;
+    config.rope_layers = Some(vec![false; 3]);
+    config.hidden_activation = Some("relu_squared".into());
+    config.decoder_extensions.mamba2_hybrid = Some(Mamba2HybridConfig {
+        layers: vec![
+            HybridDecoderBlock::Mamba2,
+            HybridDecoderBlock::Attention,
+            HybridDecoderBlock::DenseMlp,
+        ],
+        heads: 4,
+        head_dim: 8,
+        groups: 2,
+        state_dim: 3,
+        conv_kernel: 4,
+        epsilon: 1e-5,
+        dt_min: 0.01,
+        dt_max: Some(0.5),
+        conv_bias: true,
+        linear_bias: false,
+    });
+    config.validate().unwrap();
+    capability.bind_config("hybrid", config.clone());
+    capability.bind_config("other", config);
+    capability.call("hybrid", "hidden-activation", &[]).unwrap();
+    capability.call("hybrid", "rope-layers", &[]).unwrap();
+    assert_eq!(
+        capability.unread_declared_features("hybrid"),
+        vec!["mamba2-hybrid"]
+    );
+
+    let values = capability.call("hybrid", "mamba2-hybrid", &[]).unwrap();
+    let [ComponentValue::Option(Some(value))] = values.as_slice() else {
+        panic!("missing hybrid configuration")
+    };
+    let ComponentValue::Record(fields) = value.as_ref() else {
+        panic!("invalid hybrid configuration")
+    };
+    assert_eq!(
+        fields[0],
+        (
+            "layers".into(),
+            ComponentValue::List(vec![
+                ComponentValue::Enum("mamba2".into()),
+                ComponentValue::Enum("attention".into()),
+                ComponentValue::Enum("dense-mlp".into()),
+            ])
+        )
+    );
+    assert_eq!(fields[1], ("heads".into(), ComponentValue::U32(4)));
+    assert_eq!(fields[2], ("head-dimension".into(), ComponentValue::S64(8)));
+    assert_eq!(
+        fields[4],
+        ("state-dimension".into(), ComponentValue::S64(3))
+    );
+    assert_eq!(fields[7], ("dt-min".into(), ComponentValue::F64(0.01)));
+    assert_eq!(
+        fields[8],
+        (
+            "dt-max".into(),
+            ComponentValue::Option(Some(Box::new(ComponentValue::F64(0.5))))
+        )
+    );
+    assert_eq!(fields[9], ("conv-bias".into(), ComponentValue::Bool(true)));
+    assert_eq!(
+        fields[10],
+        ("linear-bias".into(), ComponentValue::Bool(false))
+    );
+    assert!(capability.unread_declared_features("hybrid").is_empty());
+    assert!(
+        capability
+            .unread_declared_features("other")
+            .contains(&"mamba2-hybrid")
+    );
+
+    capability.bind_config("plain", sample_config());
+    assert_eq!(
+        capability.call("plain", "mamba2-hybrid", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+}
+
+#[test]
 fn encoder_configuration_is_validated_bound_per_instance_and_must_be_read() {
     let capability = ModelConfigCapability::new();
     let mut architecture = sample_config();
@@ -730,6 +815,7 @@ fn qwen4_exp_decoder_forms_are_exposed_and_must_be_read() {
             compress_ratio: 4,
         }),
         sigmoid_linear_gate: true,
+        ..Default::default()
     };
     capability.bind_config("a", config);
     capability.call("a", "hidden-activation", &[]).unwrap();

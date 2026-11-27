@@ -56,6 +56,8 @@ const LATENT_ATTENTION_PROBE_COMPONENT: &str = include_str!(
 const EXPERT_NORMALIZATION_PROBE_COMPONENT: &str = include_str!(
     "../../../magnetar-runtime/fixtures/components/expert-normalization-probe.component.wat"
 );
+const MAMBA2_HYBRID_PROBE_COMPONENT: &str =
+    include_str!("../../../magnetar-runtime/fixtures/components/mamba2-hybrid-probe.component.wat");
 /// Imports `model-config@1.4.0`'s `rope-scaling`, whose variant has only the
 /// `banded` case, and returns the scaling's case (`run`).
 const BANDED_ONLY_PROBE_COMPONENT: &str = r#"
@@ -1777,6 +1779,73 @@ fn yarn_scaling() -> crate::RopeFrequencyScaling {
         },
         mscale_all_dim: Some(0.707),
     }
+}
+
+#[test]
+fn wasmtime_engine_lowers_mamba2_hybrid_configuration_into_a_real_component() {
+    let config = crate::ModelArchitectureConfig {
+        decoder_extensions: crate::DecoderExtensions {
+            mamba2_hybrid: Some(crate::Mamba2HybridConfig {
+                layers: vec![
+                    crate::HybridDecoderBlock::Mamba2,
+                    crate::HybridDecoderBlock::Attention,
+                    crate::HybridDecoderBlock::DenseMlp,
+                    crate::HybridDecoderBlock::RoutedMoe,
+                ],
+                heads: 4,
+                head_dim: 8,
+                groups: 2,
+                state_dim: 3,
+                conv_kernel: 4,
+                epsilon: 0.125,
+                dt_min: 0.25,
+                dt_max: Some(0.5),
+                conv_bias: true,
+                linear_bias: false,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        run_model_config_probe(
+            "mamba2-hybrid-probe",
+            MAMBA2_HYBRID_PROBE_COMPONENT,
+            "1.15.0",
+            config.clone(),
+            &["run"]
+        ),
+        vec![Ok(1)]
+    );
+    let mut no_limit = config.clone();
+    no_limit
+        .decoder_extensions
+        .mamba2_hybrid
+        .as_mut()
+        .unwrap()
+        .dt_max = None;
+    assert_eq!(
+        run_model_config_probe(
+            "mamba2-hybrid-unbounded",
+            MAMBA2_HYBRID_PROBE_COMPONENT,
+            "1.15.0",
+            no_limit,
+            &["run"]
+        ),
+        vec![Ok(0)]
+    );
+    let mut plain = config;
+    plain.decoder_extensions.mamba2_hybrid = None;
+    assert_eq!(
+        run_model_config_probe(
+            "mamba2-hybrid-none",
+            MAMBA2_HYBRID_PROBE_COMPONENT,
+            "1.15.0",
+            plain,
+            &["run"]
+        ),
+        vec![Ok(0)]
+    );
 }
 
 #[test]
