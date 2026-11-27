@@ -10,8 +10,15 @@ fn resident_encoder_releases_resources_after_success_failure_and_unload() {
     .unwrap();
     let case = cases.iter().find(|case| !case.bias).unwrap();
     let (_, bindings) = graph(case);
-    let bytes =
+    let mut bytes =
         include_bytes!("../../../fixtures/components/modernbert-encoder.component.wasm").to_vec();
+    // The component registry is process-wide and keyed by byte digest. Other
+    // parallel tests register this fixture with different compatibility
+    // metadata, so give this otherwise identical component a unique custom
+    // section and therefore its own registry entry.
+    let marker = b"resident-encoder-cleanup-test";
+    bytes.extend_from_slice(&[0, (marker.len() + 1) as u8, marker.len() as u8]);
+    bytes.extend_from_slice(marker);
     let component = ComponentDigest::sha256(&bytes);
     let component_manifest = include_str!(
         "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
