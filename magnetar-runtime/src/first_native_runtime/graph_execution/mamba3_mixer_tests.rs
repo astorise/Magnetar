@@ -256,6 +256,8 @@ fn run_graph_with_angle_wrap(
         graph = with_prefill_angle_wrap(graph);
     }
     graph.validate(&initial_operator_catalog()).unwrap();
+    // Component-produced graphs pass this scope gate before planning.
+    validate_first_scope_graph(&graph).unwrap();
     let fixture = e2e_fixture().unwrap();
     let mut runtime = build_runtime_trusting_fixture(&fixture);
     let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
