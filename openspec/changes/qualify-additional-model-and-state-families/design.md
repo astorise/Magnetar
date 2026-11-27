@@ -241,23 +241,25 @@ every index and its successor remain exact in f32. The managed-history
 attention test now builds its position input this way, including continuation
 and decode, rather than receiving positions from its caller. Only Reference CPU
 is qualified for this new operator.
-Variable decode lengths still need Component graph/plan handling, and the
-portable attention's element bound limits the supported window. Neither this
-test nor the internal graph form qualifies full Olala generation.
+The portable attention's element bound limits the supported window. Neither
+this test nor the internal graph form qualifies full Olala generation.
 
 The Component graph-construction API can request a decode graph at a different
 committed-history length while retaining the original prefill length. A real
 1.16 Component verifies that the history descriptors change with that length,
 and a previously prepared plan rejects the new graph's different fingerprint.
-This construction API does not replace the generation loop's published plan:
-the separate experimental plan-advance API validates both graphs, growing KV
-shapes and stable recurrent/KV schemas, the ready Model Instance revision,
-the original canonical plan and its Kernel bindings, Provider, guards and
-leases before publishing a new generation. It rejects custom plan policies
-instead of discarding them. Tests execute several newly prepared plans with
-committed KV and recurrent state and verify failed advances leave the old plan
-unchanged. The caller still owns session/history validation, and the production
-generation loop does not yet invoke this API for variable-length decoding.
+For explicit copy-based histories, the generation loop validates the request
+owner, committed token sequence and cache length, then rebuilds the graph and
+advances the published plan before its guard and dispatch. The experimental
+plan-advance API validates both graphs, growing KV shapes and stable
+recurrent/KV schemas, the ready Model Instance revision, the original canonical
+plan and its Kernel bindings, Provider, guards and leases before publishing a
+new generation. It rejects custom plan policies instead of discarding them.
+Tests exercise multiple decode positions and retry with committed KV and
+recurrent state through a real synthetic Component and verify failures preserve
+the old plan. This path rebuilds graphs instead of keeping an unbounded cache;
+its performance is not qualified. The probe's logits are a separate projection
+and do not qualify complete Olala model generation.
 
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,

@@ -725,6 +725,8 @@ pub(crate) struct CachedGraphs {
     /// their steps are neither captured nor replayed, and their prefills
     /// are never padded.
     pub(crate) recurrent: bool,
+    /// A copy-based history needs the normal executor on every step, too.
+    pub(crate) history_input: bool,
     pub(crate) prefill_memo: GraphExecutionMemo,
     pub(crate) decode_memo: GraphExecutionMemo,
     /// The Prepared Execution Plans last prepared for these graphs, with
@@ -750,11 +752,14 @@ impl CachedGraphs {
     pub(crate) fn new(graphs: FirstNativeComponentGraphs) -> Self {
         let recurrent = super::recurrent_state::has_recurrent_state(&graphs.prefill)
             || super::recurrent_state::has_recurrent_state(&graphs.decode);
+        let history_input = super::kv_history_inputs::has_history_inputs(&graphs.prefill)
+            || super::kv_history_inputs::has_history_inputs(&graphs.decode);
         Self {
             graphs,
             logits_row: false,
             serves_longer_prompts: false,
             recurrent,
+            history_input,
             prefill_memo: GraphExecutionMemo::default(),
             decode_memo: GraphExecutionMemo::default(),
             plans: std::sync::Mutex::new(None),
@@ -1605,8 +1610,8 @@ impl E2eRuntimeModelExecutionEngine {
         }
         // A replay would bypass the executor that binds and stages the
         // recurrent state.
-        if graphs.recurrent {
-            trace_step_capture("not captured", "prefill with recurrent state");
+        if graphs.recurrent || graphs.history_input {
+            trace_step_capture("not captured", "prefill with Runtime-owned state");
             return Ok(None);
         }
         let Some(provider) = execution_plan
@@ -1898,6 +1903,173 @@ impl E2eRuntimeModelExecutionEngine {
         }
     }
 
+    fn component_graphs_for_length(
+        &self,
+        runtime: &Runtime,
+        graph_length: u64,
+    ) -> Result<Arc<CachedGraphs>, InferenceApiError> {
+        if let Some(graphs) = self
+            .graph_cache
+            .as_ref()
+            .and_then(|cache| cache.get(graph_length))
+        {
+            return Ok(graphs);
+        }
+        let graphs = match &self.component_digest {
+            Some(digest) => build_first_native_graphs_from_named_component_for_artifact(
+                digest,
+                &architecture_config_from_first_native_model_config(&self.fixture.config),
+                &self.fixture.manifest.tensors,
+                &self.fixture.identity,
+                graph_length,
+            )
+            .map(|(graphs, _, _)| graphs),
+            None => first_native_component_graphs_for_prompt(&self.fixture, graph_length),
+        }
+        .map_err(|error| InferenceApiError::GraphPlanningFailed {
+            reason: error.to_string(),
+        })?;
+        Ok(Arc::new(match &self.graph_cache {
+            Some(cache) => cache.prepare(runtime, graphs, graph_length),
+            None => CachedGraphs::new(graphs),
+        }))
+    }
+
+    fn component_graphs_for_history_position(
+        &self,
+        runtime: &Runtime,
+        baseline: &Arc<CachedGraphs>,
+        prompt_tokens: u64,
+        position: u64,
+    ) -> Result<Arc<CachedGraphs>, InferenceApiError> {
+        if position == prompt_tokens {
+            return Ok(Arc::clone(baseline));
+        }
+        let digest = self.component_digest.as_ref().ok_or_else(|| {
+            InferenceApiError::GraphPlanningFailed {
+                reason: "variable history requires a registered model Component".into(),
+            }
+        })?;
+        let (graphs, _, _) =
+            build_first_native_graphs_from_named_component_for_artifact_at_decode_position(
+                digest,
+                &architecture_config_from_first_native_model_config(&self.fixture.config),
+                &self.fixture.manifest.tensors,
+                &self.fixture.identity,
+                prompt_tokens,
+                position,
+            )
+            .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                reason: error.to_string(),
+            })?;
+        let graphs = Arc::new(match &self.graph_cache {
+            Some(cache) => cache.prepare(runtime, graphs, prompt_tokens),
+            None => CachedGraphs::new(graphs),
+        });
+        if semantic_graph_fingerprint(&graphs.prefill)
+            != semantic_graph_fingerprint(&baseline.prefill)
+            || !super::kv_history_inputs::has_history_inputs(&graphs.decode)
+        {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: "the Component changed the prefill graph or removed decode history".into(),
+            });
+        }
+        Ok(graphs)
+    }
+
+    fn prepare_history_decode_step(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        plan: &mut PreparedExecutionPlan,
+    ) -> Result<(), InferenceApiError> {
+        if generated_tokens.is_empty() || self.component_digest.is_none() {
+            return Ok(());
+        }
+        self.validate_kv_request_owner(request)?;
+        let prompt_tokens = request.input_token_ids.len() as u64;
+        let graph_length = self.prefill_graph_length(prompt_tokens);
+        let baseline = self.component_graphs_for_length(runtime, graph_length)?;
+        if !super::kv_history_inputs::has_history_inputs(&baseline.decode) {
+            return Ok(());
+        }
+        if graph_length != prompt_tokens {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: "copy-based history requires an unpadded, unchunked prefill".into(),
+            });
+        }
+        let state = self.decode_kv_state(runtime, request)?;
+        if state.generated.0.as_slice() != generated_tokens {
+            return Err(InferenceApiError::KvCacheUnavailable {
+                reason: "decode token history does not match the committed generation".into(),
+            });
+        }
+        let GenerationModelReference::ModelInstance(instance) = &request.model else {
+            return Err(InferenceApiError::ModelLoadingFailed {
+                reason: "history decoding requires an active Model Instance".into(),
+            });
+        };
+        let revision = require_ready_first_native_instance(runtime, instance)?
+            .status()
+            .mutation_version;
+        if plan.scope.model_instance.as_ref() != Some(instance)
+            || plan.scope.model_instance_revision != Some(revision)
+            || plan.scope.provider.as_ref() != state.provider.as_ref()
+            || state.provider.is_none()
+        {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: "decode plan does not match the session's Model Instance and Provider"
+                    .into(),
+            });
+        }
+        let position = generation_decode_absolute_position(
+            request.input_token_ids.len(),
+            generated_tokens.len(),
+        )
+        .ok_or_else(|| InferenceApiError::GenerationFailed {
+            reason: "decode requires a newly admitted token position".into(),
+        })? as u64;
+        let cache = runtime.kv_cache(&state.cache)?;
+        if cache.layout.position_start != 0
+            || u64::from(cache.layout.current_token_length) != position
+            || cache.layout.position_end_exclusive != position
+        {
+            return Err(InferenceApiError::KvCacheUnavailable {
+                reason: "the committed KV cache length does not match the decode position".into(),
+            });
+        }
+        let next = self.component_graphs_for_history_position(
+            runtime,
+            &baseline,
+            prompt_tokens,
+            position,
+        )?;
+        if plan.graph_fingerprint == semantic_graph_fingerprint(&next.decode) {
+            return Ok(());
+        }
+        let previous_position = position
+            .checked_sub(1)
+            .filter(|&n| n >= prompt_tokens)
+            .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                reason: "decode plan does not match the first history position".into(),
+            })?;
+        let previous = self.component_graphs_for_history_position(
+            runtime,
+            &baseline,
+            prompt_tokens,
+            previous_position,
+        )?;
+        advance_first_native_history_decode_plan(
+            runtime,
+            instance,
+            &previous.decode,
+            &next.decode,
+            position,
+            plan,
+        )
+    }
+
     /// One generation step; with `greedy` (a plain greedy sampling
     /// request), a replayed decode step's token may be selected on the
     /// Device instead of returning its logits.
@@ -2093,38 +2265,30 @@ impl E2eRuntimeModelExecutionEngine {
             // bucket's graph, which the plan was prepared against.
             let graph_length = self.prefill_graph_length(prompt_token_count);
             let graph_build_clock = runtime.phase_ledger().clock();
-            let cached_graphs = self
-                .graph_cache
-                .as_ref()
-                .and_then(|cache| cache.get(graph_length));
-            let component_graphs = match cached_graphs {
-                Some(graphs) => graphs,
-                None => Arc::new(
-                    match &self.component_digest {
-                        Some(digest) => {
-                            build_first_native_graphs_from_named_component_for_artifact(
-                                digest,
-                                &architecture_config_from_first_native_model_config(
-                                    &self.fixture.config,
-                                ),
-                                &self.fixture.manifest.tensors,
-                                &self.fixture.identity,
-                                graph_length,
-                            )
-                            .map(|(graphs, _definition, _instance)| graphs)
-                        }
-                        None => {
-                            first_native_component_graphs_for_prompt(&self.fixture, graph_length)
-                        }
-                    }
-                    .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                        reason: error.to_string(),
-                    })
-                    .map(|graphs| match &self.graph_cache {
-                        Some(cache) => cache.prepare(runtime, graphs, graph_length),
-                        None => CachedGraphs::new(graphs),
-                    })?,
-                ),
+            let baseline = self.component_graphs_for_length(runtime, graph_length)?;
+            if baseline.history_input {
+                if graph_length != prompt_token_count {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: "copy-based history requires an unpadded, unchunked prefill".into(),
+                    });
+                }
+                super::history_decode_planning::validate_history_graph_pair(
+                    &baseline.prefill,
+                    &baseline.decode,
+                    prompt_token_count,
+                )?;
+            }
+            let component_graphs = if !generated_tokens.is_empty()
+                && super::kv_history_inputs::has_history_inputs(&baseline.decode)
+            {
+                self.component_graphs_for_history_position(
+                    runtime,
+                    &baseline,
+                    prompt_token_count,
+                    absolute_position as u64,
+                )?
+            } else {
+                baseline
             };
             runtime
                 .phase_ledger_mut()
@@ -2425,6 +2589,16 @@ pub(super) fn materialize_last_rows(
 }
 
 impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
+    fn prepare_decode_step(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        execution_plan: &mut PreparedExecutionPlan,
+    ) -> Result<(), InferenceApiError> {
+        self.prepare_history_decode_step(runtime, request, generated_tokens, execution_plan)
+    }
+
     fn execute_generation_step(
         &self,
         runtime: &mut Runtime,

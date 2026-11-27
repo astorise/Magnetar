@@ -5,6 +5,14 @@ use super::*;
 
 type HistorySchema = [(String, String); 2];
 
+pub(super) fn has_history_inputs(graph: &ExecutionGraph) -> bool {
+    graph.edges.values().any(|edge| {
+        edge.kv_cache
+            .as_ref()
+            .is_some_and(|metadata| metadata.behavior == GraphKvCacheBehavior::HistoryInput)
+    })
+}
+
 /// Bind each explicitly declared history input to the request's own KV
 /// resources. The matching complete-history output is staged by the normal KV
 /// transaction. Components may declare it via the experimental 1.16 ABI.
@@ -20,11 +28,7 @@ pub(super) fn bind_history_inputs(
     initial: &mut BTreeMap<TensorEdgeId, HostTensor>,
     resident: &mut BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
 ) -> Result<BTreeMap<usize, HistorySchema>, InferenceApiError> {
-    if !graph.edges.values().any(|edge| {
-        edge.kv_cache
-            .as_ref()
-            .is_some_and(|metadata| metadata.behavior == GraphKvCacheBehavior::HistoryInput)
-    }) {
+    if !has_history_inputs(graph) {
         return Ok(BTreeMap::new());
     }
     let malformed = |reason: String| InferenceApiError::GraphPlanningFailed { reason };

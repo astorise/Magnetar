@@ -9,5 +9,8 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+generation = []
+
 [dependencies]
 magnetar-component-api = { git = "https://github.com/astorise/magnetar-component-api", rev = "106afd07a3e94ccd505d69a28c299adb64d16565", features = ["v1_16"] }

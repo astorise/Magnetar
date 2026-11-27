@@ -10,13 +10,15 @@ type HistorySchema = BTreeMap<String, (String, Vec<u64>)>;
 
 fn history_schema(
     graph: &ExecutionGraph,
+    phase: ExecutionGraphPhase,
     position: u64,
+    tokens: u64,
 ) -> Result<HistorySchema, InferenceApiError> {
     let failure = |reason: &str| InferenceApiError::GraphPlanningFailed {
-        reason: format!("invalid decode history graph: {reason}"),
+        reason: format!("invalid history graph: {reason}"),
     };
-    if graph.phase != ExecutionGraphPhase::Decode {
-        return Err(failure("expected decode phase"));
+    if graph.phase != phase || tokens == 0 {
+        return Err(failure("wrong phase or empty step"));
     }
     graph
         .validate(&initial_operator_catalog())
@@ -28,7 +30,7 @@ fn history_schema(
         return Err(failure("no copy-based history inputs"));
     }
     let output_rows = position
-        .checked_add(1)
+        .checked_add(tokens)
         .ok_or_else(|| failure("position overflow"))?;
     let mut schema = BTreeMap::new();
     for binding in bindings {
@@ -51,6 +53,28 @@ fn history_schema(
         }
     }
     Ok(schema)
+}
+
+/// A production prefill and its first decode must carry the same complete
+/// copy-based histories, with no padding or implicit missing history.
+pub(super) fn validate_history_graph_pair(
+    prefill: &ExecutionGraph,
+    decode: &ExecutionGraph,
+    prompt_tokens: u64,
+) -> Result<(), InferenceApiError> {
+    if !super::kv_history_inputs::has_history_inputs(prefill)
+        && !super::kv_history_inputs::has_history_inputs(decode)
+    {
+        return Ok(());
+    }
+    if history_schema(prefill, ExecutionGraphPhase::Prefill, 0, prompt_tokens)?
+        != history_schema(decode, ExecutionGraphPhase::Decode, prompt_tokens, 1)?
+    {
+        return Err(InferenceApiError::GraphPlanningFailed {
+            reason: "prefill and decode history schemas differ".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Replaces a ready decode plan with one prepared for the next history length.
@@ -76,8 +100,12 @@ pub fn advance_first_native_history_decode_plan(
     let previous_position = next_position
         .checked_sub(1)
         .ok_or_else(|| fail("the next history position must be positive".into()))?;
-    if history_schema(previous_graph, previous_position)?
-        != history_schema(next_graph, next_position)?
+    if history_schema(
+        previous_graph,
+        ExecutionGraphPhase::Decode,
+        previous_position,
+        1,
+    )? != history_schema(next_graph, ExecutionGraphPhase::Decode, next_position, 1)?
     {
         return Err(fail("decode history schema changed between steps".into()));
     }

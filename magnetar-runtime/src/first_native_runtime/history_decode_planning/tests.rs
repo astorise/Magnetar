@@ -84,6 +84,35 @@ fn graph(position: u64) -> ExecutionGraph {
 }
 
 #[test]
+fn prefill_and_decode_require_paired_complete_histories() {
+    let mut prefill = graph(0);
+    prefill.phase = ExecutionGraphPhase::Prefill;
+    let decode = graph(1);
+    validate_history_graph_pair(&prefill, &decode, 1).unwrap();
+    let mut absent = prefill.clone();
+    for edge in absent.edges.values_mut() {
+        edge.kv_cache = None;
+    }
+    assert!(validate_history_graph_pair(&absent, &decode, 1).is_err());
+    let mut wrong_length = prefill.clone();
+    wrong_length
+        .edges
+        .get_mut(&TensorEdgeId::new("updated.k"))
+        .unwrap()
+        .descriptor
+        .shape
+        .dimensions[0] = 2;
+    assert!(validate_history_graph_pair(&wrong_length, &decode, 1).is_err());
+    let mut incompatible = decode;
+    for edge in incompatible.edges.values_mut() {
+        if let Some(history) = &mut edge.kv_cache {
+            history.compatibility_key = "other".into();
+        }
+    }
+    assert!(validate_history_graph_pair(&prefill, &incompatible, 1).is_err());
+}
+
+#[test]
 fn advancing_history_plans_preserves_guards_and_rejects_invalid_replacements() {
     let fixture = e2e_fixture().unwrap();
     let mut runtime = build_runtime_trusting_fixture(&fixture);

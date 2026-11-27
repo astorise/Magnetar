@@ -378,10 +378,11 @@ impl E2eRuntimeModelExecutionEngine {
         // resources are the same from one step to the next.
         // A replay would bypass the executor that binds and stages the
         // recurrent state (`support-qwen38-flash-next`).
-        if graphs.recurrent && decode_index == STEP_CAPTURE_DECODE_INDEX {
-            trace_step_capture("not captured", "decode step with recurrent state");
+        if (graphs.recurrent || graphs.history_input) && decode_index == STEP_CAPTURE_DECODE_INDEX {
+            trace_step_capture("not captured", "decode step with Runtime-owned state");
         }
         let replayable = !graphs.recurrent
+            && !graphs.history_input
             && self.step_replay.is_enabled()
             && kv_stores.is_some()
             && !kv_state.layer_kv.is_empty()

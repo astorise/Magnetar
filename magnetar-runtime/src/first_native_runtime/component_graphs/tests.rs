@@ -1067,6 +1067,363 @@ fn component_decode_graph_can_be_built_at_a_later_history_position() {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn production_generation_replans_component_owned_copy_histories() {
+    let bytes =
+        include_bytes!("../../../fixtures/components/kv-history-generation-probe.component.wasm");
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = include_str!(
+        "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    )
+    .replace(
+        "sha256:321b42b83773544e1ba553cc7196d3d742cd9ef1e2af3f04da72b66e402a730f",
+        &digest.value,
+    )
+    .replace("magnetar.qwen.real", "magnetar.history.generation-probe")
+    .replace("1.14.0", "1.16.0");
+    register_inference_component_artifact(
+        bytes.to_vec(),
+        manifest.into_bytes(),
+        &ComponentTrustStore::default().trust_digest(&digest.value),
+    )
+    .unwrap();
+
+    let (mut fixture, mut payload) = super::super::tests::production_shaped_canonical_fixture();
+    let template = fixture.manifest.tensors[0].clone();
+    let mut offset = fixture
+        .manifest
+        .tensors
+        .iter()
+        .filter_map(|tensor| tensor.offset_bytes.zip(tensor.size_bytes))
+        .map(|(start, length)| start + length)
+        .max()
+        .unwrap_or(0);
+    for (name, shape) in [
+        ("probe.q", vec![4, 8]),
+        ("probe.a_key", vec![4, 4]),
+        ("probe.b_key", vec![4, 4]),
+        ("probe.a_value", vec![4, 4]),
+        ("probe.b_value", vec![4, 4]),
+        ("probe.shift_key", vec![4, 2]),
+        ("probe.shift_value", vec![4, 2]),
+        ("probe.lambda", vec![4, 2]),
+        ("probe.q_norm", vec![2]),
+        ("probe.k_norm", vec![2]),
+        ("probe.scaler", vec![4]),
+    ] {
+        let count = shape.iter().product::<u64>() as usize;
+        let values: Vec<f32> = (0..count)
+            .map(|index| {
+                if name.ends_with("_norm") {
+                    1.0
+                } else {
+                    ((index * 3 % 11) as f32 - 5.0) * 0.02
+                }
+            })
+            .collect();
+        let bytes: Vec<_> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut tensor = template.clone();
+        tensor.name = name.into();
+        tensor.shape = shape;
+        tensor.offset_bytes = Some(offset);
+        tensor.size_bytes = Some(bytes.len() as u64);
+        tensor.digest = Some(ModelDigest::sha256(&bytes));
+        offset += bytes.len() as u64;
+        fixture.manifest.tensors.push(tensor);
+        payload.bytes_by_name.insert(name.into(), bytes);
+    }
+    let floats = |name: &str| {
+        let (chunks, remainder) = payload.bytes_by_name[name].as_chunks::<4>();
+        assert!(remainder.is_empty());
+        chunks
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect::<Vec<_>>()
+    };
+    let embedding = floats("token_embedding");
+    let head = floats("lm_head");
+    let trust = ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone());
+    let mut model = ProductionLoadedModel::load_with_component(
+        fixture,
+        &payload,
+        trust,
+        Arc::new(ReferenceCpuProvider::new()),
+        Some(digest),
+    )
+    .unwrap();
+    model.set_prefill_buckets(Vec::new());
+    let mut logits = Vec::new();
+    let result = model
+        .generate_streaming_with_logits(
+            ProductionGenerationRequest {
+                prompt: PromptInput::TokenIds(vec![1, 2, 3]),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions {
+                    eos: EosPolicy {
+                        mode: EosMode::Ignore,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                max_new_tokens: Some(4),
+                max_generation_millis: None,
+            },
+            None,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+            &mut |step| logits.push(step.to_vec()),
+        )
+        .unwrap();
+    assert_eq!(logits.len(), 4);
+    assert_eq!(result.result.output.generated_token_ids.len(), 4);
+    for (step, actual) in logits.iter().enumerate() {
+        let token = if step == 0 {
+            3
+        } else {
+            result.result.output.generated_token_ids[step - 1]
+        } as usize;
+        for column in 0..258 {
+            let expected: f32 = (0..4)
+                .map(|row| embedding[token * 4 + row] * head[row * 258 + column])
+                .sum();
+            assert!((actual[column] - expected).abs() < 2e-6);
+        }
+    }
+    let generations: Vec<_> = result
+        .observer
+        .observations()
+        .iter()
+        .filter(|event| {
+            event.kind == InferenceApiObservationKind::PlanSelected
+                && event.message.contains("phase=decode")
+        })
+        .filter_map(|event| {
+            event
+                .message
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix("plan_generation="))
+        })
+        .collect();
+    assert_eq!(generations, ["1", "1", "2", "3"]);
+
+    // A new session resets both fixed recurrent slots and growing history.
+    // Chunking or right padding cannot be used for this copy-based graph.
+    model.set_prefill_buckets(vec![4]);
+    model.set_prefill_chunk(2);
+    let mut repeated_logits = Vec::new();
+    let repeated = model
+        .generate_streaming_with_logits(
+            ProductionGenerationRequest {
+                prompt: PromptInput::TokenIds(vec![1, 2, 3]),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions {
+                    eos: EosPolicy {
+                        mode: EosMode::Ignore,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                max_new_tokens: Some(4),
+                max_generation_millis: None,
+            },
+            None,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+            &mut |step| repeated_logits.push(step.to_vec()),
+        )
+        .unwrap();
+    assert_eq!(
+        repeated.result.output.generated_token_ids,
+        result.result.output.generated_token_ids
+    );
+    assert_eq!(repeated_logits, logits);
+    assert_eq!(model.prefill_chunk(), 0);
+
+    // A stale token list, foreign session or invalidated plan must not
+    // advance the plan. An uncommitted step can then be retried safely.
+    let mut prepared = model
+        .prepare_generation(
+            ProductionGenerationRequest {
+                prompt: PromptInput::TokenIds(vec![1, 2, 3]),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions::default(),
+                max_new_tokens: Some(4),
+                max_generation_millis: None,
+            },
+            None,
+        )
+        .unwrap();
+    let engine = model.runtime.model_execution_engine().cloned().unwrap();
+    let request = &prepared.generation_request;
+    let prefill = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[],
+            Some(&mut prepared.prepared_plans.prefill),
+        )
+        .unwrap();
+    let cache = match &prefill.kv_commit {
+        Some(RuntimeKvCacheCommit::PrefillCompleted { cache, .. }) => cache.clone(),
+        _ => panic!("prefill must stage a KV cache"),
+    };
+    engine
+        .commit_generation_step(&mut model.runtime, request, &[], 7, &prefill)
+        .unwrap();
+    engine
+        .prepare_decode_step(
+            &mut model.runtime,
+            request,
+            &[7],
+            &mut prepared.prepared_plans.decode,
+        )
+        .unwrap();
+    let first_decode = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[7],
+            Some(&mut prepared.prepared_plans.decode),
+        )
+        .unwrap();
+    engine
+        .commit_generation_step(&mut model.runtime, request, &[7], 8, &first_decode)
+        .unwrap();
+    let layers = model
+        .runtime
+        .kv_cache(&cache)
+        .unwrap()
+        .layer_resources
+        .clone();
+    let recurrent = model
+        .runtime
+        .kv_cache(&cache)
+        .unwrap()
+        .recurrent_resources
+        .clone();
+    let before = prepared.prepared_plans.decode.clone();
+    let mut foreign = request.clone();
+    foreign.session = Some(InferenceSessionId::new("foreign-history-session").unwrap());
+    assert!(
+        engine
+            .prepare_decode_step(
+                &mut model.runtime,
+                &foreign,
+                &[7, 8],
+                &mut prepared.prepared_plans.decode,
+            )
+            .is_err()
+    );
+    assert!(
+        engine
+            .prepare_decode_step(
+                &mut model.runtime,
+                request,
+                &[7, 9],
+                &mut prepared.prepared_plans.decode,
+            )
+            .is_err()
+    );
+    assert_eq!(prepared.prepared_plans.decode, before);
+    model
+        .runtime
+        .kv_caches_mut()
+        .cache_mut(&cache)
+        .unwrap()
+        .layout
+        .current_token_length += 1;
+    assert!(
+        engine
+            .prepare_decode_step(
+                &mut model.runtime,
+                request,
+                &[7, 8],
+                &mut prepared.prepared_plans.decode,
+            )
+            .is_err()
+    );
+    assert_eq!(prepared.prepared_plans.decode, before);
+    model
+        .runtime
+        .kv_caches_mut()
+        .cache_mut(&cache)
+        .unwrap()
+        .layout
+        .current_token_length -= 1;
+    let mut invalidated = before.clone();
+    invalidated
+        .transition_to(crate::kernel_execution_plan::PreparedExecutionPlanState::Invalidated)
+        .unwrap();
+    assert!(
+        engine
+            .prepare_decode_step(&mut model.runtime, request, &[7, 8], &mut invalidated,)
+            .is_err()
+    );
+    engine
+        .prepare_decode_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            &mut prepared.prepared_plans.decode,
+        )
+        .unwrap();
+    assert_eq!(prepared.prepared_plans.decode.generation.value(), 2);
+    let attempt = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            Some(&mut prepared.prepared_plans.decode),
+        )
+        .unwrap();
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().layer_resources,
+        layers
+    );
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().recurrent_resources,
+        recurrent
+    );
+    engine
+        .prepare_decode_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            &mut prepared.prepared_plans.decode,
+        )
+        .unwrap();
+    let retry = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            Some(&mut prepared.prepared_plans.decode),
+        )
+        .unwrap();
+    assert_eq!(retry.logits, attempt.logits);
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().layer_resources,
+        layers
+    );
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().recurrent_resources,
+        recurrent
+    );
+    engine
+        .commit_generation_step(&mut model.runtime, request, &[7, 8], 9, &retry)
+        .unwrap();
+    engine
+        .release_request_state(&mut model.runtime, request)
+        .unwrap();
+    close_inference_session(&mut model.runtime, &prepared.session).unwrap();
+    model
+        .runtime
+        .forget_closed_inference_session(&prepared.session)
+        .unwrap();
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn e2e_qwen_component_wasm_reported_wrong_operator_hash_fails_before_planning() {
     let wat = qwen_component_fixture_wat(
         r#"(func (export "prefill-node-count") (result i32) i32.const 19)"#,

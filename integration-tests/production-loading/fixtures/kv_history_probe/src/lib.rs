@@ -2,15 +2,21 @@
 //! It builds a synthetic graph, not an executable language model.
 
 use magnetar_component_api::v1_16::{
-    Guest, export,
-    magnetar::model_component_graph::graph_builder::{
-        self as gb, GraphPhase, KvCacheRole, TensorShape,
-    },
-    magnetar::model_component_graph::model_config,
+    Guest, export, magnetar::model_component_graph::graph_builder::GraphPhase,
 };
+
+#[cfg(not(feature = "generation"))]
+use magnetar_component_api::v1_16::magnetar::model_component_graph::{
+    graph_builder::{self as gb, KvCacheRole, TensorShape},
+    model_config,
+};
+
+#[cfg(feature = "generation")]
+mod generation;
 
 struct Component;
 
+#[cfg(not(feature = "generation"))]
 fn graph(phase: GraphPhase, tokens: u64, position: u64) -> String {
     // The Runtime requires every decoder Component to acknowledge this
     // setting, even when this synthetic graph does not use an MLP.
@@ -29,6 +35,11 @@ fn graph(phase: GraphPhase, tokens: u64, position: u64) -> String {
     }
     let result = gb::add_node("combine", "add", "Tensor", &[], &outputs, &shape, None);
     gb::finish_graph(&result)
+}
+
+#[cfg(feature = "generation")]
+fn graph(phase: GraphPhase, tokens: u64, position: u64) -> String {
+    generation::graph(phase, tokens, position)
 }
 
 impl Guest for Component {

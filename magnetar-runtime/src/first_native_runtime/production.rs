@@ -2105,6 +2105,21 @@ impl ProductionLoadedModel {
                         graphs
                     }
                 };
+                if component_graphs.history_input
+                    && (graph_length != prompt_token_count
+                        || self.graph_cache.is_prefill_bucket(graph_length))
+                {
+                    self.graph_cache.set_prefill_buckets(Vec::new());
+                    self.graph_cache.set_prefill_chunk(0);
+                    continue;
+                }
+                if component_graphs.history_input {
+                    super::history_decode_planning::validate_history_graph_pair(
+                        &component_graphs.prefill,
+                        &component_graphs.decode,
+                        prompt_token_count,
+                    )?;
+                }
                 // A chunked prefill's later passes read the earlier passes' rows
                 // through the KV history alone (`chunk-long-prefills`): a graph
                 // whose attention reads K or V from elsewhere runs every prompt
