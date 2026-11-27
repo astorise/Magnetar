@@ -95,6 +95,201 @@ fn encoder_phase_is_distinct_and_refuses_decoder_offsets() {
 }
 
 #[test]
+fn kv_history_inputs_are_issued_paired_and_scoped_to_the_graph() {
+    let capability = GraphBuilderCapability::new();
+    for instance in ["history", "other"] {
+        capability.prepare_session(instance, context());
+        capability
+            .call(
+                instance,
+                "begin-graph",
+                &[
+                    ComponentValue::Enum("prefill".into()),
+                    ComponentValue::S64(1),
+                    ComponentValue::S64(0),
+                ],
+            )
+            .unwrap();
+    }
+    let issued = |role: &str| {
+        let result = capability
+            .call(
+                "history",
+                "kv-resource",
+                &[ComponentValue::S64(0), ComponentValue::Enum(role.into())],
+            )
+            .unwrap();
+        let ComponentValue::String(id) = &result[0] else {
+            panic!("expected KV resource")
+        };
+        id.clone()
+    };
+    let key = issued("k");
+    let value = issued("v");
+    assert!(
+        capability
+            .call(
+                "other",
+                "kv-history-input",
+                &[ComponentValue::String(key.clone()), shape(vec![1, 2])]
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .call(
+                "history",
+                "kv-history-input",
+                &[ComponentValue::String(key.clone()), shape(vec![0, 2])]
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .call(
+                "history",
+                "kv-history-input",
+                &[
+                    ComponentValue::String(key.clone()),
+                    shape(vec![1, 67_108_865])
+                ]
+            )
+            .is_err()
+    );
+
+    let build_history = |id: &str, node: &str| {
+        let result = capability
+            .call(
+                "history",
+                "kv-history-input",
+                &[ComponentValue::String(id.into()), shape(vec![1, 2])],
+            )
+            .unwrap();
+        let ComponentValue::String(input) = &result[0] else {
+            panic!("expected history edge")
+        };
+        assert!(
+            capability
+                .call(
+                    "history",
+                    "kv-history-output",
+                    &[
+                        ComponentValue::String(id.into()),
+                        ComponentValue::String(input.clone()),
+                    ],
+                )
+                .is_err()
+        );
+        assert!(
+            capability
+                .call(
+                    "history",
+                    "kv-history-input",
+                    &[ComponentValue::String(id.into()), shape(vec![1, 2])]
+                )
+                .is_err()
+        );
+        let result = capability
+            .call(
+                "history",
+                "add-node",
+                &[
+                    ComponentValue::String(node.into()),
+                    ComponentValue::String("silu".into()),
+                    ComponentValue::String("Activation".into()),
+                    ComponentValue::List(vec![]),
+                    ComponentValue::List(vec![ComponentValue::String(input.clone())]),
+                    shape(vec![1, 2]),
+                    ComponentValue::Option(None),
+                ],
+            )
+            .unwrap();
+        let ComponentValue::String(output) = &result[0] else {
+            panic!("expected output")
+        };
+        capability
+            .call(
+                "history",
+                "kv-history-output",
+                &[
+                    ComponentValue::String(id.into()),
+                    ComponentValue::String(output.clone()),
+                ],
+            )
+            .unwrap();
+        assert!(
+            capability
+                .call(
+                    "history",
+                    "kv-history-output",
+                    &[
+                        ComponentValue::String(id.into()),
+                        ComponentValue::String(output.clone())
+                    ]
+                )
+                .is_err()
+        );
+        output.clone()
+    };
+    let k = build_history(&key, "k");
+    let v = build_history(&value, "v");
+    let result = capability
+        .call(
+            "history",
+            "add-node",
+            &[
+                ComponentValue::String("combine".into()),
+                ComponentValue::String("add".into()),
+                ComponentValue::String("Tensor".into()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(k), ComponentValue::String(v)]),
+                shape(vec![1, 2]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .unwrap();
+    let ComponentValue::String(output) = &result[0] else {
+        panic!("expected output")
+    };
+    let result = capability
+        .call(
+            "history",
+            "finish-graph",
+            &[ComponentValue::String(output.clone())],
+        )
+        .unwrap();
+    let ComponentValue::String(handle) = &result[0] else {
+        panic!("expected graph handle")
+    };
+    let graph = capability.take_graph("history", handle).unwrap();
+    let bindings = graph.kv_history_bindings().unwrap();
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0].cache_id, key);
+    assert_eq!(bindings[1].cache_id, value);
+    graph.validate(&crate::default_graph_catalog()).unwrap();
+    capability
+        .call(
+            "history",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".into()),
+                ComponentValue::S64(1),
+                ComponentValue::S64(0),
+            ],
+        )
+        .unwrap();
+    assert!(
+        capability
+            .call(
+                "history",
+                "kv-history-input",
+                &[ComponentValue::String(key), shape(vec![1, 2])],
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn builds_a_minimal_two_node_graph_end_to_end() {
     let capability = GraphBuilderCapability::new();
     capability.prepare_session("instance-1", context());

@@ -227,8 +227,10 @@ pending history with a matching position, shape and compatibility key. The
 Runtime stages each complete output and commits or discards it with the raw
 recurrent state. This initial copy-based form must reject padded/in-place
 stores and caller-supplied history bindings. It does not advertise device-side
-KV access to a Kernel. A future additive graph-builder Capability must expose
-these bindings before a Component can use them; existing imports stay unchanged.
+KV access to a Kernel. The proposed additive graph-builder 1.16 Capability
+exposes these bindings without changing older imports. A compiled test Component
+builds paired prefill and decode histories through Wasmtime; the published
+contract and the Runtime copy must be reconciled before release.
 The hand-built projected-attention graph compares prefill, continuation,
 cached decode, retry and separate sessions with the pinned PyTorch fixture.
 Variable decode lengths still need Component graph/plan handling, and the

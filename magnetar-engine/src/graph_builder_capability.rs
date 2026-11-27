@@ -13,7 +13,7 @@
 //! so the *capability* stays reusable across model families even though
 //! its *caller* is not yet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::component::{ComponentError, ComponentValue, HostCapability};
@@ -31,6 +31,10 @@ use crate::operator::{
 };
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/graph-builder";
+// A Component cannot make the issuance registry grow without bound. This
+// covers two roles for each of 4096 layers; legacy kv-resource calls keep
+// returning their identities even after this history-specific limit.
+const MAX_KV_HISTORY_RESOURCES: usize = 8192;
 
 /// Runtime context one graph-building session needs, supplied by the
 /// caller before it invokes the Component (`GraphBuilderCapability::
@@ -70,6 +74,7 @@ struct Session {
     finished: BTreeMap<String, ExecutionGraph>,
     next_handle: u64,
     recurrent_resources: BTreeMap<String, RecurrentResource>,
+    kv_resources: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -120,6 +125,7 @@ impl GraphBuilderCapability {
                 finished: BTreeMap::new(),
                 next_handle: 0,
                 recurrent_resources: BTreeMap::new(),
+                kv_resources: BTreeSet::new(),
             },
         );
     }
@@ -404,6 +410,7 @@ impl GraphBuilderCapability {
         graph.fingerprint = Some(session.context.compatibility_key.clone());
         session.graph = Some(graph);
         session.recurrent_resources.clear();
+        session.kv_resources.clear();
         Ok(Vec::new())
     }
 
@@ -537,8 +544,8 @@ impl GraphBuilderCapability {
             }
         };
 
-        let sessions = self.sessions.lock().unwrap();
-        let session = sessions.get(instance_key).ok_or_else(|| {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(instance_key).ok_or_else(|| {
             rejected(
                 CAPABILITY_NAME,
                 instance_key,
@@ -546,7 +553,156 @@ impl GraphBuilderCapability {
             )
         })?;
         let resource_id = format!("{}.layer{layer}.{role}", session.context.kv_namespace);
+        if session.kv_resources.len() < MAX_KV_HISTORY_RESOURCES {
+            session.kv_resources.insert(resource_id.clone());
+        }
         Ok(vec![ComponentValue::String(resource_id)])
+    }
+
+    /// Declare a Runtime-owned, copy-based history tensor for a previously
+    /// issued KV identity. The first sequence position uses one ignored row.
+    fn kv_history_input(
+        &self,
+        instance_key: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        expect_arity("kv-history-input", 2, arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let id = expect_string(&arguments[0])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let shape = decode_tensor_shape(&arguments[1])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        if shape.dimensions.len() < 2
+            || shape.dimensions.contains(&0)
+            || !shape.element_count().is_ok_and(|count| count <= 67_108_864)
+        {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "kv-history-input: invalid shape",
+            ));
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(instance_key).ok_or_else(|| {
+            rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "no prepared session for this instance",
+            )
+        })?;
+        if !session.kv_resources.contains(id) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "kv-history-input: unknown resource",
+            ));
+        }
+        let graph = session.graph.as_mut().ok_or_else(|| {
+            rejected(CAPABILITY_NAME, instance_key, "no graph under construction")
+        })?;
+        let edge_id = TensorEdgeId::new(format!("history.{id}.input"));
+        if graph.edges.contains_key(&edge_id) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "kv-history-input: duplicate input",
+            ));
+        }
+        let mut edge = TensorEdge::new(edge_id.clone(), descriptor_from_shape(shape));
+        edge.kv_cache = Some(GraphKvCacheMetadata {
+            cache_id: id.to_string(),
+            behavior: GraphKvCacheBehavior::HistoryInput,
+            paged: false,
+            compatibility_key: session.context.compatibility_key.clone(),
+        });
+        graph.edges.insert(edge_id.clone(), edge);
+        Ok(vec![ComponentValue::String(edge_id.as_str().to_string())])
+    }
+
+    /// Associate a produced edge with a complete successor history.
+    fn kv_history_output(
+        &self,
+        instance_key: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        expect_arity("kv-history-output", 2, arguments)
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let id = expect_string(&arguments[0])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let edge_id = expect_string(&arguments[1])
+            .map_err(|message| rejected(CAPABILITY_NAME, instance_key, message))?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(instance_key).ok_or_else(|| {
+            rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "no prepared session for this instance",
+            )
+        })?;
+        if !session.kv_resources.contains(id) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "kv-history-output: unknown resource",
+            ));
+        }
+        let graph = session.graph.as_mut().ok_or_else(|| {
+            rejected(CAPABILITY_NAME, instance_key, "no graph under construction")
+        })?;
+        let input = graph
+            .edges
+            .get(&TensorEdgeId::new(format!("history.{id}.input")))
+            .ok_or_else(|| {
+                rejected(
+                    CAPABILITY_NAME,
+                    instance_key,
+                    "kv-history-output: input missing",
+                )
+            })?;
+        let input_shape = input.descriptor.shape.dimensions.clone();
+        if graph.edges.values().any(|edge| {
+            edge.kv_cache.as_ref().is_some_and(|metadata| {
+                metadata.cache_id == id && metadata.behavior == GraphKvCacheBehavior::Output
+            })
+        }) {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "kv-history-output: duplicate output",
+            ));
+        }
+        let edge = graph
+            .edges
+            .get_mut(&TensorEdgeId::new(edge_id))
+            .ok_or_else(|| {
+                rejected(
+                    CAPABILITY_NAME,
+                    instance_key,
+                    "kv-history-output: unknown edge",
+                )
+            })?;
+        let output_shape = &edge.descriptor.shape.dimensions;
+        if edge.producer.is_none()
+            || edge.kv_cache.is_some()
+            || edge.prefix_cache.is_some()
+            || edge.recurrent_state.is_some()
+            || edge.aliasing != TensorAliasing::None
+            || output_shape.len() != input_shape.len()
+            || output_shape[1..] != input_shape[1..]
+        {
+            return Err(rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                "kv-history-output: incompatible node output",
+            ));
+        }
+        edge.kv_cache = Some(GraphKvCacheMetadata {
+            cache_id: id.to_string(),
+            behavior: GraphKvCacheBehavior::Output,
+            paged: false,
+            compatibility_key: session.context.compatibility_key.clone(),
+        });
+        Ok(Vec::new())
     }
 
     fn recurrent_resource(
@@ -1037,6 +1193,8 @@ impl HostCapability for GraphBuilderCapability {
             "weight-edge" => self.weight_edge(instance_key, arguments),
             "alias-weight-edge" => self.alias_weight_edge(instance_key, arguments),
             "kv-resource" => self.kv_resource(instance_key, arguments),
+            "kv-history-input" => self.kv_history_input(instance_key, arguments),
+            "kv-history-output" => self.kv_history_output(instance_key, arguments),
             "recurrent-resource" => self.recurrent_resource(instance_key, arguments),
             "recurrent-input" => self.recurrent_input(instance_key, arguments),
             "recurrent-output" => self.recurrent_output(instance_key, arguments),
