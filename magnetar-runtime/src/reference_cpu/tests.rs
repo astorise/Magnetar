@@ -2864,6 +2864,45 @@ fn text(value: &str) -> OperatorAttributeValue {
 }
 
 #[test]
+fn position_range_kernel_checks_offset_and_output_shape() {
+    let input = reference_cpu_host_tensor([2, 2], [9.0, -3.0, 2.0, 1.0]);
+    let offset = [("position_offset", OperatorAttributeValue::Integer(12))];
+    assert_eq!(
+        invoke_extended(
+            "position-range",
+            std::slice::from_ref(&input),
+            &[2],
+            &offset
+        )
+        .unwrap()
+        .data,
+        [12.0, 13.0]
+    );
+    assert!(
+        invoke_extended(
+            "position-range",
+            std::slice::from_ref(&input),
+            &[1],
+            &offset
+        )
+        .is_none()
+    );
+    assert!(invoke_extended("position-range", std::slice::from_ref(&input), &[2], &[]).is_none());
+    assert!(
+        invoke_extended(
+            "position-range",
+            &[input],
+            &[2],
+            &[(
+                "position_offset",
+                OperatorAttributeValue::Integer(16_777_215)
+            )],
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn attention_scale_replaces_the_inverse_square_root() {
     // One head of width 2, three keys, the last query row, causal.
     let q = reference_cpu_host_tensor([1, 2], [0.5, -1.0]);

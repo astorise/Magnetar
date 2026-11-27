@@ -233,6 +233,14 @@ builds paired prefill and decode histories through Wasmtime; the published
 contract and the Runtime copy must be reconciled before release.
 The hand-built projected-attention graph compares prefill, continuation,
 cached decode, retry and separate sessions with the pinned PyTorch fixture.
+The portable `position-range@1` operator generates a contiguous f32 vector
+from a two-dimensional token anchor. A graph declares its nonnegative
+`position_offset`; the Runtime supplies the actual step position on reuse.
+The complete range is checked before allocation and stops at 16,777,215 so
+every index and its successor remain exact in f32. The managed-history
+attention test now builds its position input this way, including continuation
+and decode, rather than receiving positions from its caller. Only Reference CPU
+is qualified for this new operator.
 Variable decode lengths still need Component graph/plan handling, and the
 portable attention's element bound limits the supported window. Neither this
 test nor the internal graph form qualifies full Olala generation.

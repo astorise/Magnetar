@@ -22,6 +22,7 @@ mod mamba3_core;
 mod mamba3_mimo;
 mod mamba3_mixer;
 mod ngram_ple;
+mod position_range;
 mod projected_differential_attention;
 mod qsa_select;
 mod remainder_scalar;
@@ -52,6 +53,7 @@ pub use mamba3_core::Geometry as Mamba3Mimo;
 pub use mamba3_mimo::{mamba3_mimo, mamba3_mimo_from_attributes};
 pub use mamba3_mixer::{Mamba3Mixer, mamba3_mixer, mamba3_mixer_from_attributes};
 pub use ngram_ple::{NgramEmbedding, NgramPle, ngram_embedding, ngram_ple};
+pub use position_range::{position_range, position_range_offset, position_range_validate};
 pub use projected_differential_attention::{
     ProjectedDifferentialAttention, projected_differential_attention,
     projected_differential_attention_from_attributes,

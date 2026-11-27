@@ -7,7 +7,7 @@ type HistorySchema = [(String, String); 2];
 
 /// Bind each explicitly declared history input to the request's own KV
 /// resources. The matching complete-history output is staged by the normal KV
-/// transaction. No Component-facing capability exposes this form yet.
+/// transaction. Components may declare it via the experimental 1.16 ABI.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn bind_history_inputs(
     runtime: &Runtime,

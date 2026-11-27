@@ -136,6 +136,73 @@ fn close(actual: &[f32], expected: &[f32], label: &str) {
         );
     }
 }
+
+#[test]
+fn position_range_uses_the_graph_offset_or_the_actual_step_position() {
+    let input = TensorEdgeId::new("input.hidden");
+    let output = TensorEdgeId::new("logits");
+    let graph = ExecutionGraph::new(
+        ExecutionGraphId::new("positions"),
+        ExecutionGraphPhase::Prefill,
+    )
+    .with_edge(TensorEdge::new(
+        input.clone(),
+        f32_tensor_descriptor_from_shape(&[2, 3]),
+    ))
+    .with_edge(TensorEdge::new(
+        output.clone(),
+        f32_tensor_descriptor_from_shape(&[2]),
+    ))
+    .with_node(
+        ExecutionNode::new(
+            ExecutionNodeId::new("positions"),
+            OperatorId::magnetar("position-range", 1, OperatorFamily::Tensor),
+        )
+        .with_input(input.clone())
+        .with_output(output.clone())
+        .with_attribute("position_offset", OperatorAttributeValue::Integer(4)),
+    );
+    graph.validate(&initial_operator_catalog()).unwrap();
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &graph,
+        &instance,
+        revision,
+        2,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    let bindings = BTreeMap::from([(input, HostTensor::new([2, 3], vec![0.0; 6]).unwrap())]);
+    let mut run = |offset| {
+        execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("positions").unwrap(),
+            &graph,
+            &mut plan,
+            bindings.clone(),
+            None,
+            offset,
+            &mut Vec::new(),
+            MaterializedEdges::All,
+            None,
+            None,
+        )
+    };
+    assert_eq!(run(None).unwrap().1[&output].data, [4.0, 5.0]);
+    assert_eq!(run(Some(9)).unwrap().1[&output].data, [9.0, 10.0]);
+    assert!(run(Some(16_777_215)).is_err());
+}
+
 fn make_graph(
     c: &Reference,
     case: &Case,
@@ -491,8 +558,8 @@ fn projected_attention_keeps_raw_state_separate_from_kv_history() {
 }
 
 /// Both the fixed raw-token state and the growing K/V history belong to the
-/// Runtime. The hand-built graph is experimental; no Component API exposes
-/// these history inputs yet.
+/// Runtime. The hand-built graph is experimental and generates positions
+/// from the invocation's actual offset instead of a caller-supplied tensor.
 #[test]
 fn projected_attention_uses_runtime_managed_history_tensors() {
     let c = reference();
@@ -538,6 +605,17 @@ fn projected_attention_uses_runtime_managed_history_tensors() {
             .unwrap();
         }
         let (mut graph, mut bindings) = make_graph(&c, case, &tensors);
+        bindings.remove(&TensorEdgeId::new("input.5"));
+        graph = graph.with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("positions"),
+                OperatorId::magnetar("position-range", 1, OperatorFamily::Tensor),
+            )
+            .with_input(TensorEdgeId::new("input.0"))
+            .with_output(TensorEdgeId::new("input.5"))
+            // The Runtime supplies the actual offset on every invocation.
+            .with_attribute("position_offset", OperatorAttributeValue::Integer(0)),
+        );
         for (slot, input, output) in [
             ("raw_key", "input.1", "output.raw-key"),
             ("raw_value", "input.2", "output.raw-value"),

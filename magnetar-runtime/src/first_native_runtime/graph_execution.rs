@@ -956,6 +956,54 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "position-range" => {
+            if inputs.len() != 1 || node.outputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' expects one position anchor and output"
+                    ),
+                });
+            }
+            let declared_offset = crate::operator_semantics::position_range_offset(
+                &node.attributes,
+            )
+            .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                reason: error.to_string(),
+            })?;
+            let offset = absolute_position_override.unwrap_or(declared_offset);
+            let input = inputs.remove(0);
+            let tokens = crate::operator_semantics::position_range_validate(input.shape(), offset)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                })?;
+            let shape = [tokens];
+            if let Some(graph) = ctx.graph.as_ref()
+                && graph
+                    .graph()
+                    .edges
+                    .get(&node.outputs[0])
+                    .is_none_or(|edge| edge.descriptor.shape.dimensions != shape)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' has an invalid position output shape"),
+                });
+            }
+            let mut attributes = node.attributes.clone();
+            attributes.insert(
+                "position_offset".into(),
+                OperatorAttributeValue::Integer(offset as i64),
+            );
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                node.operator.clone(),
+                vec![node_input_resource(node_id, "anchor", input)],
+                f32_tensor_descriptor_from_shape(&shape),
+                Some(output_target),
+                attributes,
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "slice-last" => {
             if inputs.len() != 1 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -2072,6 +2120,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "projected-differential-attention"
                 | "affine-layernorm"
                 | "slice-last"
+                | "position-range"
                 | "remainder-scalar"
                 | "row-scale"
                 | "activation"
@@ -2186,6 +2235,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "affine-layernorm"
                 | "gelu-exact"
                 | "slice-last"
+                | "position-range"
                 | "remainder-scalar"
         ) {
             for edge_id in &node.outputs {
