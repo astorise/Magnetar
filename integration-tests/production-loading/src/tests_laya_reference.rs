@@ -197,7 +197,7 @@ fn models_from_synthetic_safetensors() -> (
     )
 }
 
-fn encoder_graph_request(
+pub(crate) fn encoder_graph_request(
     profile: &CheckpointProfile,
     sequence_length: u64,
 ) -> (
@@ -459,6 +459,7 @@ fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
             &graph,
             &magnetar_runtime::KvCacheId::new("laya-encoder-conformance").unwrap(),
             bindings,
+            &["hidden_states"],
         )
         .unwrap();
         let graph_hidden =

@@ -43,6 +43,8 @@ mod tests_glm_logits;
 #[cfg(test)]
 mod tests_kimi_logits;
 #[cfg(test)]
+mod tests_laya_real_checkpoint;
+#[cfg(test)]
 mod tests_laya_reference;
 #[cfg(test)]
 mod tests_mistral_logits;

@@ -24,3 +24,35 @@ generator verifies the Laya source hash. With both submodules checked out:
 python integration-tests/production-loading/fixtures/generate_laya_reference.py \
   path/to/modeling_modernbert.py path/to/rl_common.py
 ```
+
+## Complete checkpoint comparison
+
+`laya-real-checkpoint-reference.json` uses the complete published Laya
+`model.safetensors` from revision `fd4f9dbcf4fde222fd43174bdd4c3b08b789e4e1`
+(843 MB, SHA-256 `891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c`).
+Its two cases have hand-specified token IDs, padding, two or three markers and
+different question types. The generator checks the checkpoint and source
+digests and runs the source-verified Transformers ModernBERT classes with eager
+attention and the pinned Laya decision head in PyTorch float32. It records
+hidden states, option/action logits and probabilities, not model weights.
+
+The optional integration test checks the complete file digest, reads and
+decodes the actual F16 weights via the bounded Hugging Face loader, constructs
+the encoder Component graph, and executes it with explicit test weight bindings
+on the native CPU Provider. The graph's output feeds the Laya reference head.
+On the Windows test host, the two cases' maximum absolute errors were 1.15e-5
+for hidden states, 2.15e-6 for option logits, 0.00147 for action logits, and
+3.28e-7 for option probabilities. This verifies these unquantized f32
+computations on that Provider; it does not test the product loading/inference
+interface, tokenizer, statistical calibration, GPU execution or long windows.
+
+Regenerate and run (the external checkpoint and source files are not committed):
+
+```sh
+python integration-tests/production-loading/fixtures/generate_laya_real_checkpoint_reference.py \
+  /path/to/model.safetensors /path/to/modeling_modernbert.py /path/to/rl_common.py \
+  integration-tests/production-loading/fixtures/laya-real-checkpoint-reference.json
+MAGNETAR_LAYA_REAL_CHECKPOINT=/path/to/model.safetensors cargo test --locked \
+  --manifest-path integration-tests/production-loading/Cargo.toml \
+  laya_real_checkpoint_component_and_head_match_pytorch -- --ignored --nocapture
+```

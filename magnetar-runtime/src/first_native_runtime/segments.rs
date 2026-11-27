@@ -139,7 +139,7 @@ pub fn run_first_native_graph_with_provider(
 }
 
 /// Run a graph against the conformance fixture with explicitly supplied input
-/// edge values, including any test weights, and return all materialized edges.
+/// edge values, including any test weights, and return selected output edges.
 ///
 /// This is a conformance helper, not a trusted model-loading path: input
 /// bindings may supply weight edges directly and are not authenticated by the
@@ -151,6 +151,7 @@ pub fn run_first_native_graph_with_provider_and_bindings(
     graph: &ExecutionGraph,
     kv_cache_id: &KvCacheId,
     bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    output_edges: &[&str],
 ) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
     let tokens = bindings
         .get(&TensorEdgeId::new("input.token_ids"))
@@ -177,19 +178,23 @@ pub fn run_first_native_graph_with_provider_and_bindings(
         PreparedExecutionPlanGeneration::new(1),
         &provider_binding,
     )?;
-    let (dispatch, bindings, layer_kv, resolved_provider) = execute_first_native_graph(
-        &mut runtime,
-        fixture,
-        &instance,
-        kv_cache_id,
-        graph,
-        &mut plan,
-        bindings,
-        None,
-        Some(0),
-        &mut Vec::new(),
-    )
-    .map_err(E2eConformanceError::from)?;
+    let (dispatch, bindings, layer_kv, resolved_provider) =
+        execute_first_native_graph_materializing(
+            &mut runtime,
+            fixture,
+            &instance,
+            kv_cache_id,
+            graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(output_edges),
+            None,
+            None,
+        )
+        .map_err(E2eConformanceError::from)?;
     Ok(FirstNativeProviderRunOutcome {
         runtime,
         instance,
