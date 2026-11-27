@@ -311,6 +311,33 @@ wiring without weights or CUDA. The standalone Mamba-2 numerical fixtures do
 not settle whether a complete cached hybrid graph should match this source or
 the intended attention-history contract; neither is qualified by them.
 
+The integrated Transformers 5.23.0 implementation is a possible separate
+reference for that wiring: at commit `52b080b6416a7897e2af90febeb4dfad22b84d19`,
+its `NemotronHBlock` forwards both the cache and masks to its attention and
+Mamba mixers. It is not numerically interchangeable with the pinned NVIDIA
+source merely for that reason. Its Mamba mixer sets the prefill scan's lower
+dt bound to `config.time_step_min` (0.001 for the Nano configuration), whereas
+the pinned NVIDIA profile uses zero; its PyTorch cached single-token scan does
+not apply that lower bound. The hash-checked
+`integration-tests/production-loading/fixtures/audit_nemotron_transformers_forwarding.py`
+reproduces the forwarding with stand-ins and, optionally, runs the actual
+Transformers PyTorch scan functions. With a deliberately small synthetic dt,
+the latter returns approximately 0.001 on prefill and 2.06e-9 for a cached
+step. This demonstrates a possible divergence, not that the real checkpoint
+reaches that range. Whole-model qualification must select and document an
+explicit reference and validate its prefill/decode behavior.
+
+Reproduce with the unmodified [Transformers source at that commit](https://github.com/huggingface/transformers/blob/52b080b6416a7897e2af90febeb4dfad22b84d19/src/transformers/models/nemotron_h/modeling_nemotron_h.py)
+(SHA-256 `d13b26d1adb49f54dd952b9ee11b3b008b79e55792c9e8d1cce9f46c213f6397`):
+
+```sh
+python integration-tests/production-loading/fixtures/audit_nemotron_transformers_forwarding.py \
+  /path/to/modeling_nemotron_h.py --numeric
+```
+
+The numerical option requires PyTorch and Transformers 5.23.0 and verifies the
+installed source hash before running the reference functions.
+
 The Nemotron component also derives an invocation plan for the pinned Nano
 mixer geometry. Checkpoint tensor names, shapes and dtypes for all 23 Mamba
 layers were checked against 12 real Safetensors shard headers, including BF16 matrices and
