@@ -7,9 +7,8 @@ Qwen3.5 Component and the compatible, pre-merged checkpoint bundle when loading
 configured separately through `ArtifactTrustPolicy`.
 
 The [checkpoint conversion tool](https://github.com/astorise/Magnetar-component-Kev/pull/8)
-creates the derived Safetensors bundle from the pinned base and adapter. Its
-provenance and format sidecars accompany the weights. The conversion tool is
-proposed separately and is not yet in this repository's locked Kev revision.
+in the locked Kev revision creates the derived Safetensors bundle from the
+pinned base and adapter. Its provenance and format sidecars accompany the weights.
 Export the separately downloaded `head.pt`
 with `integration-tests/production-loading/fixtures/export_kev_pointer_head.py`;
 that script verifies the pinned input digest and uses PyTorch's restricted
