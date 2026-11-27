@@ -73,9 +73,16 @@ with torch.inference_mode():
         query = functional.linear(decision, head["q.weight"], head["q.bias"])
         keys = functional.linear(choices, head["k.weight"], head["k.bias"])
         logits = (keys @ query) / math.sqrt(256) / temperature
+        vocabulary_logits = model.lm_head(decision).float()
+        probe_ids = [0, 1, 10, 20, 42, 100, 1000, 248049, 248060, 248062]
+        top = torch.topk(vocabulary_logits, 16).indices.tolist()
+        probe_ids = list(dict.fromkeys(probe_ids + top))
         cases.append({"prefix": prefix, "row": row, "option_end_indices": options,
                       "decision_index": len(row) - 1, "decision": decision.tolist(),
                       "options": choices.tolist(), "logits": logits.tolist(),
-                      "probabilities": torch.softmax(logits, -1).tolist()})
+                      "probabilities": torch.softmax(logits, -1).tolist(),
+                      "vocab_probe_ids": probe_ids,
+                      "vocab_probe_logits": vocabulary_logits[probe_ids].tolist(),
+                      "vocab_argmax": int(vocabulary_logits.argmax())})
 output_path.write_text(json.dumps(cases, indent=2) + "\n", encoding="utf-8")
 print(f"Wrote {len(cases)} adapted Kev question references to {output_path}")

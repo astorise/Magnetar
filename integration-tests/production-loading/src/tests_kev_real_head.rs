@@ -161,3 +161,119 @@ fn full_kev_head_scores_real_adapted_qwen_hidden_states() {
     }
     eprintln!("maximum absolute score/probability error: {max_error}");
 }
+
+/// Qualifies the adapted Qwen backbone's generation logits. The derived
+/// checkpoint is pre-merged externally; Runtime adapter loading and Kev's
+/// pointer-head inference are not exercised by this test.
+#[test]
+#[ignore = "requires the separately prepared 2.75 GB merged Kev/Qwen checkpoint"]
+fn merged_kev_backbone_production_logits_match_pytorch() {
+    use std::{fs, io::Read, ops::ControlFlow, sync::Arc};
+
+    use magnetar_loader_huggingface::{
+        HuggingFaceIngestor, HuggingFaceTokenizer, parse_tokenizer_config,
+    };
+    use magnetar_provider_cpu::native::{NativeCpuExecutor, NativeCpuProvider};
+    use magnetar_runtime::{
+        GenerationParameters, ModelTrustStore, ProductionGenerationRequest, ProductionLoadedModel,
+        ProductionModelArtifactIngestor, PromptInput, StopConditions, Tokenizer,
+        production_model_fixture,
+    };
+    use sha2::{Digest, Sha256};
+
+    let directory = PathBuf::from(
+        std::env::var_os("MAGNETAR_KEV_MERGED_DIR")
+            .expect("set MAGNETAR_KEV_MERGED_DIR to the prepared derived bundle"),
+    );
+    let mut file = fs::File::open(directory.join("model.safetensors")).unwrap();
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 8 << 20];
+    loop {
+        let count = file.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    let actual: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        actual,
+        "a7aeec3ce2e2b0ab61fed3598fc89b80668eb774e7d0df6ddfabad8931bca51f"
+    );
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(directory.clone()),
+        directory.clone(),
+    );
+    let ingested = HuggingFaceIngestor::new().ingest(&source).unwrap();
+    let tokenizer_config =
+        parse_tokenizer_config(&fs::read(directory.join("tokenizer_config.json")).unwrap())
+            .unwrap();
+    let tokenizer = HuggingFaceTokenizer::from_bytes(
+        &fs::read(directory.join("tokenizer.json")).unwrap(),
+        Some(&tokenizer_config),
+        "kev-qwen35-merged",
+        Some(248_320),
+    )
+    .unwrap();
+    let metadata = tokenizer.metadata().clone();
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let trust = ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
+    let fixture = production_model_fixture(ingested.manifest.clone(), metadata, tokenizer).unwrap();
+    super::test_support::register_real_qwen_component();
+    let provider = Arc::new(NativeCpuProvider::with_executor(
+        NativeCpuExecutor::with_settings(true, false, 4),
+    ));
+    let mut model =
+        ProductionLoadedModel::load(fixture, ingested.payload_source.as_ref(), trust, provider)
+            .unwrap();
+    model.set_prefill_replay(false);
+    let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../fixtures/kev-real-checkpoint-reference.json"
+    ))
+    .unwrap();
+    let mut max_error = 0.0_f32;
+    for case in cases {
+        let tokens: Vec<u32> = integers(&case, "prefix")
+            .into_iter()
+            .chain(integers(&case, "row"))
+            .map(|n| n as u32)
+            .collect();
+        let mut logits = Vec::new();
+        let outcome = model
+            .generate_streaming_with_logits(
+                ProductionGenerationRequest {
+                    prompt: PromptInput::TokenIds(tokens),
+                    parameters: GenerationParameters::greedy(),
+                    stop_conditions: StopConditions::default(),
+                    max_new_tokens: Some(1),
+                    max_generation_millis: None,
+                },
+                None,
+                &mut |_| ControlFlow::Continue(()),
+                &mut |values| logits.extend_from_slice(values),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.result.output.generated_token_ids[0] as u64,
+            case["vocab_argmax"].as_u64().unwrap()
+        );
+        for (index, expected) in integers(&case, "vocab_probe_ids")
+            .into_iter()
+            .zip(floats(&case["vocab_probe_logits"]))
+        {
+            let error = (logits[index] - expected).abs();
+            max_error = max_error.max(error);
+            assert!(
+                error <= 0.05,
+                "token {index}: {} != {expected}",
+                logits[index]
+            );
+        }
+    }
+    eprintln!("merged Kev backbone maximum absolute logit error: {max_error}");
+    model.unload().unwrap();
+}

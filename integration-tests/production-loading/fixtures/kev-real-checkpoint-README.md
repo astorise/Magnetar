@@ -7,7 +7,8 @@ The generator verifies and executes all 24 Qwen3.5 backbone layers in PyTorch
 float32, applying the 186 rank-16 LoRA overlays as explicit PyTorch linear
 operations. It then evaluates the full trained pointer head with its saved
 temperature. The recorded decision and option hidden states, scores and
-probabilities contain no checkpoint weights.
+probabilities contain no checkpoint weights. It also records selected next-token
+logits and the argmax token for each row.
 
 Pinned source artifacts:
 
@@ -23,6 +24,17 @@ loader, and writes the four tensor values to Safetensors; the test checks the
 result's SHA-256 `ab7c75921e79ec27ca97d8bf7b928e277dac843a6f4a528f9e8b7ab0fe7cd47d`.
 Neither checkpoint nor exported weights are checked into this repository.
 
+A second optional test loads a separately pre-merged 2.75 GB checkpoint through
+the production Hugging Face ingestor and Qwen Component, and executes both
+rows on the native CPU Provider with independent sessions. Its derived model
+weights SHA-256 is `a7aeec3ce2e2b0ab61fed3598fc89b80668eb774e7d0df6ddfabad8931bca51f`;
+the component's `tools/merge_kev_checkpoint.py` creates this bundle from the
+verified pinned inputs. On the Windows test host, the maximum absolute error
+over the selected logits was 9.06e-6 and both argmax tokens matched the
+unmerged PyTorch overlay. This compares those selected logits and does not
+execute the pointer head from Runtime-generated hidden states, exercise prefix
+cache reuse, or qualify a GPU Provider.
+
 Regenerate with PyTorch 2.15, Safetensors 0.8.0 and Transformers 5.23.0:
 
 ```sh
@@ -34,4 +46,7 @@ python integration-tests/production-loading/fixtures/export_kev_pointer_head.py 
 MAGNETAR_KEV_HEAD_SAFETENSORS=/path/to/kev-head.safetensors cargo test --locked \
   --manifest-path integration-tests/production-loading/Cargo.toml \
   full_kev_head_scores_real_adapted_qwen_hidden_states -- --ignored --nocapture
+MAGNETAR_KEV_MERGED_DIR=/path/to/merged-bundle cargo test --locked \
+  --manifest-path integration-tests/production-loading/Cargo.toml \
+  merged_kev_backbone_production_logits_match_pytorch -- --ignored --nocapture
 ```
