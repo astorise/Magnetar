@@ -1,3 +1,5 @@
 .gitattributes text eol=lf
+*.sh text eol=lf
+repositories.lock text eol=lf
 magnetar-runtime/fixtures/components/*.wat text eol=lf
 magnetar-runtime/fixtures/components/*.yaml text eol=lf
