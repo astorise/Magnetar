@@ -26,14 +26,16 @@ Neither checkpoint nor exported weights are checked into this repository.
 
 A second optional test loads a separately pre-merged 2.75 GB checkpoint through
 the production Hugging Face ingestor and Qwen Component, and executes both
-rows on the native CPU Provider with independent sessions. Its derived model
-weights SHA-256 is `a7aeec3ce2e2b0ab61fed3598fc89b80668eb774e7d0df6ddfabad8931bca51f`;
-the component's `tools/merge_kev_checkpoint.py` creates this bundle from the
-verified pinned inputs. On the Windows test host, the maximum absolute error
-over the selected logits was 9.06e-6 and both argmax tokens matched the
-unmerged PyTorch overlay. This compares those selected logits and does not
-execute the pointer head from Runtime-generated hidden states, exercise prefix
-cache reuse, or qualify a GPU Provider.
+rows independently on the native CPU Provider. Its derived model weights
+SHA-256 is `a7aeec3ce2e2b0ab61fed3598fc89b80668eb774e7d0df6ddfabad8931bca51f`;
+the component's proposed `tools/merge_kev_checkpoint.py` creates this bundle
+from the verified pinned inputs. A Windows CPU run compared Runtime-observed
+final hidden states directly through the trained pointer head with the original
+unmerged PyTorch overlay: maximum absolute errors were 9.06e-6 for selected
+hidden states, 1.52e-6 for head scores/probabilities, and 9.06e-6 for selected
+vocabulary logits; both argmax tokens matched. The test also exercises the
+structured token and text decision paths. It does not exercise prefix-cache
+reuse or qualify a GPU Provider.
 
 Regenerate with PyTorch 2.15, Safetensors 0.8.0 and Transformers 5.23.0:
 
@@ -46,7 +48,8 @@ python integration-tests/production-loading/fixtures/export_kev_pointer_head.py 
 MAGNETAR_KEV_HEAD_SAFETENSORS=/path/to/kev-head.safetensors cargo test --locked \
   --manifest-path integration-tests/production-loading/Cargo.toml \
   full_kev_head_scores_real_adapted_qwen_hidden_states -- --ignored --nocapture
-MAGNETAR_KEV_MERGED_DIR=/path/to/merged-bundle cargo test --locked \
+MAGNETAR_KEV_MERGED_DIR=/path/to/merged-bundle \
+  MAGNETAR_KEV_HEAD_SAFETENSORS=/path/to/kev-head.safetensors cargo test --locked \
   --manifest-path integration-tests/production-loading/Cargo.toml \
   merged_kev_backbone_production_logits_match_pytorch -- --ignored --nocapture
 ```

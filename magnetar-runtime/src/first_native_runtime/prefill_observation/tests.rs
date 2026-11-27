@@ -79,6 +79,41 @@ fn observed_prefill_rejects_invalid_inputs_without_allocating() {
 }
 
 #[test]
+fn observed_prefill_does_not_execute_the_later_generation_head() {
+    let (fixture, payload) = production_shaped_canonical_fixture();
+    let mut reference = fixture.clone();
+    reference.weights = e2e_fixture_weights(&reference.config).unwrap();
+    let provider = Arc::new(ReferenceCpuProvider::new());
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        provider.clone(),
+    )
+    .unwrap();
+    let weight = model
+        .runtime
+        .model_instances()
+        .instance(&model.instance)
+        .unwrap()
+        .definition()
+        .resource_bindings
+        .weights["lm_head"]
+        .clone();
+    let executor = provider.executor();
+    let saved = executor.read_tensor(&weight).unwrap();
+    assert!(executor.release_tensor(&weight));
+    let expected = e2e_forward_hidden_states(&reference, &[5, 6, 7]).unwrap();
+    let actual = model
+        .observe_prefill_edge(&[5, 6, 7], "edge.final_norm")
+        .unwrap();
+    for (actual, expected) in actual.data.iter().zip(&expected.data) {
+        assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+    }
+    executor.write_tensor(weight, saved);
+}
+
+#[test]
 fn failed_observed_prefill_releases_partial_execution() {
     let (fixture, payload) = production_shaped_canonical_fixture();
     let provider = Arc::new(ReferenceCpuProvider::new());

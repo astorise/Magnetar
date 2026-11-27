@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// This first implementation retains intermediate resources for the duration
-/// of a call. Bound its work until scoped executions can release them eagerly.
+/// This first implementation retains intermediate resources until the
+/// requested edge is produced. Bound its work until they can be freed eagerly.
 const MAX_OBSERVED_PREFILL_TOKENS: usize = 512;
 static OBSERVATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -16,7 +16,8 @@ impl ProductionLoadedModel {
     /// meaning is documented by the trusted Component; Runtime does not infer
     /// model-specific semantics from its name. The token sequence starts at
     /// position zero, and all temporary KV, recurrent and graph resources are
-    /// discarded after the call. This does not return a reusable prefix cache.
+    /// discarded after the call. Nodes after the requested edge are not run.
+    /// This does not return a reusable prefix cache.
     ///
     /// Inputs are bounded to 512 tokens in this first profile. A Component
     /// without the requested edge, an unsupported Provider, or a tensor-parallel

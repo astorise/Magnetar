@@ -2678,6 +2678,16 @@ pub(super) fn execute_first_native_graph_nodes(
             }
         }
         last_dispatch = Some(dispatch_result);
+        // An isolated observation needs only the requested intermediate, not
+        // later nodes such as the full-vocabulary generation head. It does
+        // not commit KV or recurrent state, so it can stop as soon as the
+        // requested producer has finished all its outputs.
+        if private_kv_namespace.is_some()
+            && let MaterializedEdges::Only([target]) = materialized
+            && node.outputs.iter().any(|edge| edge.as_str() == *target)
+        {
+            break;
+        }
     }
 
     // `0..layer_count` (the *full architecture's* layer count, `fixture`'s
@@ -2694,7 +2704,12 @@ pub(super) fn execute_first_native_graph_nodes(
     // necessarily sparse result stays correctly addressable by whichever
     // real layer a later decode step actually asks for.
     let mut updated_layer_kv = LayerKvMap::new();
-    for layer in 0..layer_count {
+    let kv_layers_to_collect = if private_kv_namespace.is_some() {
+        0
+    } else {
+        layer_count
+    };
+    for layer in 0..kv_layers_to_collect {
         let touched = layer_k[layer].is_some() || layer_v[layer].is_some();
         if !touched {
             continue;
@@ -2757,13 +2772,15 @@ pub(super) fn execute_first_native_graph_nodes(
     // Each recurrent output becomes the cache's pending state, kept under
     // its own resource: the edge's is overwritten by the next step. Last:
     // it releases the pending value this step read.
-    super::recurrent_state::stage_recurrent_outputs(
-        dispatch_ctx.runtime,
-        executor,
-        kv_cache_id,
-        &recurrent,
-        &recurrent_outputs,
-    )?;
+    if private_kv_namespace.is_none() {
+        super::recurrent_state::stage_recurrent_outputs(
+            dispatch_ctx.runtime,
+            executor,
+            kv_cache_id,
+            &recurrent,
+            &recurrent_outputs,
+        )?;
+    }
     Ok((dispatch_result, materialized_bindings, updated_layer_kv))
 }
 
