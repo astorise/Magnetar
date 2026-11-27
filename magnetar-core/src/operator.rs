@@ -1579,6 +1579,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         ),
         ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
         ("slice-last", OperatorFamily::Tensor, 1, 1, ShapeRule::Any),
+        // Generate exact f32 absolute positions for the input's token rows.
+        (
+            "position-range",
+            OperatorFamily::Tensor,
+            1,
+            1,
+            ShapeRule::Any,
+        ),
         (
             "remainder-scalar",
             OperatorFamily::Tensor,
@@ -1751,7 +1759,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         if name == "encoder-attention" {
             spec.memory = OperatorMemoryBehavior::pure().with_workspace();
         }
-        if name == "gated-delta-mixer" {
+        if matches!(name, "gated-delta-mixer" | "position-range") {
             spec.layout_contract = OperatorLayoutContract::new([TensorLayoutKind::Contiguous]);
         }
         if matches!(
@@ -1790,7 +1798,11 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         }
         if matches!(
             name,
-            "affine-layernorm" | "gelu-exact" | "slice-last" | "remainder-scalar"
+            "affine-layernorm"
+                | "gelu-exact"
+                | "slice-last"
+                | "remainder-scalar"
+                | "position-range"
         ) {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
@@ -1814,6 +1826,10 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "position-range" => OperatorAttributeSchema::default().with_rule(
+            "position_offset",
+            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+        ),
         "remainder-scalar" => OperatorAttributeSchema::default().with_rule(
             "divisor",
             OperatorAttributeRule::required(OperatorAttributeKind::Float),

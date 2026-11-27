@@ -209,14 +209,57 @@ must be contiguous from that length. A document reset is a new call with zero
 past and position zero, which suppresses any supplied prior raw state. Packed
 multi-document attention, RoPE, value embeddings, XSA and biased/CosNet
 projections are outside this profile and must not silently use it. The graph
-executor can bind raw previous K/V to Runtime-managed recurrent slots; the
-current Olala test still supplies the separate attention history explicitly.
+executor can bind raw previous K/V to Runtime-managed recurrent slots. The
+original Olala test supplies attention history explicitly; a separate
+hand-built graph now tests Runtime-owned copy-based history as described below.
 The Olala profile can reorder decoded f32 weights into this operator's
 layout. An opt-in integration test decodes the pinned checkpoint's first
 differential-attention layer and compares its f32 projections and explicit
 states with the upstream PyTorch class on synthetic hidden states, retaining
 the class's bfloat16 attention-boundary rounding. This is not a qualification
 of native BF16 projections or end-to-end hybrid inference.
+
+The experimental attention-history increment is a Runtime-owned **tensor** input,
+distinct from a Kernel-managed cache handle. A graph declares one input and
+one complete-history output for each logical KV identity; the first call gets
+a single ignored zero row, while later calls bind the exact committed or
+pending history with a matching position, shape and compatibility key. The
+Runtime stages each complete output and commits or discards it with the raw
+recurrent state. This initial copy-based form must reject padded/in-place
+stores and caller-supplied history bindings. It does not advertise device-side
+KV access to a Kernel. The proposed additive graph-builder 1.16 Capability
+exposes these bindings without changing older imports. A compiled test Component
+builds paired prefill and decode histories through Wasmtime; the published
+contract and the Runtime copy must be reconciled before release.
+The hand-built projected-attention graph compares prefill, continuation,
+cached decode, retry and separate sessions with the pinned PyTorch fixture.
+The portable `position-range@1` operator generates a contiguous f32 vector
+from a two-dimensional token anchor. A graph declares its nonnegative
+`position_offset`; the Runtime supplies the actual step position on reuse.
+The complete range is checked before allocation and stops at 16,777,215 so
+every index and its successor remain exact in f32. The managed-history
+attention test now builds its position input this way, including continuation
+and decode, rather than receiving positions from its caller. Only Reference CPU
+is qualified for this new operator.
+The portable attention's element bound limits the supported window. Neither
+this test nor the internal graph form qualifies full Olala generation.
+
+The Component graph-construction API can request a decode graph at a different
+committed-history length while retaining the original prefill length. A real
+1.16 Component verifies that the history descriptors change with that length,
+and a previously prepared plan rejects the new graph's different fingerprint.
+For explicit copy-based histories, the generation loop validates the request
+owner, committed token sequence and cache length, then rebuilds the graph and
+advances the published plan before its guard and dispatch. The experimental
+plan-advance API validates both graphs, growing KV shapes and stable
+recurrent/KV schemas, the ready Model Instance revision, the original canonical
+plan and its Kernel bindings, Provider, guards and leases before publishing a
+new generation. It rejects custom plan policies instead of discarding them.
+Tests exercise multiple decode positions and retry with committed KV and
+recurrent state through a real synthetic Component and verify failures preserve
+the old plan. This path rebuilds graphs instead of keeping an unbounded cache;
+its performance is not qualified. The probe's logits are a separate projection
+and do not qualify complete Olala model generation.
 
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,
@@ -230,6 +273,15 @@ cannot remove a state edge. A real Wasmtime Component tests both graph phases;
 older Components continue linking through their original versions. The current
 first-native executor can stage and commit declared recurrent resources; this
 does not by itself qualify an Olala or Nemotron model Component.
+
+A conservative Mamba-2 prefill profile may continue through full-sized chunks
+in production: every attention node reads causal KV history, both recurrent
+states bind directly to each mixer, and the remaining graph uses the qualified
+token-wise operators. The optimized graph may fuse a projection with its
+residual. The real Component graph's two chunks, generated logits and decode
+steps match the pinned synthetic PyTorch reference and a one-pass execution.
+Unknown operators, other recurrent bindings, noncausal attention and a final
+partial chunk retain the single-pass fallback; padding must not advance state.
 Before a decoder graph pair is returned, the Runtime also checks that prefill
 and decode declare the same state identities, layers, slots, compatibility
 keys and tensor descriptors; mismatched phases, schemas or out-of-range layers
@@ -350,6 +402,28 @@ F32 A-log/D vectors. The source configuration's `time_step_min` and
 unbounded. This is a shape and conversion plan for the f32 operator, not
 checkpoint loading, BF16 numerical qualification or recurrent execution.
 
+A separate synthetic CPU graph compares the pinned NVIDIA `NemotronHMOE`,
+`NemotronHTopkRouter` and `NemotronHMLP` PyTorch classes with sigmoid routing,
+correction bias, top-1 and top-2 normalization, ReLU-squared routed experts,
+the shared expert and a logits projection. The fixture uses the pinned Nano
+profile's one selected group and scaling semantics. It does not establish a
+mixed Mamba/attention/MoE Component or cover other group-masking profiles.
+
+An experimental Component now constructs mixed prefill and decode graphs
+through `model-component-graph@1.15.0`; an actual Wasmtime test checks the
+Mamba-2, non-RoPE attention, dense MLP and MoE nodes and separate
+convolution/SSM slots, and rejects a missing weight or unsupported position
+mode. The checked-in
+Component fixture is built from `Magnetar-component-Nemotron` commit
+`5b7370a6881a5f04c65deb4765e6852d749a54d1` and takes normalized f32 graph
+weights. A synthetic mixed model built from pinned NVIDIA PyTorch primitives
+compares the real graph's full prefill and prefix plus four cached decode
+steps, including logits, convolution/SSM state and attention K/V. Releasing
+the session and opening another starts both types of state afresh. This is not
+checkpoint ingestion or full-checkpoint numerical qualification. Its explicit
+causal attention history is a deliberate profile choice and does not claim
+equivalence to the pinned NVIDIA block that fails to forward its cache.
+
 ### Experimental masked encoder attention
 
 ModernBERT's attention is bidirectional; its local window is symmetric and
@@ -466,6 +540,20 @@ native BF16 arithmetic or a GPU Provider.
 ### Compatibility and WIT evolution
 
 Preserve existing F32 and single-Device baseline fixtures and public request semantics. Reuse current WIT and Rust contracts first. Before implementation requires new graph operators, state envelopes or result types, record their exact versioned portable schema, negotiation, unsupported behavior and migration tests; native API types are prohibited. A new precision or model profile is opt-in until its validation evidence supports promotion. Vendor implementations stay in their repositories, followed by an explicit parent submodule pin update.
+
+The additive `model-component-graph@1.15.0` configuration describes an
+ordered sequence of Mamba-2 mixers, attention, dense MLP and routed MoE
+residual blocks. Mixer head/group/state dimensions, convolution width,
+normalization, bias flags and inference-time step limits are explicit and
+bounded; checkpoint initialization limits are not inference limits. Attention
+position handling, activation and expert positions and routing are declared
+separately, never inferred from a model name. Existing Components continue to
+link, but their graphs are refused if they have not read a declared hybrid
+configuration. Each session must keep convolution and SSM state separate from
+attention KV history. The mixer and MoE operators have independent CPU/PyTorch
+comparisons; this contract alone does not qualify a complete hybrid decoder.
+KV capacity estimates for this layout reserve rows only for attention blocks;
+Mamba-2, dense MLP and expert blocks do not allocate attention history.
 
 ### Authority and isolation
 

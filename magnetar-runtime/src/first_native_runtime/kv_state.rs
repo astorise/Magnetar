@@ -11,6 +11,8 @@ pub(super) struct PromotedKvLayer {
     /// Valid rows of an in-place KV store (`append-kv-history-in-place`);
     /// `None` for a copy-based generation.
     pub(super) rows: Option<u64>,
+    pub(super) history_schema: Option<[(String, String); 2]>,
+    pub(super) history_owner: Option<KvCacheId>,
 }
 
 /// The KV commit lifecycle, named and typed explicitly (Correctif 11 / task
@@ -93,6 +95,8 @@ impl KvUpdateTransaction {
                 binding,
                 previous,
                 rows: Some(rows),
+                history_schema: pending.history_schema.clone(),
+                history_owner: pending.history_owner.clone(),
             });
             return Ok(());
         }
@@ -109,6 +113,8 @@ impl KvUpdateTransaction {
             binding,
             previous,
             rows: None,
+            history_schema: pending.history_schema.clone(),
+            history_owner: pending.history_owner.clone(),
         });
         Ok(())
     }
@@ -176,6 +182,8 @@ impl KvUpdateTransaction {
                     k: promoted_layer.binding.k,
                     v: promoted_layer.binding.v,
                     rows: promoted_layer.rows,
+                    history_schema: promoted_layer.history_schema,
+                    history_owner: promoted_layer.history_owner,
                 },
             );
         }
@@ -370,10 +378,11 @@ impl E2eRuntimeModelExecutionEngine {
         // resources are the same from one step to the next.
         // A replay would bypass the executor that binds and stages the
         // recurrent state (`support-qwen38-flash-next`).
-        if graphs.recurrent && decode_index == STEP_CAPTURE_DECODE_INDEX {
-            trace_step_capture("not captured", "decode step with recurrent state");
+        if (graphs.recurrent || graphs.history_input) && decode_index == STEP_CAPTURE_DECODE_INDEX {
+            trace_step_capture("not captured", "decode step with Runtime-owned state");
         }
         let replayable = !graphs.recurrent
+            && !graphs.history_input
             && self.step_replay.is_enabled()
             && kv_stores.is_some()
             && !kv_state.layer_kv.is_empty()

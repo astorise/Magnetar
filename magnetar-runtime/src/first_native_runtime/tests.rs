@@ -2030,6 +2030,8 @@ pub(super) fn execute_qwen_prefill_hidden_states_through_dispatch(
             k: k_resource,
             v: v_resource,
             rows: None,
+            history_schema: None,
+            history_owner: None,
         });
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
@@ -2327,6 +2329,8 @@ pub(super) fn execute_qwen_decode_hidden_states_through_dispatch(
             k: k_resource,
             v: v_resource,
             rows: None,
+            history_schema: None,
+            history_owner: None,
         });
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,

@@ -773,6 +773,34 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     )
     .expect("a Component with no MLP may explicitly accept an unknown activation");
 
+    // This real older Component can otherwise build a graph, but cannot
+    // observe the newer hybrid schema and must never silently omit it.
+    let mut hybrid = architecture_config_from_first_native_model_config(&fixture.config);
+    hybrid.decoder_extensions.mamba2_hybrid = Some(crate::Mamba2HybridConfig {
+        layers: vec![crate::HybridDecoderBlock::Mamba2; hybrid.num_hidden_layers as usize],
+        heads: 2,
+        head_dim: 2,
+        groups: 1,
+        state_dim: 2,
+        conv_kernel: 3,
+        epsilon: 1e-5,
+        dt_min: 0.0,
+        dt_max: None,
+        conv_bias: false,
+        linear_bias: false,
+    });
+    hybrid.validate().unwrap();
+    let error = build_first_native_graphs_from_named_component(
+        &synthetic_digest,
+        &hybrid,
+        &fixture.identity,
+        prompt_token_count,
+    )
+    .map(|_| ())
+    .expect_err("an older Component must not ignore a hybrid decoder")
+    .to_string();
+    assert!(error.contains("mamba2-hybrid"), "{error}");
+
     // The pre-1.8 version of this same fixture cannot distinguish known and
     // unknown activation values. It must be rejected for both, even though
     // it could otherwise construct a graph successfully.
@@ -950,6 +978,448 @@ fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregister
             panic!("an unregistered digest must fail closed, not silently build a fallback graph")
         }
     }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn component_decode_graph_can_be_built_at_a_later_history_position() {
+    let bytes = include_bytes!("../../../fixtures/components/kv-history-probe.component.wasm");
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = include_str!(
+        "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    )
+    .replace(
+        "sha256:321b42b83773544e1ba553cc7196d3d742cd9ef1e2af3f04da72b66e402a730f",
+        &digest.value,
+    )
+    .replace("magnetar.qwen.real", "magnetar.history.probe")
+    .replace("1.14.0", "1.16.0");
+    register_inference_component_artifact(
+        bytes.to_vec(),
+        manifest.into_bytes(),
+        &ComponentTrustStore::default().trust_digest(&digest.value),
+    )
+    .unwrap();
+    let fixture = e2e_fixture().unwrap();
+    let config = architecture_config_from_first_native_model_config(&fixture.config);
+    let build = |cached| {
+        build_first_native_graphs_from_named_component_for_artifact_at_decode_position(
+            &digest,
+            &config,
+            &fixture.manifest.tensors,
+            &fixture.identity,
+            4,
+            cached,
+        )
+    };
+    let (first, _, _) = build(4).unwrap();
+    let (later, _, _) = build(6).unwrap();
+    let (empty, _, _) = build(0).unwrap();
+    assert!(empty.decode.id.as_str().ends_with("-0"));
+    assert_eq!(
+        semantic_graph_fingerprint(&first.prefill),
+        semantic_graph_fingerprint(&later.prefill)
+    );
+    assert_ne!(
+        semantic_graph_fingerprint(&first.decode),
+        semantic_graph_fingerprint(&later.decode)
+    );
+    for (graph, expected) in [(&first.decode, 4), (&later.decode, 6)] {
+        let histories = graph.kv_history_bindings().unwrap();
+        assert_eq!(histories.len(), 2);
+        for history in histories {
+            assert_eq!(
+                graph.edges[&history.input_edge].descriptor.shape.dimensions,
+                [expected, 2]
+            );
+        }
+    }
+    assert!(build(u64::MAX).is_err());
+
+    // A differently sized graph must not execute through the old plan.
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut old_plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &first.decode,
+        &instance,
+        revision,
+        1,
+        PreparedExecutionPlanGeneration::new(1),
+        &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    assert!(matches!(
+        PreparedExecutionPlanExecutor::new().prepare_node_execution(
+            &later.decode,
+            &mut old_plan,
+            runtime.kernel_registry(),
+            &first_native_plan_context(PreparedExecutionPhase::Decode, 1),
+            later.decode.nodes.keys().next().unwrap(),
+        ),
+        Err(PreparedExecutionPlanError::PlanValidationFailed)
+    ));
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_generation_replans_component_owned_copy_histories() {
+    let bytes =
+        include_bytes!("../../../fixtures/components/kv-history-generation-probe.component.wasm");
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = include_str!(
+        "../../../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    )
+    .replace(
+        "sha256:321b42b83773544e1ba553cc7196d3d742cd9ef1e2af3f04da72b66e402a730f",
+        &digest.value,
+    )
+    .replace("magnetar.qwen.real", "magnetar.history.generation-probe")
+    .replace("1.14.0", "1.16.0");
+    register_inference_component_artifact(
+        bytes.to_vec(),
+        manifest.into_bytes(),
+        &ComponentTrustStore::default().trust_digest(&digest.value),
+    )
+    .unwrap();
+
+    let (mut fixture, mut payload) = super::super::tests::production_shaped_canonical_fixture();
+    let template = fixture.manifest.tensors[0].clone();
+    let mut offset = fixture
+        .manifest
+        .tensors
+        .iter()
+        .filter_map(|tensor| tensor.offset_bytes.zip(tensor.size_bytes))
+        .map(|(start, length)| start + length)
+        .max()
+        .unwrap_or(0);
+    for (name, shape) in [
+        ("probe.q", vec![4, 8]),
+        ("probe.a_key", vec![4, 4]),
+        ("probe.b_key", vec![4, 4]),
+        ("probe.a_value", vec![4, 4]),
+        ("probe.b_value", vec![4, 4]),
+        ("probe.shift_key", vec![4, 2]),
+        ("probe.shift_value", vec![4, 2]),
+        ("probe.lambda", vec![4, 2]),
+        ("probe.q_norm", vec![2]),
+        ("probe.k_norm", vec![2]),
+        ("probe.scaler", vec![4]),
+    ] {
+        let count = shape.iter().product::<u64>() as usize;
+        let values: Vec<f32> = (0..count)
+            .map(|index| {
+                if name.ends_with("_norm") {
+                    1.0
+                } else {
+                    ((index * 3 % 11) as f32 - 5.0) * 0.02
+                }
+            })
+            .collect();
+        let bytes: Vec<_> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut tensor = template.clone();
+        tensor.name = name.into();
+        tensor.shape = shape;
+        tensor.offset_bytes = Some(offset);
+        tensor.size_bytes = Some(bytes.len() as u64);
+        tensor.digest = Some(ModelDigest::sha256(&bytes));
+        offset += bytes.len() as u64;
+        fixture.manifest.tensors.push(tensor);
+        payload.bytes_by_name.insert(name.into(), bytes);
+    }
+    let floats = |name: &str| {
+        let (chunks, remainder) = payload.bytes_by_name[name].as_chunks::<4>();
+        assert!(remainder.is_empty());
+        chunks
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect::<Vec<_>>()
+    };
+    let embedding = floats("token_embedding");
+    let head = floats("lm_head");
+    let trust = ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone());
+    let mut model = ProductionLoadedModel::load_with_component(
+        fixture,
+        &payload,
+        trust,
+        Arc::new(ReferenceCpuProvider::new()),
+        Some(digest),
+    )
+    .unwrap();
+    model.set_prefill_buckets(Vec::new());
+    let mut logits = Vec::new();
+    let result = model
+        .generate_streaming_with_logits(
+            ProductionGenerationRequest {
+                prompt: PromptInput::TokenIds(vec![1, 2, 3]),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions {
+                    eos: EosPolicy {
+                        mode: EosMode::Ignore,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                max_new_tokens: Some(4),
+                max_generation_millis: None,
+            },
+            None,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+            &mut |step| logits.push(step.to_vec()),
+        )
+        .unwrap();
+    assert_eq!(logits.len(), 4);
+    assert_eq!(result.result.output.generated_token_ids.len(), 4);
+    for (step, actual) in logits.iter().enumerate() {
+        let token = if step == 0 {
+            3
+        } else {
+            result.result.output.generated_token_ids[step - 1]
+        } as usize;
+        for column in 0..258 {
+            let expected: f32 = (0..4)
+                .map(|row| embedding[token * 4 + row] * head[row * 258 + column])
+                .sum();
+            assert!((actual[column] - expected).abs() < 2e-6);
+        }
+    }
+    let generations: Vec<_> = result
+        .observer
+        .observations()
+        .iter()
+        .filter(|event| {
+            event.kind == InferenceApiObservationKind::PlanSelected
+                && event.message.contains("phase=decode")
+        })
+        .filter_map(|event| {
+            event
+                .message
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix("plan_generation="))
+        })
+        .collect();
+    assert_eq!(generations, ["1", "1", "2", "3"]);
+
+    // A new session resets both fixed recurrent slots and growing history.
+    // Chunking or right padding cannot be used for this copy-based graph.
+    model.set_prefill_buckets(vec![4]);
+    model.set_prefill_chunk(2);
+    let mut repeated_logits = Vec::new();
+    let repeated = model
+        .generate_streaming_with_logits(
+            ProductionGenerationRequest {
+                prompt: PromptInput::TokenIds(vec![1, 2, 3]),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions {
+                    eos: EosPolicy {
+                        mode: EosMode::Ignore,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                max_new_tokens: Some(4),
+                max_generation_millis: None,
+            },
+            None,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+            &mut |step| repeated_logits.push(step.to_vec()),
+        )
+        .unwrap();
+    assert_eq!(
+        repeated.result.output.generated_token_ids,
+        result.result.output.generated_token_ids
+    );
+    assert_eq!(repeated_logits, logits);
+    assert_eq!(model.prefill_chunk(), 0);
+
+    // A stale token list, foreign session or invalidated plan must not
+    // advance the plan. An uncommitted step can then be retried safely.
+    let mut prepared = model
+        .prepare_generation(
+            ProductionGenerationRequest {
+                prompt: PromptInput::TokenIds(vec![1, 2, 3]),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions::default(),
+                max_new_tokens: Some(4),
+                max_generation_millis: None,
+            },
+            None,
+        )
+        .unwrap();
+    let engine = model.runtime.model_execution_engine().cloned().unwrap();
+    let request = &prepared.generation_request;
+    let prefill = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[],
+            Some(&mut prepared.prepared_plans.prefill),
+        )
+        .unwrap();
+    let cache = match &prefill.kv_commit {
+        Some(RuntimeKvCacheCommit::PrefillCompleted { cache, .. }) => cache.clone(),
+        _ => panic!("prefill must stage a KV cache"),
+    };
+    engine
+        .commit_generation_step(&mut model.runtime, request, &[], 7, &prefill)
+        .unwrap();
+    engine
+        .prepare_decode_step(
+            &mut model.runtime,
+            request,
+            &[7],
+            &mut prepared.prepared_plans.decode,
+        )
+        .unwrap();
+    let first_decode = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[7],
+            Some(&mut prepared.prepared_plans.decode),
+        )
+        .unwrap();
+    engine
+        .commit_generation_step(&mut model.runtime, request, &[7], 8, &first_decode)
+        .unwrap();
+    let layers = model
+        .runtime
+        .kv_cache(&cache)
+        .unwrap()
+        .layer_resources
+        .clone();
+    let recurrent = model
+        .runtime
+        .kv_cache(&cache)
+        .unwrap()
+        .recurrent_resources
+        .clone();
+    let before = prepared.prepared_plans.decode.clone();
+    let mut foreign = request.clone();
+    foreign.session = Some(InferenceSessionId::new("foreign-history-session").unwrap());
+    assert!(
+        engine
+            .prepare_decode_step(
+                &mut model.runtime,
+                &foreign,
+                &[7, 8],
+                &mut prepared.prepared_plans.decode,
+            )
+            .is_err()
+    );
+    assert!(
+        engine
+            .prepare_decode_step(
+                &mut model.runtime,
+                request,
+                &[7, 9],
+                &mut prepared.prepared_plans.decode,
+            )
+            .is_err()
+    );
+    assert_eq!(prepared.prepared_plans.decode, before);
+    model
+        .runtime
+        .kv_caches_mut()
+        .cache_mut(&cache)
+        .unwrap()
+        .layout
+        .current_token_length += 1;
+    assert!(
+        engine
+            .prepare_decode_step(
+                &mut model.runtime,
+                request,
+                &[7, 8],
+                &mut prepared.prepared_plans.decode,
+            )
+            .is_err()
+    );
+    assert_eq!(prepared.prepared_plans.decode, before);
+    model
+        .runtime
+        .kv_caches_mut()
+        .cache_mut(&cache)
+        .unwrap()
+        .layout
+        .current_token_length -= 1;
+    let mut invalidated = before.clone();
+    invalidated
+        .transition_to(crate::kernel_execution_plan::PreparedExecutionPlanState::Invalidated)
+        .unwrap();
+    assert!(
+        engine
+            .prepare_decode_step(&mut model.runtime, request, &[7, 8], &mut invalidated,)
+            .is_err()
+    );
+    engine
+        .prepare_decode_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            &mut prepared.prepared_plans.decode,
+        )
+        .unwrap();
+    assert_eq!(prepared.prepared_plans.decode.generation.value(), 2);
+    let attempt = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            Some(&mut prepared.prepared_plans.decode),
+        )
+        .unwrap();
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().layer_resources,
+        layers
+    );
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().recurrent_resources,
+        recurrent
+    );
+    engine
+        .prepare_decode_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            &mut prepared.prepared_plans.decode,
+        )
+        .unwrap();
+    let retry = engine
+        .execute_generation_step(
+            &mut model.runtime,
+            request,
+            &[7, 8],
+            Some(&mut prepared.prepared_plans.decode),
+        )
+        .unwrap();
+    assert_eq!(retry.logits, attempt.logits);
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().layer_resources,
+        layers
+    );
+    assert_eq!(
+        model.runtime.kv_cache(&cache).unwrap().recurrent_resources,
+        recurrent
+    );
+    engine
+        .commit_generation_step(&mut model.runtime, request, &[7, 8], 9, &retry)
+        .unwrap();
+    engine
+        .release_request_state(&mut model.runtime, request)
+        .unwrap();
+    close_inference_session(&mut model.runtime, &prepared.session).unwrap();
+    model
+        .runtime
+        .forget_closed_inference_session(&prepared.session)
+        .unwrap();
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

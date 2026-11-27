@@ -1624,6 +1624,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("affine-layernorm", OperatorFamily::Normalization),
         baseline_advertisement("gelu-exact", OperatorFamily::Activation),
         baseline_advertisement("slice-last", OperatorFamily::Tensor),
+        baseline_advertisement("position-range", OperatorFamily::Tensor),
         baseline_advertisement("remainder-scalar", OperatorFamily::Tensor),
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
@@ -2635,7 +2636,11 @@ impl ReferenceCpuExecutor {
         let name = invocation.kernel.name.as_str();
         if matches!(
             name,
-            "affine-layernorm" | "gelu-exact" | "slice-last" | "remainder-scalar"
+            "affine-layernorm"
+                | "gelu-exact"
+                | "slice-last"
+                | "remainder-scalar"
+                | "position-range"
         ) && invocation.outputs.iter().any(|output| {
             invocation
                 .inputs
@@ -3269,6 +3274,21 @@ impl ReferenceCpuExecutor {
                 )
                 .map_err(KernelError::from)?
             }
+            "position-range" => {
+                if invocation.inputs.len() != 1 || invocation.outputs.len() != 1 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "position-range expects one input and one output".into(),
+                    });
+                }
+                let offset =
+                    crate::operator_semantics::position_range_offset(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                crate::operator_semantics::position_range(
+                    &self.input_tensor(invocation, 0)?,
+                    offset,
+                )
+                .map_err(KernelError::from)?
+            }
             "differential-attention" => {
                 if invocation.inputs.len() != 4
                     || invocation.outputs.len() != 1
@@ -3657,6 +3677,7 @@ impl ReferenceCpuExecutor {
                 | "gelu-exact"
                 | "slice-last"
                 | "remainder-scalar"
+                | "position-range"
                 | "differential-attention"
         ) && invocation
             .outputs

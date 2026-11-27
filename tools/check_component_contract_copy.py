@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 # A commit of magnetar-component-api that holds the version the Runtime serves.
-API_REV = "2383a7479ff496b147e27e294f3190d5209b39d4"
+API_REV = "b067d298c69ca00a1cb1ceced1cb89600a324a38"
 RUNTIME_FILE = pathlib.Path("magnetar-runtime/wit/model-component-graph.wit")
 RAW = "https://raw.githubusercontent.com/astorise/magnetar-component-api/{rev}/wit/{version}/model-component-graph.wit"
 

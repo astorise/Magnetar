@@ -1573,6 +1573,181 @@ fn olala_relu_squared_moe_graph_matches_upstream_logits() {
     }
 }
 
+/// The pinned NVIDIA implementation uses selection-biased sigmoid routing,
+/// always normalizes the selected scores, applies ReLU-squared experts and
+/// adds a separate shared expert. The reference is the actual PyTorch class.
+#[test]
+fn nemotron_relu_squared_moe_graph_matches_pinned_upstream() {
+    #[derive(serde::Deserialize)]
+    struct TensorFixture {
+        shape: Vec<u64>,
+        data: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        top_k: i64,
+        scale: f64,
+        experts: i64,
+        tensors: BTreeMap<String, TensorFixture>,
+    }
+    let cases: Vec<Fixture> = serde_json::from_str(include_str!(
+        "../../../fixtures/nemotron-moe-reference.json"
+    ))
+    .unwrap();
+    for case in cases {
+        let mut builder = FormsGraph {
+            graph: ExecutionGraph::new(
+                ExecutionGraphId::new("nemotron-relu-squared"),
+                ExecutionGraphPhase::Prefill,
+            ),
+        };
+        let mut bindings = BTreeMap::new();
+        let mut input = |name: &str, builder: &mut FormsGraph| {
+            let tensor = &case.tensors[name];
+            let id = builder.input(name, &tensor.shape);
+            bindings.insert(
+                id.clone(),
+                HostTensor::new(tensor.shape.clone(), tensor.data.clone()).unwrap(),
+            );
+            id
+        };
+        let hidden = input("hidden", &mut builder);
+        let router = input("router", &mut builder);
+        let expert_in = input("expert_in", &mut builder);
+        let expert_out = input("expert_out", &mut builder);
+        let bias = input("bias", &mut builder);
+        let shared_in = input("shared_in", &mut builder);
+        let shared_out = input("shared_out", &mut builder);
+        let head = input("head", &mut builder);
+        let router_logits = builder.node(
+            "router",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden.clone(), router],
+            &[4, 4],
+        );
+        let routed = builder.node(
+            "experts",
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            vec![
+                ("experts", OperatorAttributeValue::Integer(case.experts)),
+                ("top_k", OperatorAttributeValue::Integer(case.top_k)),
+                (
+                    "activation",
+                    OperatorAttributeValue::String("relu_squared".into()),
+                ),
+                (
+                    "routing_scoring",
+                    OperatorAttributeValue::String("sigmoid".into()),
+                ),
+                (
+                    "routing_normalization",
+                    OperatorAttributeValue::String("always".into()),
+                ),
+                ("routing_scale", OperatorAttributeValue::Float(case.scale)),
+                ("routing_group_count", OperatorAttributeValue::Integer(1)),
+                ("routing_group_selected", OperatorAttributeValue::Integer(1)),
+            ],
+            vec![hidden.clone(), router_logits, expert_in, expert_out, bias],
+            &[4, 5],
+        );
+        let shared = builder.node(
+            "shared_in",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden, shared_in],
+            &[4, 6],
+        );
+        let shared = builder.node(
+            "shared_activation",
+            "activation",
+            OperatorFamily::Activation,
+            vec![(
+                "kind",
+                OperatorAttributeValue::String("relu_squared".into()),
+            )],
+            vec![shared],
+            &[4, 6],
+        );
+        let shared = builder.node(
+            "shared_out",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![shared, shared_out],
+            &[4, 5],
+        );
+        let combined = builder.node(
+            "combined",
+            "add",
+            OperatorFamily::Tensor,
+            vec![],
+            vec![routed, shared],
+            &[4, 5],
+        );
+        let result = builder.node(
+            "head",
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![combined, head],
+            &[4, 7],
+        );
+        let mut graph = builder.graph;
+        let mut edge = graph.edges.remove(&result).unwrap();
+        edge.id = TensorEdgeId::new("logits");
+        graph.edges.insert(edge.id.clone(), edge);
+        graph
+            .nodes
+            .get_mut(&ExecutionNodeId::new("head"))
+            .unwrap()
+            .outputs = vec![TensorEdgeId::new("logits")];
+        let fixture = e2e_fixture().unwrap();
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            &graph,
+            &instance,
+            revision,
+            4,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new("nemotron-moe").unwrap(),
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = &outputs[&TensorEdgeId::new("logits")].data;
+        let expected = &case.tensors["logits"].data;
+        assert_eq!(actual.len(), expected.len());
+        for (&a, &b) in actual.iter().zip(expected) {
+            assert!((a - b).abs() < 2e-6, "top-{}: {a} != {b}", case.top_k);
+        }
+    }
+}
+
 impl FormsGraph {
     fn input(&mut self, name: &str, shape: &[u64]) -> TensorEdgeId {
         let id = TensorEdgeId::new(format!("input.{name}"));

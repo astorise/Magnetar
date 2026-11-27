@@ -302,10 +302,12 @@ pub fn register_inference_component_artifact(
     // mixed expert layers, expert routing and the YaRN RoPE case.
     // `1.13.0` (`support-qwen38-flash-next`) adds `linear-attention` and
     // `decoder-variants`; `1.14.0` adds `hyper-connections`,
-    // `ngram-embeddings`, `token-selection` and `linear-attention-gate`.
+    // `ngram-embeddings`, `token-selection` and `linear-attention-gate`;
+    // `1.15.0` adds an explicit ordered Mamba-2 hybrid configuration;
+    // `1.16.0` adds Runtime-bound copy-based KV history tensors.
     for version in [
         "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
-        "1.12.0", "1.13.0", "1.14.0",
+        "1.12.0", "1.13.0", "1.14.0", "1.15.0", "1.16.0",
     ] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
@@ -424,8 +426,37 @@ pub fn build_first_native_graphs_from_named_component_for_artifact(
     ),
     E2eConformanceError,
 > {
+    build_first_native_graphs_from_named_component_for_artifact_at_decode_position(
+        digest,
+        config,
+        tensors,
+        identity,
+        prompt_token_count,
+        prompt_token_count.max(1),
+    )
+}
+
+/// Builds the prompt graph and a decode graph for a particular committed
+/// history length. The caller must prepare a new plan for the resulting
+/// decode graph; this function does not replace or execute a published plan.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn build_first_native_graphs_from_named_component_for_artifact_at_decode_position(
+    digest: &ComponentDigest,
+    config: &ModelArchitectureConfig,
+    tensors: &[ModelTensorMetadata],
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+    cached_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
     let runtime = named_component_runtime(digest)?;
-    build_first_native_graphs_with_runtime(
+    build_first_native_graphs_with_runtime_at_decode_position(
         &runtime.manager,
         &runtime.capability,
         &runtime.model_config_capability,
@@ -434,6 +465,7 @@ pub fn build_first_native_graphs_from_named_component_for_artifact(
         weight_shapes_for_artifact(config, tensors),
         identity,
         prompt_token_count,
+        cached_token_count,
     )
 }
 
@@ -682,6 +714,26 @@ pub fn build_first_native_graphs_from_named_component_for_artifact(
     build_first_native_graphs_from_named_component(digest, config, identity, prompt_token_count)
 }
 
+/// Fails closed when this build has no Component engine.
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
+pub fn build_first_native_graphs_from_named_component_for_artifact_at_decode_position(
+    digest: &ComponentDigest,
+    config: &ModelArchitectureConfig,
+    _tensors: &[ModelTensorMetadata],
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+    _cached_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
+    build_first_native_graphs_from_named_component(digest, config, identity, prompt_token_count)
+}
+
 /// Builds prefill and decode Execution Graphs by instantiating the real
 /// Qwen Model Component (`QWEN_REAL_COMPONENT_BYTES`, compiled once and
 /// cached -- see `qwen_real_component_runtime`) and calling its
@@ -785,11 +837,53 @@ pub(super) fn build_first_native_graphs_with_runtime(
     ),
     E2eConformanceError,
 > {
+    build_first_native_graphs_with_runtime_at_decode_position(
+        manager,
+        capability,
+        model_config_capability,
+        definition,
+        config,
+        weight_shapes,
+        identity,
+        prompt_token_count,
+        prompt_token_count.max(1),
+    )
+}
+
+/// As above, but the decode Component receives the independently supplied
+/// committed history length instead of the prefill length.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[allow(clippy::too_many_arguments)]
+fn build_first_native_graphs_with_runtime_at_decode_position(
+    manager: &Mutex<ComponentManager>,
+    capability: &GraphBuilderCapability,
+    model_config_capability: &ModelConfigCapability,
+    definition: ComponentDefinitionId,
+    config: &ModelArchitectureConfig,
+    weight_shapes: BTreeMap<String, Vec<u64>>,
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+    cached_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
     config
         .validate()
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: format!("invalid model architecture configuration: {error}"),
         })?;
+    let argument = |count: u64| {
+        i64::try_from(count).map_err(|_| E2eConformanceError::ModelComponentFailed {
+            reason: "graph sequence length exceeds the Component argument limit".into(),
+        })
+    };
+    let prompt_argument = argument(prompt_token_count.max(1))?;
+    let cached_argument = argument(cached_token_count)?;
     let mut manager = manager.lock().unwrap();
 
     let instance = manager
@@ -823,7 +917,7 @@ pub(super) fn build_first_native_graphs_with_runtime(
         let prefill_result = manager
             .invoke(
                 ComponentInvocation::new(instance, export_interface.clone(), "build-prefill-graph")
-                    .with_arguments(vec![ComponentValue::S64(prompt_token_count.max(1) as i64)]),
+                    .with_arguments(vec![ComponentValue::S64(prompt_argument)]),
             )
             .map_err(|error| E2eConformanceError::ModelComponentFailed {
                 reason: error.to_string(),
@@ -846,7 +940,7 @@ pub(super) fn build_first_native_graphs_with_runtime(
         let decode_result = manager
             .invoke(
                 ComponentInvocation::new(instance, export_interface, "build-decode-graph")
-                    .with_arguments(vec![ComponentValue::S64(prompt_token_count.max(1) as i64)]),
+                    .with_arguments(vec![ComponentValue::S64(cached_argument)]),
             )
             .map_err(|error| E2eConformanceError::ModelComponentFailed {
                 reason: error.to_string(),
@@ -1358,3 +1452,10 @@ fn require_declared_features_read(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+mod nemotron_tests;

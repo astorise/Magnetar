@@ -1643,6 +1643,56 @@ fn linear_attention_layers_keep_no_kv_rows() {
     assert_eq!(config.kv_value_row_widths(), expected);
 }
 
+#[test]
+fn ordered_mamba2_hybrid_reserves_kv_only_for_attention_blocks() {
+    let mut config = FirstNativeModelConfig::new(
+        first_native_architecture_metadata(8, 4, 4, 2, 2, 12, 24, 64),
+        FirstNativeRopeConfig::standard(2),
+    );
+    config.decoder_extensions.mamba2_hybrid = Some(crate::Mamba2HybridConfig {
+        layers: vec![
+            crate::HybridDecoderBlock::Mamba2,
+            crate::HybridDecoderBlock::Attention,
+            crate::HybridDecoderBlock::DenseMlp,
+            crate::HybridDecoderBlock::RoutedMoe,
+        ],
+        heads: 4,
+        head_dim: 2,
+        groups: 2,
+        state_dim: 3,
+        conv_kernel: 3,
+        epsilon: 1e-5,
+        dt_min: 0.0,
+        dt_max: None,
+        conv_bias: true,
+        linear_bias: false,
+    });
+    assert_eq!(config.kv_layer_count(), 4);
+    assert_eq!(config.kv_row_widths(), vec![None, Some(4), None, None]);
+    assert_eq!(
+        config.kv_value_row_widths(),
+        vec![None, Some(4), None, None]
+    );
+    assert_eq!(
+        config.kv_head_dimensions(),
+        vec![None, Some((2, 2)), None, None]
+    );
+    let layout = crate::KvCacheLayoutMetadata::contiguous(4, 2, 2, 64, ComputeDType::Float32)
+        .with_layer_row_widths(config.kv_row_widths())
+        .with_layer_value_row_widths(config.kv_value_row_widths());
+    assert_eq!(layout.estimated_storage_bytes().unwrap(), 64 * (4 + 4) * 4);
+    // A malformed short layout must not accidentally reserve KV for an
+    // unknown block before the architecture validator rejects it.
+    config
+        .decoder_extensions
+        .mamba2_hybrid
+        .as_mut()
+        .unwrap()
+        .layers
+        .truncate(2);
+    assert_eq!(config.kv_row_widths(), vec![None, Some(4), None, None]);
+}
+
 /// `support-qwen38-flash-next`: each full-attention layer of a model with a
 /// token indexer keeps its raw index keys in a KV store of its own, numbered
 /// after the decoder layers, holding keys of the indexer's head width and no

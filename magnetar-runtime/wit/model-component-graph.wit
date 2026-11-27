@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.14.0;
+package magnetar:model-component-graph@1.15.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -555,6 +555,38 @@ interface model-config {
   /// 1.14.0: `none` keeps `silu`. A declared value must be read before a
   /// graph is accepted.
   linear-attention-gate: func() -> option<gate-activation>;
+
+  /// One ordered residual block. A block is one mixer or MLP, not a
+  /// combined attention-plus-MLP decoder layer.
+  enum hybrid-decoder-block {
+    mamba2,
+    attention,
+    dense-mlp,
+    routed-moe,
+  }
+
+  /// The portable Mamba-2 geometry shared by the declared mixer blocks.
+  /// `dt-min`/`dt-max` are inference-time limits, not initializer bounds;
+  /// no upper limit is represented by `none`. Attention position encoding
+  /// and expert routing are supplied by `rope-layers`, `mixture-of-experts`,
+  /// `mixture-of-experts-layers` and `expert-routing` rather than guessed.
+  record mamba2-hybrid-config {
+    layers: list<hybrid-decoder-block>,
+    heads: u32,
+    head-dimension: u64,
+    groups: u32,
+    state-dimension: u64,
+    conv-kernel: u32,
+    epsilon: f64,
+    dt-min: f64,
+    dt-max: option<f64>,
+    conv-bias: bool,
+    linear-bias: bool,
+  }
+
+  /// Added in 1.15.0: a declared hybrid must be read before its graph is
+  /// accepted. Older Components continue linking but cannot ignore it.
+  mamba2-hybrid: func() -> option<mamba2-hybrid-config>;
 }
 
 /// A separate graph-producing world for one bidirectional encoder pass.

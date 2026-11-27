@@ -1272,6 +1272,18 @@ fn runtime_generation_plan_context(
 /// logits. Callers configure this when constructing a Runtime; normal
 /// generation does not accept per-request callbacks or readiness booleans.
 pub(crate) trait RuntimeModelExecutionEngine: Send + Sync {
+    /// Prepare any request-specific decode plan before its guard is checked.
+    /// Engines whose graph does not change across steps keep the supplied plan.
+    fn prepare_decode_step(
+        &self,
+        _runtime: &mut Runtime,
+        _request: &GenerationRequest,
+        _generated_tokens: &[TokenId],
+        _execution_plan: &mut PreparedExecutionPlan,
+    ) -> Result<(), InferenceApiError> {
+        Ok(())
+    }
+
     fn execute_generation_step(
         &self,
         runtime: &mut Runtime,
@@ -1328,6 +1340,17 @@ pub(crate) struct SharedRuntimeModelExecutionEngine(Arc<dyn RuntimeModelExecutio
 impl SharedRuntimeModelExecutionEngine {
     pub(crate) fn new(executor: Arc<dyn RuntimeModelExecutionEngine>) -> Self {
         Self(executor)
+    }
+
+    pub(crate) fn prepare_decode_step(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        execution_plan: &mut PreparedExecutionPlan,
+    ) -> Result<(), InferenceApiError> {
+        self.0
+            .prepare_decode_step(runtime, request, generated_tokens, execution_plan)
     }
 
     pub(crate) fn execute_generation_step(
@@ -1771,6 +1794,13 @@ fn run_generation_loop_inner(
                 request,
                 &generated,
             );
+            if !generated.is_empty()
+                && let Err(error) =
+                    executor.prepare_decode_step(runtime, request, &generated, plans.decode)
+            {
+                observe_generation_execution_error(observer, correlation_id.clone(), &error);
+                return Err(error);
+            }
             if let Err(error) = plans
                 .decode
                 .execute_ready_path(&context)

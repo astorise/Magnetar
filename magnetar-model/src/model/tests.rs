@@ -366,6 +366,7 @@ fn decoder_extensions_validate_against_the_architecture() {
                 compress_ratio: 4,
             }),
             sigmoid_linear_gate: true,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -401,4 +402,125 @@ fn decoder_extensions_validate_against_the_architecture() {
     refused(|extensions| extensions.token_selection.as_mut().unwrap().key_heads = 2);
     refused(|extensions| extensions.token_selection.as_mut().unwrap().budget = 30);
     refused(|extensions| extensions.token_selection.as_mut().unwrap().compress_ratio = 0);
+}
+
+#[test]
+fn mamba2_hybrid_requires_bounded_geometry_and_explicit_block_semantics() {
+    let valid = ModelArchitectureConfig {
+        hidden_size: 8,
+        intermediate_size: 12,
+        num_hidden_layers: 4,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 4,
+        vocab_size: 24,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10_000.0,
+        rope_layers: Some(vec![false; 4]),
+        hidden_activation: Some("relu_squared".into()),
+        mixture_of_experts: Some(MixtureOfExpertsConfig {
+            experts: 4,
+            experts_per_token: 2,
+            expert_intermediate_size: 3,
+            shared_expert_intermediate_size: Some(6),
+            normalize_top_k: true,
+        }),
+        moe_layers: Some(vec![false, false, true, false]),
+        expert_routing: Some(ExpertRoutingConfig {
+            scoring: ExpertScoring::Sigmoid,
+            groups: Some(ExpertGroups {
+                count: 1,
+                per_token: 1,
+                score: ExpertGroupScore::TopTwoSum,
+            }),
+            routed_scaling_factor: 2.5,
+            selection_bias: true,
+            normalization: Some(ExpertNormalization::Always),
+            shared_expert_gated: false,
+        }),
+        decoder_extensions: DecoderExtensions {
+            mamba2_hybrid: Some(Mamba2HybridConfig {
+                layers: vec![
+                    HybridDecoderBlock::Mamba2,
+                    HybridDecoderBlock::Attention,
+                    HybridDecoderBlock::RoutedMoe,
+                    HybridDecoderBlock::Mamba2,
+                ],
+                heads: 4,
+                head_dim: 2,
+                groups: 2,
+                state_dim: 3,
+                conv_kernel: 3,
+                epsilon: 1e-5,
+                dt_min: 0.0,
+                dt_max: None,
+                conv_bias: true,
+                linear_bias: false,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    valid.validate().unwrap();
+    assert!(valid.decoder_extensions.is_declared());
+    let invalid = |change: fn(&mut ModelArchitectureConfig)| {
+        let mut candidate = valid.clone();
+        change(&mut candidate);
+        assert!(candidate.validate().is_err(), "{candidate:?}");
+    };
+    invalid(|config| {
+        config
+            .decoder_extensions
+            .mamba2_hybrid
+            .as_mut()
+            .unwrap()
+            .layers
+            .pop();
+    });
+    invalid(|config| {
+        config
+            .decoder_extensions
+            .mamba2_hybrid
+            .as_mut()
+            .unwrap()
+            .groups = 3
+    });
+    invalid(|config| {
+        config
+            .decoder_extensions
+            .mamba2_hybrid
+            .as_mut()
+            .unwrap()
+            .state_dim = u64::MAX
+    });
+    invalid(|config| {
+        config
+            .decoder_extensions
+            .mamba2_hybrid
+            .as_mut()
+            .unwrap()
+            .epsilon = f64::NAN
+    });
+    invalid(|config| {
+        config
+            .decoder_extensions
+            .mamba2_hybrid
+            .as_mut()
+            .unwrap()
+            .dt_min = -1.0
+    });
+    invalid(|config| {
+        config
+            .decoder_extensions
+            .mamba2_hybrid
+            .as_mut()
+            .unwrap()
+            .dt_max = Some(f64::INFINITY)
+    });
+    invalid(|config| config.rope_layers = None);
+    invalid(|config| config.rope_layers.as_mut().unwrap()[0] = true);
+    invalid(|config| config.moe_layers.as_mut().unwrap()[1] = true);
+    invalid(|config| config.expert_routing = None);
+    invalid(|config| config.hidden_activation = None);
+    invalid(|config| config.attention_output_gate = true);
 }

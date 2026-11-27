@@ -31,6 +31,8 @@ const QWEN_GRAPH_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/qwen-graph.component.wat");
 const RECURRENT_STATE_COMPONENT: &[u8] =
     include_bytes!("../../../magnetar-runtime/fixtures/components/recurrent-state.component.wasm");
+const KV_HISTORY_COMPONENT: &[u8] =
+    include_bytes!("../../../magnetar-runtime/fixtures/components/kv-history-probe.component.wasm");
 const LEGACY_RECURRENT_STATE_COMPONENT: &[u8] = include_bytes!(
     "../../../magnetar-runtime/fixtures/components/recurrent-state-legacy.component.wasm"
 );
@@ -56,6 +58,8 @@ const LATENT_ATTENTION_PROBE_COMPONENT: &str = include_str!(
 const EXPERT_NORMALIZATION_PROBE_COMPONENT: &str = include_str!(
     "../../../magnetar-runtime/fixtures/components/expert-normalization-probe.component.wat"
 );
+const MAMBA2_HYBRID_PROBE_COMPONENT: &str =
+    include_str!("../../../magnetar-runtime/fixtures/components/mamba2-hybrid-probe.component.wat");
 /// Imports `model-config@1.4.0`'s `rope-scaling`, whose variant has only the
 /// `banded` case, and returns the scaling's case (`run`).
 const BANDED_ONLY_PROBE_COMPONENT: &str = r#"
@@ -514,6 +518,118 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
         crate::GraphKvCacheBehavior::Output
     );
 
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wasmtime_engine_builds_runtime_owned_kv_history_graphs() {
+    let directory =
+        std::env::temp_dir().join(format!("magnetar-wasmtime-history-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("history.component.wasm");
+    std::fs::write(&artifact, KV_HISTORY_COMPONENT).unwrap();
+    let capability = Arc::new(crate::GraphBuilderCapability::new());
+    let model_config = Arc::new(crate::ModelConfigCapability::new());
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("magnetar:model-component-graph/graph-builder", "1.16.0");
+    let config_interface =
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.16.0");
+    engine.register_capability(
+        interface.clone(),
+        capability.clone() as Arc<dyn HostCapability>,
+    );
+    engine.register_capability(
+        config_interface.clone(),
+        model_config.clone() as Arc<dyn HostCapability>,
+    );
+    let export = WitInterface::new(
+        "magnetar:model-component-graph/model-component-graph-producer",
+        "1.16.0",
+    );
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(207),
+        metadata: crate::ComponentMetadata::new("history", "1", "history graph probe")
+            .with_import(interface.clone())
+            .with_import(config_interface.clone())
+            .with_export(export.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link = ComponentLinkPlan::default();
+    link.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+    link.insert_for_test(crate::ComponentEndpoint::Capability {
+        interface: config_interface,
+    });
+    let instance = engine.instantiate(&prepared, &link).unwrap();
+    for (operation, argument, expected_rows) in
+        [("build-prefill-graph", 4, 1), ("build-decode-graph", 3, 3)]
+    {
+        model_config.bind_config(
+            instance.engine_key(),
+            crate::ModelArchitectureConfig {
+                hidden_size: 4,
+                intermediate_size: 8,
+                num_hidden_layers: 1,
+                num_attention_heads: 2,
+                num_key_value_heads: 2,
+                head_dim: 2,
+                vocab_size: 258,
+                rms_norm_eps: 1e-6,
+                rope_theta: 10_000.0,
+                hidden_activation: Some("silu".into()),
+                ..Default::default()
+            },
+        );
+        capability.prepare_session(
+            instance.engine_key(),
+            crate::graph_builder_capability::SessionContext {
+                component_id: "history".into(),
+                compatibility_key: "model-v1".into(),
+                kv_namespace: "probe".into(),
+                weight_shapes: BTreeMap::new(),
+                output_edge_name: "logits".into(),
+            },
+        );
+        let result = engine
+            .invoke(
+                &instance,
+                &ComponentInvocation::new(
+                    crate::ComponentInstanceId::new(207),
+                    export.clone(),
+                    operation,
+                )
+                .with_arguments(vec![ComponentValue::S64(argument)]),
+            )
+            .unwrap();
+        let [ComponentValue::String(handle)] = result.values.as_slice() else {
+            panic!("expected graph handle")
+        };
+        let graph = capability
+            .take_graph(instance.engine_key(), handle)
+            .unwrap();
+        assert!(
+            model_config
+                .unread_declared_features(instance.engine_key())
+                .is_empty()
+        );
+        graph.validate(&crate::default_graph_catalog()).unwrap();
+        let histories = graph.kv_history_bindings().unwrap();
+        assert_eq!(histories.len(), 2);
+        for binding in histories {
+            assert_eq!(binding.compatibility_key, "model-v1");
+            assert_eq!(
+                graph.edges[&binding.input_edge].descriptor.shape.dimensions,
+                [expected_rows, 2]
+            );
+        }
+    }
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -1777,6 +1893,73 @@ fn yarn_scaling() -> crate::RopeFrequencyScaling {
         },
         mscale_all_dim: Some(0.707),
     }
+}
+
+#[test]
+fn wasmtime_engine_lowers_mamba2_hybrid_configuration_into_a_real_component() {
+    let config = crate::ModelArchitectureConfig {
+        decoder_extensions: crate::DecoderExtensions {
+            mamba2_hybrid: Some(crate::Mamba2HybridConfig {
+                layers: vec![
+                    crate::HybridDecoderBlock::Mamba2,
+                    crate::HybridDecoderBlock::Attention,
+                    crate::HybridDecoderBlock::DenseMlp,
+                    crate::HybridDecoderBlock::RoutedMoe,
+                ],
+                heads: 4,
+                head_dim: 8,
+                groups: 2,
+                state_dim: 3,
+                conv_kernel: 4,
+                epsilon: 0.125,
+                dt_min: 0.25,
+                dt_max: Some(0.5),
+                conv_bias: true,
+                linear_bias: false,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        run_model_config_probe(
+            "mamba2-hybrid-probe",
+            MAMBA2_HYBRID_PROBE_COMPONENT,
+            "1.15.0",
+            config.clone(),
+            &["run"]
+        ),
+        vec![Ok(1)]
+    );
+    let mut no_limit = config.clone();
+    no_limit
+        .decoder_extensions
+        .mamba2_hybrid
+        .as_mut()
+        .unwrap()
+        .dt_max = None;
+    assert_eq!(
+        run_model_config_probe(
+            "mamba2-hybrid-unbounded",
+            MAMBA2_HYBRID_PROBE_COMPONENT,
+            "1.15.0",
+            no_limit,
+            &["run"]
+        ),
+        vec![Ok(0)]
+    );
+    let mut plain = config;
+    plain.decoder_extensions.mamba2_hybrid = None;
+    assert_eq!(
+        run_model_config_probe(
+            "mamba2-hybrid-none",
+            MAMBA2_HYBRID_PROBE_COMPONENT,
+            "1.15.0",
+            plain,
+            &["run"]
+        ),
+        vec![Ok(0)]
+    );
 }
 
 #[test]

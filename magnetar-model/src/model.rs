@@ -800,9 +800,9 @@ pub struct ModelArchitectureConfig {
     pub eos_token_id: Option<u32>,
 }
 
-/// The decoder forms of `model-config` `1.14.0` (Qwen4-Exp). Each is a
-/// separate function of the Capability, so a Component that does not read
-/// one a checkpoint declares is refused instead of running without it.
+/// Optional decoder forms exposed by separate `model-config` functions. A
+/// Component that does not read a declared form is refused instead of running
+/// without it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DecoderExtensions {
     /// The decoder carries several residual streams mixed by learned gates
@@ -816,6 +816,9 @@ pub struct DecoderExtensions {
     /// The linear-attention layers' output gate is `sigmoid` instead of
     /// `silu` (`linear-attention-gate`).
     pub sigmoid_linear_gate: bool,
+    /// Ordered Mamba-2, attention and MLP blocks with explicit mixer geometry
+    /// (`mamba2-hybrid`, model-config 1.15.0).
+    pub mamba2_hybrid: Option<Mamba2HybridConfig>,
 }
 
 impl DecoderExtensions {
@@ -825,7 +828,38 @@ impl DecoderExtensions {
             || self.ngram_embeddings.is_some()
             || self.token_selection.is_some()
             || self.sigmoid_linear_gate
+            || self.mamba2_hybrid.is_some()
     }
+}
+
+/// One block in an ordered hybrid decoder. A block has its own residual
+/// update; these variants do not imply another attention or MLP sublayer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HybridDecoderBlock {
+    Mamba2,
+    Attention,
+    DenseMlp,
+    RoutedMoe,
+}
+
+/// Configuration for portable Mamba-2 mixer blocks in a hybrid decoder.
+/// Attention position handling and expert routing remain explicit in the
+/// architecture's `rope_layers`, `mixture_of_experts` and `expert_routing`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mamba2HybridConfig {
+    pub layers: Vec<HybridDecoderBlock>,
+    pub heads: u32,
+    pub head_dim: u64,
+    pub groups: u32,
+    pub state_dim: u64,
+    pub conv_kernel: u32,
+    pub epsilon: f64,
+    /// Inference-time lower limit, not the checkpoint's initializer bound.
+    pub dt_min: f64,
+    /// `None` means no inference-time upper clamp.
+    pub dt_max: Option<f64>,
+    pub conv_bias: bool,
+    pub linear_bias: bool,
 }
 
 /// `model-config`'s `hyper-connection-config` (`1.14.0`): the embedding is
@@ -1088,6 +1122,107 @@ impl ModelArchitectureConfig {
                 selection.key_heads, selection.budget, selection.compress_ratio
             )));
         }
+        if let Some(hybrid) = &extensions.mamba2_hybrid {
+            const MAX_ELEMENTS: u64 = 67_108_864;
+            let finite_f32 = |value: f64| value.is_finite() && (value as f32).is_finite();
+            let inner = u64::from(hybrid.heads).checked_mul(hybrid.head_dim);
+            let grouped = u64::from(hybrid.groups).checked_mul(hybrid.state_dim);
+            let channels = inner.and_then(|inner| {
+                grouped.and_then(|grouped| grouped.checked_mul(2)?.checked_add(inner))
+            });
+            let projection = inner.and_then(|inner| {
+                channels.and_then(|channels| {
+                    inner
+                        .checked_add(channels)?
+                        .checked_add(u64::from(hybrid.heads))
+                })
+            });
+            let bounded = |value: Option<u64>| value.is_some_and(|n| n > 0 && n <= MAX_ELEMENTS);
+            let geometry_valid = hybrid.layers.len() == self.num_hidden_layers as usize
+                && hybrid.layers.contains(&HybridDecoderBlock::Mamba2)
+                && hybrid.heads > 0
+                && hybrid.groups > 0
+                && hybrid.heads.is_multiple_of(hybrid.groups)
+                && hybrid.head_dim > 0
+                && hybrid.state_dim > 0
+                && hybrid.conv_kernel > 0
+                && bounded(inner)
+                && bounded(grouped)
+                && bounded(channels)
+                && bounded(projection)
+                && bounded(projection.and_then(|n| n.checked_mul(self.hidden_size)))
+                && bounded(inner.and_then(|n| n.checked_mul(hybrid.state_dim)))
+                && bounded(channels.and_then(|n| n.checked_mul(u64::from(hybrid.conv_kernel))))
+                && finite_f32(hybrid.epsilon)
+                && (hybrid.epsilon as f32) > 0.0
+                && finite_f32(hybrid.dt_min)
+                && hybrid.dt_min >= 0.0
+                && hybrid.dt_max.is_none_or(|max| {
+                    finite_f32(max)
+                        && max >= hybrid.dt_min
+                        && (max as f32) >= (hybrid.dt_min as f32)
+                });
+            if !geometry_valid {
+                return Err(invalid(
+                    "invalid ordered Mamba-2 hybrid geometry or inference limits".into(),
+                ));
+            }
+            let has_attention = hybrid.layers.contains(&HybridDecoderBlock::Attention);
+            if (has_attention && self.rope_layers.is_none())
+                || self.rope_layers.as_ref().is_some_and(|rope| {
+                    rope.len() != hybrid.layers.len()
+                        || rope.iter().zip(&hybrid.layers).any(|(&enabled, layer)| {
+                            enabled && *layer != HybridDecoderBlock::Attention
+                        })
+                })
+            {
+                return Err(invalid(
+                    "hybrid attention requires explicit, layer-compatible position encoding".into(),
+                ));
+            }
+            let moe_layers: Vec<_> = hybrid
+                .layers
+                .iter()
+                .map(|layer| *layer == HybridDecoderBlock::RoutedMoe)
+                .collect();
+            let has_moe = moe_layers.contains(&true);
+            if (has_moe
+                && (self.mixture_of_experts.is_none()
+                    || self.expert_routing.is_none()
+                    || self.moe_layers.as_ref() != Some(&moe_layers)))
+                || (!has_moe && (self.mixture_of_experts.is_some() || self.moe_layers.is_some()))
+            {
+                return Err(invalid(
+                    "hybrid expert blocks require matching explicit expert layers and routing"
+                        .into(),
+                ));
+            }
+            if hybrid.layers.iter().any(|layer| {
+                matches!(
+                    layer,
+                    HybridDecoderBlock::DenseMlp | HybridDecoderBlock::RoutedMoe
+                )
+            }) && self.hidden_activation.is_none()
+            {
+                return Err(invalid(
+                    "hybrid MLP blocks require an explicit activation".into(),
+                ));
+            }
+            if self.linear_attention.is_some()
+                || self.latent_attention.is_some()
+                || self.layer_layout.is_some()
+                || self.attention_output_gate
+                || self.norm_weight_offset.is_some_and(|offset| offset != 0.0)
+                || extensions.hyper_connections.is_some()
+                || extensions.ngram_embeddings.is_some()
+                || extensions.token_selection.is_some()
+                || extensions.sigmoid_linear_gate
+            {
+                return Err(invalid(
+                    "unsupported combination with an ordered Mamba-2 hybrid decoder".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1112,7 +1247,10 @@ impl ModelArchitectureConfig {
         }
         self.validate_decoder_extensions()?;
         if let Some(activation) = self.hidden_activation.as_deref()
-            && !matches!(activation, "silu" | "gelu" | "gelu_pytorch_tanh" | "relu")
+            && !matches!(
+                activation,
+                "silu" | "gelu" | "gelu_pytorch_tanh" | "relu" | "relu_squared"
+            )
         {
             return Err(ModelArtifactError::InvalidManifest {
                 message: format!("unsupported checkpoint activation '{activation}'"),

@@ -328,6 +328,7 @@ pub(super) fn note_graph_kv_requirement(
 ) {
     let behavior = match kv.behavior {
         GraphKvCacheBehavior::Input => "input",
+        GraphKvCacheBehavior::HistoryInput => "history-input",
         GraphKvCacheBehavior::Output => "output",
         GraphKvCacheBehavior::Append => "append",
     };

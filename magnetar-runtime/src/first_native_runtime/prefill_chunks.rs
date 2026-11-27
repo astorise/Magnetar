@@ -5,6 +5,8 @@
 //! bounded by the chunk length instead of the prompt's. The last pass is
 //! right-padded to the chunk length like a bucketed prefill
 //! (`replay-bucketed-prefill`), so every pass shares one graph and one plan.
+//! Graphs with recurrent state only use this path when every chunk is full:
+//! padding would otherwise advance that state beyond the prompt.
 
 use super::*;
 
@@ -67,6 +69,99 @@ pub(crate) fn prefill_continues_history(graph: &ExecutionGraph) -> bool {
             node.inputs.len() >= 3 && is_kv_edge(&node.inputs[1]) && is_kv_edge(&node.inputs[2])
         })
         && super::engine::kv_edges_feed_only_attention(graph)
+}
+
+/// Conservative continuation profile for recurrent prefills. A recurrent
+/// slot alone does not promise that running a graph in chunks is equivalent:
+/// unknown operators, noncausal attention, or state transformed elsewhere
+/// must keep the existing single-pass behavior. This profile covers the
+/// token-wise composition and direct Mamba-2 state bindings qualified by the
+/// mixed-model continuation test.
+pub(crate) fn recurrent_prefill_continues_history(graph: &ExecutionGraph) -> bool {
+    if !prefill_continues_history(graph) {
+        return false;
+    }
+    let Ok(bindings) = graph.recurrent_state_bindings() else {
+        return false;
+    };
+    let mut mixers = 0;
+    for node in graph.nodes.values() {
+        if node.operator.namespace() != "magnetar:operator" || node.operator.version() != 1 {
+            return false;
+        }
+        match node.operator.name() {
+            "mamba2-mixer" => {
+                mixers += 1;
+                for index in [1, 2] {
+                    let Some((input, output)) = node.inputs.get(index).zip(node.outputs.get(index))
+                    else {
+                        return false;
+                    };
+                    if !bindings.iter().any(|binding| {
+                        binding.input_edge == *input && binding.output_edge == *output
+                    }) || graph.edges.get(input).is_none_or(|edge| {
+                        edge.consumers.len() != 1 || !edge.consumers.contains(&node.id)
+                    }) || graph
+                        .edges
+                        .get(output)
+                        .is_none_or(|edge| !edge.consumers.is_empty())
+                    {
+                        return false;
+                    }
+                }
+            }
+            "attention" => {
+                if node.attributes.get("causal") != Some(&OperatorAttributeValue::Boolean(true))
+                    || node.attributes.get("attention_mask_kind")
+                        != Some(&OperatorAttributeValue::String("causal".into()))
+                {
+                    return false;
+                }
+            }
+            "matmul" | "matmul-residual" => {
+                let expected_inputs = if node.operator.name() == "matmul" {
+                    2
+                } else {
+                    3
+                };
+                if node.inputs.len() != expected_inputs
+                    || !node.inputs[1].as_str().starts_with("weight.")
+                {
+                    return false;
+                }
+            }
+            "embedding" => {
+                if node.inputs.len() != 2
+                    || match node.inputs[0].as_str() {
+                        "input.token_ids" => node.inputs[1].as_str() != "weight.token_embedding",
+                        super::prefill_buckets::LOGITS_ROW_INPUT => false,
+                        _ => true,
+                    }
+                {
+                    return false;
+                }
+            }
+            "rmsnorm" => {
+                if node.inputs.len() != 2 || !node.inputs[1].as_str().starts_with("weight.") {
+                    return false;
+                }
+            }
+            "moe-experts" => {
+                if node.inputs.len() < 4
+                    || node
+                        .inputs
+                        .iter()
+                        .skip(2)
+                        .any(|edge| !edge.as_str().starts_with("weight."))
+                {
+                    return false;
+                }
+            }
+            "residual-add" | "add" | "activation" => {}
+            _ => return false,
+        }
+    }
+    mixers > 0 && bindings.len() == mixers * 2
 }
 
 impl E2eRuntimeModelExecutionEngine {

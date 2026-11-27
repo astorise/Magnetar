@@ -2105,6 +2105,21 @@ impl ProductionLoadedModel {
                         graphs
                     }
                 };
+                if component_graphs.history_input
+                    && (graph_length != prompt_token_count
+                        || self.graph_cache.is_prefill_bucket(graph_length))
+                {
+                    self.graph_cache.set_prefill_buckets(Vec::new());
+                    self.graph_cache.set_prefill_chunk(0);
+                    continue;
+                }
+                if component_graphs.history_input {
+                    super::history_decode_planning::validate_history_graph_pair(
+                        &component_graphs.prefill,
+                        &component_graphs.decode,
+                        prompt_token_count,
+                    )?;
+                }
                 // A chunked prefill's later passes read the earlier passes' rows
                 // through the KV history alone (`chunk-long-prefills`): a graph
                 // whose attention reads K or V from elsewhere runs every prompt
@@ -2129,10 +2144,20 @@ impl ProductionLoadedModel {
                     self.graph_cache.set_prefill_chunk(0);
                     continue;
                 }
-                // Padding rows would advance recurrent state past the prompt
-                // (`support-qwen38-flash-next`): such graphs run at the
-                // prompt's exact length.
-                if component_graphs.recurrent && graph_length != prompt_token_count {
+                // Padding rows would advance recurrent state past the prompt.
+                // A chunked prefill is safe when every pass is full: the
+                // executor stages each pass's state for the next one. Keep
+                // non-divisible prompts and padded buckets at exact length.
+                let full_recurrent_chunks = graph_length > 0
+                    && graph_length < prompt_token_count
+                    && prompt_token_count.is_multiple_of(graph_length)
+                    && super::prefill_chunks::recurrent_prefill_continues_history(
+                        &component_graphs.prefill,
+                    );
+                if component_graphs.recurrent
+                    && graph_length != prompt_token_count
+                    && !full_recurrent_chunks
+                {
                     self.graph_cache.set_prefill_buckets(Vec::new());
                     self.graph_cache.set_prefill_chunk(0);
                     continue;
