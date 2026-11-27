@@ -1276,6 +1276,28 @@ pub(super) fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "remainder-scalar" => {
+            if inputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects one remainder input"),
+                });
+            }
+            crate::operator_semantics::remainder_scalar_divisor(&node.attributes).map_err(
+                |error| InferenceApiError::GraphPlanningFailed {
+                    reason: error.to_string(),
+                },
+            )?;
+            dispatch_qwen_unary(
+                ctx,
+                node_id,
+                "remainder-scalar",
+                OperatorFamily::Tensor,
+                inputs.remove(0),
+                node.attributes.clone(),
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "gelu" | "gelu-exact" => {
             if inputs.len() != 1 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -1969,6 +1991,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "projected-differential-attention"
                 | "affine-layernorm"
                 | "slice-last"
+                | "remainder-scalar"
                 | "row-scale"
                 | "activation"
                 | "attention"
@@ -2082,6 +2105,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "affine-layernorm"
                 | "gelu-exact"
                 | "slice-last"
+                | "remainder-scalar"
         ) {
             for edge_id in &node.outputs {
                 let output_id = dispatch_ctx.edge_resource(edge_id.as_str());

@@ -1579,6 +1579,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         ),
         ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
         ("slice-last", OperatorFamily::Tensor, 1, 1, ShapeRule::Any),
+        (
+            "remainder-scalar",
+            OperatorFamily::Tensor,
+            1,
+            1,
+            ShapeRule::SameShape,
+        ),
         // `append-kv-history-in-place`: writes `rows` into `store` at
         // `row_offset`, in place; the output resource is the store itself.
         ("kv-write", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
@@ -1781,7 +1788,10 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 OperatorDTypeContract::new(TensorRole::Accumulation, floats),
             ];
         }
-        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last") {
+        if matches!(
+            name,
+            "affine-layernorm" | "gelu-exact" | "slice-last" | "remainder-scalar"
+        ) {
             spec.dtype_contracts = vec![
                 OperatorDTypeContract::new(TensorRole::Input, [ComputeDType::Float32]),
                 OperatorDTypeContract::new(TensorRole::Output, [ComputeDType::Float32]),
@@ -1804,6 +1814,10 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
+        "remainder-scalar" => OperatorAttributeSchema::default().with_rule(
+            "divisor",
+            OperatorAttributeRule::required(OperatorAttributeKind::Float),
+        ),
         "differential-attention" => OperatorAttributeSchema::default()
             .with_rule(
                 "scale",
