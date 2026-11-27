@@ -342,93 +342,98 @@ fn mamba3_prefill_wrap_is_committed_before_cached_steps() {
         .mutation_version;
     let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
     let executor = resolve_kernel_execution_provider(&runtime, &provider).unwrap();
-    let cache = runtime
-        .create_kv_cache(KvCache::new(
-            KvCacheId::new("mamba3-managed-session").unwrap(),
-            KvCacheScope::Session,
-            KvCacheCompatibility::new(
-                GenerationModelReference::ModelInstance(instance.clone()),
-                TokenizerId::new("tokenizer").unwrap(),
-            ),
-            KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float32),
-        ))
-        .unwrap();
-    let step = |runtime: &mut Runtime, start: usize, count: usize, wrap: bool| {
-        let tensors = inputs(&reference, start, count, None);
-        let (mut graph, mut bindings) = make_graph(&reference, &tensors);
-        if wrap {
-            graph = with_prefill_angle_wrap(graph);
-        }
-        for (slot, input, output) in [
-            ("angle", "input.1", "output.angle"),
-            ("ssm", "input.2", "output.ssm"),
-            ("key", "input.3", "output.key"),
-            ("input", "input.4", "output.input"),
-        ] {
-            for (edge, behavior) in [
-                (input, GraphRecurrentStateBehavior::Input),
-                (output, GraphRecurrentStateBehavior::Output),
-            ] {
-                graph
-                    .edges
-                    .get_mut(&TensorEdgeId::new(edge))
-                    .unwrap()
-                    .recurrent_state = Some(GraphRecurrentStateMetadata {
-                    resource_id: format!("mamba3.layer0.{slot}"),
-                    layer: 0,
-                    slot: slot.into(),
-                    behavior,
-                    compatibility_key: "mamba3-mixer-v1".into(),
-                });
-            }
-            bindings.remove(&TensorEdgeId::new(input));
-        }
-        graph.validate(&initial_operator_catalog()).unwrap();
-        let mut plan = prepare_first_native_plan_for_graph(
-            runtime,
-            &graph,
-            &instance,
-            revision,
-            count as u64,
-            PreparedExecutionPlanGeneration::new(1),
-            &provider,
-        )
-        .unwrap();
-        let (_, outputs, _, _) = execute_first_native_graph_materializing(
-            runtime,
-            &fixture,
-            &instance,
-            &cache,
-            &graph,
-            &mut plan,
-            bindings,
-            None,
-            Some(0),
-            &mut Vec::new(),
-            MaterializedEdges::All,
-            None,
-            None,
-        )
-        .unwrap();
-        [
-            "output.activation",
-            "output.angle",
-            "output.ssm",
-            "output.key",
-            "output.input",
-        ]
-        .map(|name| outputs[&TensorEdgeId::new(name)].clone())
+    let new_cache = |runtime: &mut Runtime, name: &str| {
+        runtime
+            .create_kv_cache(KvCache::new(
+                KvCacheId::new(name).unwrap(),
+                KvCacheScope::Session,
+                KvCacheCompatibility::new(
+                    GenerationModelReference::ModelInstance(instance.clone()),
+                    TokenizerId::new("tokenizer").unwrap(),
+                ),
+                KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float32),
+            ))
+            .unwrap()
     };
-    let commit = |runtime: &mut Runtime| {
+    let cache = new_cache(&mut runtime, "mamba3-managed-session");
+    let other_cache = new_cache(&mut runtime, "mamba3-managed-other-session");
+    let step =
+        |runtime: &mut Runtime, cache: &KvCacheId, start: usize, count: usize, wrap: bool| {
+            let tensors = inputs(&reference, start, count, None);
+            let (mut graph, mut bindings) = make_graph(&reference, &tensors);
+            if wrap {
+                graph = with_prefill_angle_wrap(graph);
+            }
+            for (slot, input, output) in [
+                ("angle", "input.1", "output.angle"),
+                ("ssm", "input.2", "output.ssm"),
+                ("key", "input.3", "output.key"),
+                ("input", "input.4", "output.input"),
+            ] {
+                for (edge, behavior) in [
+                    (input, GraphRecurrentStateBehavior::Input),
+                    (output, GraphRecurrentStateBehavior::Output),
+                ] {
+                    graph
+                        .edges
+                        .get_mut(&TensorEdgeId::new(edge))
+                        .unwrap()
+                        .recurrent_state = Some(GraphRecurrentStateMetadata {
+                        resource_id: format!("mamba3.layer0.{slot}"),
+                        layer: 0,
+                        slot: slot.into(),
+                        behavior,
+                        compatibility_key: "mamba3-mixer-v1".into(),
+                    });
+                }
+                bindings.remove(&TensorEdgeId::new(input));
+            }
+            graph.validate(&initial_operator_catalog()).unwrap();
+            let mut plan = prepare_first_native_plan_for_graph(
+                runtime,
+                &graph,
+                &instance,
+                revision,
+                count as u64,
+                PreparedExecutionPlanGeneration::new(1),
+                &provider,
+            )
+            .unwrap();
+            let (_, outputs, _, _) = execute_first_native_graph_materializing(
+                runtime,
+                &fixture,
+                &instance,
+                cache,
+                &graph,
+                &mut plan,
+                bindings,
+                None,
+                Some(0),
+                &mut Vec::new(),
+                MaterializedEdges::All,
+                None,
+                None,
+            )
+            .unwrap();
+            [
+                "output.activation",
+                "output.angle",
+                "output.ssm",
+                "output.key",
+                "output.input",
+            ]
+            .map(|name| outputs[&TensorEdgeId::new(name)].clone())
+        };
+    let commit = |runtime: &mut Runtime, cache: &KvCacheId| {
         KvUpdateTransaction {
             provider_binding: provider.clone(),
             executor: executor.clone(),
             promoted: Vec::new(),
         }
-        .commit(runtime, &cache)
+        .commit(runtime, cache)
         .unwrap();
     };
-    let prefix = step(&mut runtime, 0, 3, true);
+    let prefix = step(&mut runtime, &cache, 0, 3, true);
     close(
         &prefix[0].data,
         &reference.prefix_output,
@@ -439,13 +444,26 @@ fn mamba3_prefill_wrap_is_committed_before_cached_steps() {
         &reference.prefix_state.angle,
         "managed prefill angle",
     );
-    commit(&mut runtime);
+    commit(&mut runtime, &cache);
     assert_eq!(
         runtime.kv_cache(&cache).unwrap().recurrent_resources.len(),
         4
     );
+    // A second session starts from zeros while the first holds all four slots.
+    let isolated = step(&mut runtime, &other_cache, 0, 3, true);
+    close(
+        &isolated[0].data,
+        &reference.prefix_output,
+        "isolated prefill output",
+    );
+    close(
+        &isolated[1].data,
+        &reference.prefix_state.angle,
+        "isolated prefill angle",
+    );
+    commit(&mut runtime, &other_cache);
     for (index, expected) in reference.steps.iter().enumerate() {
-        let output = step(&mut runtime, 3 + index, 1, false);
+        let output = step(&mut runtime, &cache, 3 + index, 1, false);
         close(&output[0].data, &expected.output, "managed decode output");
         close(&output[1].data, &expected.angle, "managed decode angle");
         close(&output[2].data, &expected.ssm, "managed decode SSM");
@@ -453,13 +471,20 @@ fn mamba3_prefill_wrap_is_committed_before_cached_steps() {
         close(&output[4].data, &expected.input, "managed decode input");
         if index == 0 {
             super::super::recurrent_state::discard_recurrent_state(&mut runtime, &executor, &cache);
-            let retry = step(&mut runtime, 3, 1, false);
+            let retry = step(&mut runtime, &cache, 3, 1, false);
             close(&retry[0].data, &expected.output, "managed retried decode");
         }
-        commit(&mut runtime);
+        commit(&mut runtime, &cache);
+        if index == 0 {
+            // Advancing the first session must not advance the second.
+            let other = step(&mut runtime, &other_cache, 3, 1, false);
+            close(&other[0].data, &expected.output, "isolated decode output");
+            close(&other[2].data, &expected.ssm, "isolated decode SSM");
+            commit(&mut runtime, &other_cache);
+        }
     }
     super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
-    let reset = step(&mut runtime, 0, 1, true);
+    let reset = step(&mut runtime, &cache, 0, 1, true);
     let width = reference.geometry.heads * reference.geometry.head_dim;
     close(
         &reset[0].data,
@@ -467,6 +492,19 @@ fn mamba3_prefill_wrap_is_committed_before_cached_steps() {
         "managed reset output",
     );
     super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+    // Resetting the first session must not erase the other's committed state.
+    let other_next = step(&mut runtime, &other_cache, 4, 1, false);
+    close(
+        &other_next[0].data,
+        &reference.steps[1].output,
+        "decode after other reset",
+    );
+    close(
+        &other_next[1].data,
+        &reference.steps[1].angle,
+        "angle after other reset",
+    );
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &other_cache);
 }
 
 #[test]
