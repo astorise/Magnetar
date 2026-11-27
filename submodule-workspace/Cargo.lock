@@ -925,6 +925,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-component-kev"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "magnetar-component-laya"
 version = "0.1.0"
 dependencies = [
@@ -1049,6 +1056,7 @@ dependencies = [
 name = "magnetar-integration-production-loading"
 version = "0.1.0"
 dependencies = [
+ "magnetar-component-kev",
  "magnetar-component-laya",
  "magnetar-component-modernbert",
  "magnetar-component-nemotron",

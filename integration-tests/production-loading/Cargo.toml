@@ -16,6 +16,7 @@ license = "MIT"
 publish = false
 
 [dev-dependencies]
+magnetar-component-kev = { path = "../../components/kev" }
 magnetar-component-laya = { path = "../../components/laya" }
 magnetar-component-modernbert = { path = "../../components/modernbert" }
 magnetar-component-nemotron = { path = "../../components/nemotron" }
