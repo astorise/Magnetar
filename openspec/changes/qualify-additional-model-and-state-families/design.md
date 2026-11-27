@@ -87,6 +87,20 @@ Evidence (RTX 3060, GPU CI run 42186542821):
 
 ### Experimental Olala expert network and hybrid state
 
+The pinned Olala Mamba-3 reference returns its prefill angle state modulo
+`2*pi`, while its incremental step retains the unwrapped next angle. A graph
+must express that boundary explicitly: an additive `remainder-scalar@1`
+operator accepts one finite contiguous f32 tensor and a finite positive f32
+divisor, returning an equal-shaped tensor with the divisor-sign remainder.
+The Component places it on the angle-state output at a prefill boundary and
+omits it for cached decode. Missing or invalid divisors and non-finite inputs
+are rejected. Because this is a distinct Operator identity, Providers without
+an implementation cannot silently execute the graph. Reference CPU and the
+CPU Provider are the initial targets; no GPU support is implied. The existing
+unwrapped Mamba-3 operators and WIT signatures remain unchanged. Chunked
+prefill and state transitions require independent numerical comparisons;
+the operator alone does not qualify Olala inference.
+
 At revision `b40f8165ee2254c18601220e19842600c6d91794`, Olala uses
 selection-biased sigmoid routing and an **ungated** expert network
 `W_out(relu(W_in(x))²)`, with optional routed input/output projections and a
