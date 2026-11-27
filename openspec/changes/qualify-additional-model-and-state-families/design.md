@@ -359,11 +359,16 @@ mixed Mamba/attention/MoE Component or cover other group-masking profiles.
 
 An experimental Component now constructs mixed prefill and decode graphs
 through `model-component-graph@1.15.0`; an actual Wasmtime test checks the
-Mamba-2, non-RoPE attention and MoE nodes and separate convolution/SSM slots,
-and rejects a missing weight or unsupported position mode. The checked-in
+Mamba-2, non-RoPE attention, dense MLP and MoE nodes and separate
+convolution/SSM slots, and rejects a missing weight or unsupported position
+mode. The checked-in
 Component fixture is built from `Magnetar-component-Nemotron` commit
-`5b7370a6881a5f04c65deb4765e6852d749a54d1` and takes normalized f32 graph weights. This tests graph production,
-not whole-model numerical execution or checkpoint ingestion. Its explicit
+`5b7370a6881a5f04c65deb4765e6852d749a54d1` and takes normalized f32 graph
+weights. A synthetic mixed model built from pinned NVIDIA PyTorch primitives
+compares the real graph's full prefill and prefix plus four cached decode
+steps, including logits, convolution/SSM state and attention K/V. Releasing
+the session and opening another starts both types of state afresh. This is not
+checkpoint ingestion or full-checkpoint numerical qualification. Its explicit
 causal attention history is a deliberate profile choice and does not claim
 equivalence to the pinned NVIDIA block that fails to forward its cache.
 
