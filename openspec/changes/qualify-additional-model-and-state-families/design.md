@@ -159,10 +159,14 @@ biases, three MIMO projections and the skip weight. It returns the flattened
 the upstream rotary fraction, positive epsilon and decay floor, and an
 explicit zero-centered normalization flag. More general grouping, optional
 projection forms, post-gate normalization or auxiliary linear branches are
-not assumed. As with `mamba3-mimo`, explicit state tensors do not establish
-Runtime-managed session state. The Operator catalog validates both forms'
-geometry, all input and output state shapes, bounded intermediate sizes and
-the projected mixer's numerical attributes before a graph is planned.
+not assumed. A Runtime graph test binds the four state tensors to separate
+recurrent slots, commits the wrapped prefill angle, and verifies cached steps,
+discard/retry and reset against the pinned upstream fixture. This exercises
+state ownership and isolation between two sessions for one mixer, not a
+complete Olala Component. The Operator
+catalog validates both forms' geometry, all input and output state shapes,
+bounded intermediate sizes and the projected mixer's numerical attributes
+before a graph is planned.
 The Olala library now plans this f32 invocation for all 29 Mamba-3 layers
 of the pinned mini configuration. Its eleven checkpoint names, shapes and
 storage dtypes match the verified Safetensors header; matrix transposition and
@@ -400,8 +404,11 @@ explicit architecture, encoder profile and caller-provided weight inventory;
 it checks input and output descriptors, requires both token IDs and the mask
 to be connected to the hidden-state output, and releases temporary Component
 state even on failure. This dataflow check cannot prove the numerical meaning
-of a mask; independent reference comparisons are still necessary. It does not
-yet load an encoder checkpoint or run inference.
+of a mask; independent reference comparisons are still necessary. A resident
+encoder now loads trusted graph-facing weights and executes isolated,
+single-sequence requests, releasing temporary resources on success and
+failure. Checkpoint-specific source authentication and tensor conversion are
+the responsibility of the caller that constructs those graph-facing weights.
 
 ### Typed decision results
 
@@ -414,16 +421,20 @@ abstention threshold. Confidence, when supplied, is a statistic in `[0,1]`,
 not a calibration claim. Every present distribution must be nonempty, finite,
 nonnegative, at most one per entry, and sum to one within `1e-6`; an option
 prediction must be in range. Multiple questions can carry separate results
-with different option counts. This is a result contract, not a claim that
-the inference API can already load or execute a decision checkpoint.
+with different option counts. This contract is independent of any particular
+decision checkpoint or calibration claim.
 
 The standalone Laya f32 head can construct its parameters from decoded,
 named tensors after validating geometry, shapes and finite values. Its 35
 expected head tensors match the pinned checkpoint's F16 header. A separate
 opt-in test compares the real head weights, converted to f32, with the pinned
-PyTorch head using synthetic padded and variable-option encoder outputs. This
-does not decode the checkpoint in Runtime or qualify the real encoder, a BF16
-execution path, calibration, or an end-to-end decision request.
+PyTorch head using synthetic padded and variable-option encoder outputs. A
+separate CPU comparison executes the complete checkpoint's encoder and head
+against PyTorch. The pinned Laya decision path also authenticates the source
+checkpoint and configurations, loads its graph-facing encoder weights into
+the Runtime, and compares tokenized decisions and text requests using the real
+tokenizer with independent references. This is f32 execution and does not
+qualify native BF16 or GPU execution, nor establish statistical calibration.
 
 ### Identity, eligibility and recovery
 
@@ -446,11 +457,11 @@ attributes, so no WIT version is changed by this addition.
 
 Synthetic fixtures compare the real CPU graph's prefill, chunked continuation,
 single-token steps, grouped heads, mask handling, output and both explicit
-states with independently executed pinned Transformers functions. The
-component's opt-in real-weight f32 test covers one verified base-checkpoint
-mixer separately. Neither test enables model graphs or Runtime-managed
-recurrent sessions; those remain explicitly rejected until lifecycle and
-atomic commit requirements are implemented.
+states with independently executed pinned Transformers functions. The Qwen
+Component also builds hybrid attention/recurrent graphs with Runtime-managed
+state. An opt-in CPU test compares the merged Kev-0.8B backbone, pointer head
+and selected logits with independent PyTorch outputs. This does not qualify
+native BF16 arithmetic or a GPU Provider.
 
 ### Compatibility and WIT evolution
 

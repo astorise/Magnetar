@@ -1,4 +1,4 @@
-# Synthetic Laya encoder and decision reference
+# Laya encoder and decision references
 
 `laya-reference.json` compares a three-layer ModernBERT encoder connected to
 the two-layer Laya decision head. The generator executes the source-verified
@@ -42,9 +42,21 @@ the encoder Component graph, and executes it with explicit test weight bindings
 on the native CPU Provider. The graph's output feeds the Laya reference head.
 On the Windows test host, the two cases' maximum absolute errors were 1.15e-5
 for hidden states, 2.15e-6 for option logits, 0.00147 for action logits, and
-3.28e-7 for option probabilities. This verifies these unquantized f32
-computations on that Provider; it does not test the product loading/inference
-interface, tokenizer, statistical calibration, GPU execution or long windows.
+3.28e-7 for option probabilities.
+
+`resident_laya_checkpoint_decisions_match_pytorch` separately loads the same
+checkpoint through `LoadedLaya`, the authenticated Hugging Face payload source,
+the registered Component and the resident Runtime encoder. Its option and
+action scores and probabilities match those two PyTorch cases. It also runs
+choice, score and noul questions through the pinned real tokenizer and compares
+their results with independently prepared upstream token sequences. The text
+fixtures include accented characters and literal mask-token text.
+
+`laya-text-reference.json` is produced by the actual source-verified Laya
+sequence builder and the pinned tokenizer (SHA-256
+`6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30`).
+These tests qualify the exercised f32 CPU paths, not native BF16 or GPU
+execution, statistical calibration, arbitrary checkpoints or long windows.
 
 Regenerate and run (the external checkpoint and source files are not committed):
 
@@ -55,4 +67,16 @@ python integration-tests/production-loading/fixtures/generate_laya_real_checkpoi
 MAGNETAR_LAYA_REAL_CHECKPOINT=/path/to/model.safetensors cargo test --locked \
   --manifest-path integration-tests/production-loading/Cargo.toml \
   laya_real_checkpoint_component_and_head_match_pytorch -- --ignored --nocapture
+python integration-tests/production-loading/fixtures/generate_laya_text_reference.py \
+  /path/to/tokenizer.json /path/to/rl_common.py \
+  integration-tests/production-loading/fixtures/laya-text-reference.json
+MAGNETAR_LAYA_REAL_CHECKPOINT=/path/to/model.safetensors \
+MAGNETAR_LAYA_TOKENIZER=/path/to/tokenizer.json \
+cargo --config 'profile.dev.package.sha2.opt-level=3' \
+  --config 'profile.dev.package.magnetar-component-laya.opt-level=3' \
+  --config 'profile.dev.package.magnetar-component-modernbert.opt-level=3' \
+  --config 'profile.dev.package.magnetar-inference-component.opt-level=3' \
+  --config 'profile.dev.package.magnetar-provider-cpu.opt-level=3' \
+  test --locked --manifest-path integration-tests/production-loading/Cargo.toml \
+  resident_laya_checkpoint_decisions_match_pytorch -- --ignored --nocapture
 ```

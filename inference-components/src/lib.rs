@@ -27,6 +27,8 @@ use std::{
 
 #[cfg(feature = "kev")]
 pub mod kev;
+#[cfg(feature = "laya")]
+pub mod laya;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceComponentPlacement {

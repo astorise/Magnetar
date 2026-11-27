@@ -1017,6 +1017,8 @@ dependencies = [
  "anyhow",
  "ed25519-dalek",
  "magnetar-component-kev",
+ "magnetar-component-laya",
+ "magnetar-component-modernbert",
  "magnetar-format-safetensors",
  "magnetar-loader-gguf",
  "magnetar-loader-huggingface",

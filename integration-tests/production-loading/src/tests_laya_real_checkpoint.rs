@@ -55,6 +55,203 @@ fn close(actual: &[f32], expected: &[f32], label: &str) {
 
 #[test]
 #[ignore = "requires the pinned 843 MB Laya checkpoint and sufficient host memory"]
+fn resident_laya_checkpoint_decisions_match_pytorch() {
+    use magnetar_component_laya::{ChoiceOption, Question};
+    use magnetar_inference_component::laya::LoadedLaya;
+    use magnetar_loader_huggingface::HuggingFaceTokenizer;
+    use magnetar_runtime::ModelTrustStore;
+
+    let path = PathBuf::from(
+        std::env::var_os("MAGNETAR_LAYA_REAL_CHECKPOINT")
+            .expect("set MAGNETAR_LAYA_REAL_CHECKPOINT to the pinned model.safetensors"),
+    );
+    let encoder_config =
+        include_bytes!("../../../components/modernbert/tests/fixtures/laya-encoder.config.json");
+    let decision_config =
+        include_bytes!("../../../components/laya/tests/fixtures/rl_agent_config.json");
+    let profile =
+        CheckpointProfile::from_huggingface_config(encoder_config, CheckpointNamespace::Encoder)
+            .unwrap();
+    let (component, _) = super::tests_laya_reference::encoder_graph_request(&profile, 1);
+    let provider = Arc::new(NativeCpuProvider::with_executor(
+        NativeCpuExecutor::with_settings(true, false, 4),
+    ));
+    let mut model = LoadedLaya::load_pinned(
+        &path,
+        encoder_config,
+        decision_config,
+        component,
+        ModelTrustStore::default().trust_digest(
+            "sha256:891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c",
+        ),
+        provider,
+    )
+    .unwrap();
+    let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../fixtures/laya-real-checkpoint-reference.json"
+    ))
+    .unwrap();
+    for case in cases {
+        let ids: Vec<u32> = integers(&case, "ids")
+            .into_iter()
+            .map(|n| n as u32)
+            .collect();
+        let mask: Vec<bool> = integers(&case, "mask")
+            .into_iter()
+            .map(|n| n != 0)
+            .collect();
+        let markers = integers(&case, "markers");
+        let kind = match case["qtype"].as_u64().unwrap() {
+            0 => QuestionType::Choice,
+            1 => QuestionType::Score,
+            _ => panic!("unsupported reference question type"),
+        };
+        assert!(model.decide_tokenized(&ids, &mask, &[0], kind).is_err());
+        let actual = model.decide_tokenized(&ids, &mask, &markers, kind).unwrap();
+        close(
+            &actual
+                .options
+                .iter()
+                .map(|item| item.score as f32)
+                .collect::<Vec<_>>(),
+            &numbers(&case, "logits"),
+            "resident option logits",
+        );
+        close(
+            &actual
+                .options
+                .iter()
+                .map(|item| item.probability as f32)
+                .collect::<Vec<_>>(),
+            &numbers(&case, "probabilities"),
+            "resident option probabilities",
+        );
+        let actions = actual.actions.unwrap();
+        close(
+            &actions
+                .iter()
+                .map(|item| item.score as f32)
+                .collect::<Vec<_>>(),
+            &numbers(&case, "action_logits"),
+            "resident action logits",
+        );
+        close(
+            &actions
+                .iter()
+                .map(|item| item.probability as f32)
+                .collect::<Vec<_>>(),
+            &numbers(&case, "action_probabilities"),
+            "resident action probabilities",
+        );
+    }
+    let tokenizer_path = PathBuf::from(
+        std::env::var_os("MAGNETAR_LAYA_TOKENIZER")
+            .expect("set MAGNETAR_LAYA_TOKENIZER to the pinned tokenizer.json"),
+    );
+    let tokenizer = HuggingFaceTokenizer::from_bytes(
+        &std::fs::read(tokenizer_path).unwrap(),
+        None,
+        "laya-tokenizer",
+        Some(50_368),
+    )
+    .unwrap();
+    let text_cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/laya-text-reference.json")).unwrap();
+    for case in text_cases {
+        let question = &case["question"];
+        let instructions = question["ins"].as_str().unwrap();
+        let state = case["state"].as_str().unwrap();
+        let (actual, kind) = match question["t"].as_str().unwrap() {
+            "choice" => {
+                let choices: Vec<_> = case["option_order"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|label| {
+                        let label = label.as_str().unwrap();
+                        ChoiceOption {
+                            label,
+                            description: question["crit"][label].as_str(),
+                        }
+                    })
+                    .collect();
+                (
+                    model
+                        .decide_text(
+                            &tokenizer,
+                            state,
+                            &Question::Choice {
+                                instructions,
+                                options: &choices,
+                            },
+                        )
+                        .unwrap(),
+                    QuestionType::Choice,
+                )
+            }
+            "score" => {
+                let levels: Vec<_> = question["crit"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect();
+                (
+                    model
+                        .decide_text(
+                            &tokenizer,
+                            state,
+                            &Question::Score {
+                                instructions,
+                                levels: &levels,
+                            },
+                        )
+                        .unwrap(),
+                    QuestionType::Score,
+                )
+            }
+            "noul" => (
+                model
+                    .decide_text(
+                        &tokenizer,
+                        state,
+                        &Question::Noul {
+                            instructions,
+                            when_false: question["crit"]["false"].as_str(),
+                            when_true: question["crit"]["true"].as_str(),
+                        },
+                    )
+                    .unwrap(),
+                QuestionType::Noul,
+            ),
+            _ => panic!("unknown reference question type"),
+        };
+        let ids: Vec<u32> = integers(&case, "ids")
+            .into_iter()
+            .map(|n| n as u32)
+            .collect();
+        let expected = model
+            .decide_tokenized(
+                &ids,
+                &vec![true; ids.len()],
+                &integers(&case, "markers"),
+                kind,
+            )
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "text input differs from upstream tokenization"
+        );
+        eprintln!(
+            "validated Laya text question: {}",
+            question["t"].as_str().unwrap()
+        );
+    }
+    model.unload().unwrap();
+}
+
+#[test]
+#[ignore = "requires the pinned 843 MB Laya checkpoint and sufficient host memory"]
 fn laya_real_checkpoint_component_and_head_match_pytorch() {
     let path = PathBuf::from(
         std::env::var_os("MAGNETAR_LAYA_REAL_CHECKPOINT")
