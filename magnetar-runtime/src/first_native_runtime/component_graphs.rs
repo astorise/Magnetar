@@ -1359,3 +1359,10 @@ fn require_declared_features_read(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+mod nemotron_tests;
