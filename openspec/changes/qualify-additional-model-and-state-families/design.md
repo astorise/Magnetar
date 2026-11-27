@@ -204,8 +204,9 @@ shapes; `past_length` explicitly states the number of valid rows. Positions
 must be contiguous from that length. A document reset is a new call with zero
 past and position zero, which suppresses any supplied prior raw state. Packed
 multi-document attention, RoPE, value embeddings, XSA and biased/CosNet
-projections are outside this profile and must not silently use it. These
-explicit tensors do not implement Runtime-managed recurrent or KV lifecycle.
+projections are outside this profile and must not silently use it. The graph
+executor can bind raw previous K/V to Runtime-managed recurrent slots; the
+current Olala test still supplies the separate attention history explicitly.
 The Olala profile can reorder decoded f32 weights into this operator's
 layout. An opt-in integration test decodes the pinned checkpoint's first
 differential-attention layer and compares its f32 projections and explicit
@@ -222,8 +223,9 @@ validation requires one consumed input and one produced output per identity,
 with matching descriptor, layer, slot and compatibility key. State edges cannot
 alias or be KV/prefix edges. Fingerprints include state metadata and fusion
 cannot remove a state edge. A real Wasmtime Component tests both graph phases;
-older Components continue linking through their original versions. Planning and
-execution explicitly reject these graphs while lifecycle support is absent.
+older Components continue linking through their original versions. The current
+first-native executor can stage and commit declared recurrent resources; this
+does not by itself qualify an Olala or Nemotron model Component.
 Before a decoder graph pair is returned, the Runtime also checks that prefill
 and decode declare the same state identities, layers, slots, compatibility
 keys and tensor descriptors; mismatched phases, schemas or out-of-range layers
@@ -252,8 +254,8 @@ second prefill cannot overwrite an existing committed generation. A rejected
 history leaves both the prior cache and any pending step intact. Token IDs are
 not printed by the state diagnostic representation.
 
-For the future execution path, initial state is zero; continuing calls read
-the last committed generation. State slots are keyed by session, model and
+For this execution path, initial state is zero; continuing calls read
+pending state within an attempt or the last committed generation. State slots are keyed by session, model and
 component compatibility, layer, slot and dtype/shape, and never contain
 Provider handles in WIT. Outputs remain pending until the token/segment and
 all matching KV changes commit together. Failed dispatch, sampling,
@@ -262,9 +264,8 @@ must leave the prior committed generation unchanged. State reset and document
 boundaries clear only the relevant sequence, while close/expiry releases all
 its leases after in-flight work completes. Multi-output graph production,
 old/new component linking, cross-segment isolation and completion-safe
-retirement need explicit tests before this experimental profile can run. The
-standalone Mamba-2 reference is evidence for numeric equations, not an
-implementation of this Runtime contract.
+retirement need explicit tests for each claimed profile. The standalone Mamba-2
+reference is evidence for numeric equations, not a complete model Component.
 
 Stateful scans naturally return their activation and several new state tensors
 from the same computation. The additive `graph-builder@1.11.0` also exposes
@@ -272,8 +273,8 @@ from the same computation. The additive `graph-builder@1.11.0` also exposes
 plus a list of 1-16 output shapes and a returned edge for each output.
 Each output remains independently validated and may subsequently be bound to
 a recurrent slot; this form does not attach KV metadata. The old single-output
-`add-node` stays unchanged. Multi-output description alone does not enable
-recurrent execution or relax the unsupported behavior above.
+`add-node` stays unchanged. Multi-output description alone does not establish
+the state lifecycle or model-specific numerical behavior.
 
 The initial experimental `mamba2-mixer@1` CPU operator is a pure function of
 one sequence and two explicit f32 state tensors. Inputs are `[T,H]` hidden
@@ -291,9 +292,11 @@ nonnegative. The three ordered outputs are `[T,H]` mixer output and
 same-shaped next convolution and SSM states. The CPU form follows the pinned
 Nemotron-H SiLU convolution, selective update and grouped gated RMS norm;
 Mamba-3 is a different operator. Invalid shapes, values, unsupported bias
-forms or missing Kernel support fail closed. Explicit state inputs/outputs are
-not Runtime-managed session state; graph-level recurrent execution stays
-disabled until the transactional lifecycle is implemented and tested.
+forms or missing Kernel support fail closed. A Runtime graph test binds the
+convolution and SSM inputs and outputs to separate recurrent slots and compares
+chunked prefill, cached steps, discarded attempts, failure, independent sessions
+and reset against the pinned upstream synthetic fixture. A complete mixed
+Nemotron Component, its attention history and checkpoint loading remain open.
 The Operator catalog validates state, weight and output shapes, bias-dependent
 arity and numerical attributes before a graph can be accepted for planning.
 
