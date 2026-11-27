@@ -215,6 +215,38 @@ pub(super) fn release_recurrent_state(
     }
 }
 
+/// Release an isolated observation's recurrent values, reporting a Provider
+/// failure while still attempting to release every other value.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub(super) fn release_observed_recurrent_state(
+    runtime: &mut Runtime,
+    executor: &Arc<dyn ProviderExecutionApi>,
+    cache: &KvCacheId,
+) -> Result<(), InferenceApiError> {
+    let kv_cache = runtime.kv_caches_mut().cache_mut(cache)?;
+    let pending = std::mem::take(&mut kv_cache.pending_recurrent_resources);
+    let committed = std::mem::take(&mut kv_cache.recurrent_resources);
+    let mut failure = None;
+    for binding in pending.values().chain(committed.values()) {
+        match executor.release_admitted_tensor(runtime.memory_mut(), &binding.resource) {
+            Ok(_) if runtime.memory().is_live_allocation(binding.allocation) => {
+                if let Err(error) = runtime.memory_mut().release(binding.allocation) {
+                    failure.get_or_insert_with(|| InferenceApiError::ProviderTensorReleaseFailed {
+                        reason: format!("could not release recurrent allocation: {error}"),
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failure.get_or_insert_with(|| InferenceApiError::ProviderTensorReleaseFailed {
+                    reason: format!("could not release recurrent state: {error}"),
+                });
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 fn release_recurrent_resource(
     runtime: &mut Runtime,
     executor: &Arc<dyn ProviderExecutionApi>,

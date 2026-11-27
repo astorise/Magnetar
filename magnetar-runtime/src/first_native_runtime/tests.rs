@@ -1875,6 +1875,7 @@ pub(super) fn execute_qwen_prefill_hidden_states_through_dispatch(
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
         resource_namespace: None,
+        private_input_resources: None,
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -2152,6 +2153,7 @@ pub(super) fn execute_qwen_decode_hidden_states_through_dispatch(
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
         resource_namespace: None,
+        private_input_resources: None,
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -5459,6 +5461,7 @@ pub(super) fn check_graph_dispatch_ignores_kernel_registry_preference_change_aft
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
         resource_namespace: None,
+        private_input_resources: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: Some(&mut plan),

@@ -411,6 +411,7 @@ pub(super) fn check_operator_coverage(
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
         resource_namespace: None,
+        private_input_resources: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,

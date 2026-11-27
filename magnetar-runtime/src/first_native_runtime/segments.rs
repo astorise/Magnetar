@@ -138,6 +138,73 @@ pub fn run_first_native_graph_with_provider(
     )
 }
 
+/// Run a graph against the conformance fixture with explicitly supplied input
+/// edge values, including any test weights, and return selected output edges.
+///
+/// This is a conformance helper, not a trusted model-loading path: input
+/// bindings may supply weight edges directly and are not authenticated by the
+/// fixture's model artifact. The graph's `input.token_ids` determines the
+/// sequence length used for planning and must be a nonempty rank-one tensor.
+pub fn run_first_native_graph_with_provider_and_bindings(
+    provider: Arc<dyn Provider>,
+    fixture: &E2eFixture,
+    graph: &ExecutionGraph,
+    kv_cache_id: &KvCacheId,
+    bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    output_edges: &[&str],
+) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
+    let tokens = bindings
+        .get(&TensorEdgeId::new("input.token_ids"))
+        .and_then(|tensor| match tensor.shape.as_slice() {
+            [tokens] if *tokens > 0 => Some(*tokens),
+            _ => None,
+        })
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "conformance graph requires nonempty rank-one input.token_ids".into(),
+        })?;
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
+    let (instance, _) =
+        load_fixture_instance_for_provider(fixture, &mut runtime, &provider_binding)?;
+    let revision = require_ready_first_native_instance(&runtime, &instance)?
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        graph,
+        &instance,
+        revision,
+        tokens,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider_binding,
+    )?;
+    let (dispatch, bindings, layer_kv, resolved_provider) =
+        execute_first_native_graph_materializing(
+            &mut runtime,
+            fixture,
+            &instance,
+            kv_cache_id,
+            graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::Only(output_edges),
+            None,
+            None,
+        )
+        .map_err(E2eConformanceError::from)?;
+    Ok(FirstNativeProviderRunOutcome {
+        runtime,
+        instance,
+        dispatch,
+        bindings,
+        resolved_provider,
+        layer_kv,
+    })
+}
+
 /// [`run_first_native_graph_with_provider`], generalized to materialize
 /// caller-supplied `weights` (through
 /// `load_fixture_instance_with_weights_for_provider`) instead of the one
@@ -426,6 +493,7 @@ pub fn run_first_native_graph_segment_dispatch(
             None,
             None,
             false,
+            None,
         )
         .map_err(E2eConformanceError::from)?;
     Ok(FirstNativeProviderRunOutcome {

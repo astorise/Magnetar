@@ -303,6 +303,193 @@ fn projected_differential_attention_matches_pinned_upstream_layer() {
     compare(&reset, &c.full, &c);
 }
 
+/// Olala's raw previous K/V are fixed-size recurrent state, distinct from
+/// the growing attention K/V history. Exercise both through the actual graph
+/// executor and the Runtime's pending/committed state lifecycle.
+#[test]
+fn projected_attention_keeps_raw_state_separate_from_kv_history() {
+    let c = reference();
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let executor = resolve_kernel_execution_provider(&runtime, &provider).unwrap();
+    let new_cache = |runtime: &mut Runtime, name: &str| {
+        runtime
+            .create_kv_cache(KvCache::new(
+                KvCacheId::new(name).unwrap(),
+                KvCacheScope::Session,
+                KvCacheCompatibility::new(
+                    GenerationModelReference::ModelInstance(instance.clone()),
+                    TokenizerId::new("tokenizer").unwrap(),
+                ),
+                KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float32),
+            ))
+            .unwrap()
+    };
+    let cache = new_cache(&mut runtime, "projected-attention-session");
+    let other_cache = new_cache(&mut runtime, "projected-attention-other-session");
+    let step = |runtime: &mut Runtime,
+                cache: &KvCacheId,
+                case: &Case,
+                previous: Option<&[HostTensor; 4]>| {
+        let tensors = inputs(&c, case.start, case.end, previous);
+        let (mut graph, mut bindings) = make_graph(&c, case, &tensors);
+        for (slot, input, output) in [
+            ("raw_key", "input.1", "output.raw-key"),
+            ("raw_value", "input.2", "output.raw-value"),
+        ] {
+            for (edge, behavior) in [
+                (input, GraphRecurrentStateBehavior::Input),
+                (output, GraphRecurrentStateBehavior::Output),
+            ] {
+                graph
+                    .edges
+                    .get_mut(&TensorEdgeId::new(edge))
+                    .unwrap()
+                    .recurrent_state = Some(GraphRecurrentStateMetadata {
+                    resource_id: format!("projected.layer0.{slot}"),
+                    layer: 0,
+                    slot: slot.into(),
+                    behavior,
+                    compatibility_key: "olala-projected-v1".into(),
+                });
+            }
+            // Only the raw state is Runtime-owned. The two variable-length
+            // attention-history inputs remain distinct caller bindings.
+            bindings.remove(&TensorEdgeId::new(input));
+        }
+        graph.validate(&initial_operator_catalog()).unwrap();
+        let mut plan = prepare_first_native_plan_for_graph(
+            runtime,
+            &graph,
+            &instance,
+            revision,
+            (case.end - case.start) as u64,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        let (_, outputs, _, _) = execute_first_native_graph_materializing(
+            runtime,
+            &fixture,
+            &instance,
+            cache,
+            &graph,
+            &mut plan,
+            bindings,
+            None,
+            Some(0),
+            &mut Vec::new(),
+            MaterializedEdges::All,
+            None,
+            None,
+        )
+        .unwrap();
+        [
+            "output.attention",
+            "output.raw-key",
+            "output.raw-value",
+            "output.keys",
+            "output.values",
+        ]
+        .map(|name| outputs[&TensorEdgeId::new(name)].clone())
+    };
+    let history = |output: &[HostTensor; 5]| {
+        [
+            output[1].clone(),
+            output[2].clone(),
+            output[3].clone(),
+            output[4].clone(),
+        ]
+    };
+    let commit = |runtime: &mut Runtime, cache: &KvCacheId| {
+        KvUpdateTransaction {
+            provider_binding: provider.clone(),
+            executor: executor.clone(),
+            promoted: Vec::new(),
+        }
+        .commit(runtime, cache)
+        .unwrap();
+    };
+
+    // Prefill two chunks in one attempt, then commit the fixed raw state.
+    let first = step(&mut runtime, &cache, &c.chunks[0], None);
+    compare(&first, &c.chunks[0], &c);
+    let second = step(&mut runtime, &cache, &c.chunks[1], Some(&history(&first)));
+    compare(&second, &c.chunks[1], &c);
+    commit(&mut runtime, &cache);
+    assert_eq!(
+        runtime.kv_cache(&cache).unwrap().recurrent_resources.len(),
+        2
+    );
+
+    // A separate session starts from zero even while this cache has state.
+    let isolated = step(&mut runtime, &other_cache, &c.chunks[0], None);
+    compare(&isolated, &c.chunks[0], &c);
+
+    // A one-token decode uses the committed raw state and the prior KV
+    // history. A failed attempt must leave both reusable for the retry.
+    let decoded = step(&mut runtime, &cache, &c.chunks[2], Some(&history(&second)));
+    compare(&decoded, &c.chunks[2], &c);
+    super::super::recurrent_state::discard_recurrent_state(&mut runtime, &executor, &cache);
+    let retry = step(&mut runtime, &cache, &c.chunks[2], Some(&history(&second)));
+    compare(&retry, &c.chunks[2], &c);
+    commit(&mut runtime, &cache);
+    let last = step(&mut runtime, &cache, &c.chunks[3], Some(&history(&retry)));
+    compare(&last, &c.chunks[3], &c);
+
+    // Reset the document: neither raw state nor previous KV may carry over.
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+    let reset = step(&mut runtime, &cache, &c.full, None);
+    compare(&reset, &c.full, &c);
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+
+    // Continue token by token after another reset. Compare each token to the
+    // upstream full-sequence result and the final raw and KV states to its
+    // independently computed final states.
+    let mut previous = None;
+    let output_width = c.signal_heads * c.head_dim;
+    for index in 0..c.full.end {
+        let token = Case {
+            start: index,
+            end: index + 1,
+            output: Vec::new(),
+            raw_key: Vec::new(),
+            raw_value: Vec::new(),
+            keys: Vec::new(),
+            values: Vec::new(),
+        };
+        let output = step(&mut runtime, &cache, &token, previous.as_ref());
+        close(
+            &output[0].data,
+            &c.full.output[index * output_width..(index + 1) * output_width],
+            "cached token output",
+        );
+        commit(&mut runtime, &cache);
+        previous = Some(history(&output));
+    }
+    let final_state = previous.unwrap();
+    for (tensor, expected, label) in final_state
+        .iter()
+        .zip([
+            (&c.full.raw_key, "final raw key"),
+            (&c.full.raw_value, "final raw value"),
+            (&c.full.keys, "final keys"),
+            (&c.full.values, "final values"),
+        ])
+        .map(|(tensor, (expected, label))| (tensor, expected, label))
+    {
+        close(&tensor.data, expected, label);
+    }
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &other_cache);
+}
+
 #[test]
 fn projected_differential_attention_rejects_bad_state_and_positions() {
     let c = reference();

@@ -310,6 +310,190 @@ fn mamba2_graph_matches_nvidia_prefill_and_explicit_state_decode() {
 }
 
 #[test]
+fn mamba2_runtime_state_survives_chunks_retry_and_session_reset() {
+    let reference: Reference = serde_json::from_str(include_str!(
+        "../../../fixtures/nemotron-layer-reference.json"
+    ))
+    .unwrap();
+    let c = &reference.config;
+    let inner = c.heads * c.head_dim;
+    let conv = inner + 2 * c.groups * c.state_dim;
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let executor = resolve_kernel_execution_provider(&runtime, &provider).unwrap();
+    let new_cache = |runtime: &mut Runtime, name: &str| {
+        runtime
+            .create_kv_cache(KvCache::new(
+                KvCacheId::new(name).unwrap(),
+                KvCacheScope::Session,
+                KvCacheCompatibility::new(
+                    GenerationModelReference::ModelInstance(instance.clone()),
+                    TokenizerId::new("tokenizer").unwrap(),
+                ),
+                KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float32),
+            ))
+            .unwrap()
+    };
+    let cache = new_cache(&mut runtime, "mamba2-session");
+    let other_cache = new_cache(&mut runtime, "mamba2-other-session");
+    let step =
+        |runtime: &mut Runtime, cache: &KvCacheId, start: usize, count: usize, fail: bool| {
+            let mut tensors = inputs(
+                &reference,
+                start,
+                count,
+                vec![0.0; conv * c.kernel],
+                vec![0.0; inner * c.state_dim],
+            );
+            if fail {
+                tensors[0].data[0] = f32::NAN;
+            }
+            let (mut graph, mut bindings) = make_graph(&reference, &tensors);
+            for (slot, input, output) in [
+                ("conv", "input.1", "output.conv"),
+                ("ssm", "input.2", "output.ssm"),
+            ] {
+                for (edge, behavior) in [
+                    (input, GraphRecurrentStateBehavior::Input),
+                    (output, GraphRecurrentStateBehavior::Output),
+                ] {
+                    graph
+                        .edges
+                        .get_mut(&TensorEdgeId::new(edge))
+                        .unwrap()
+                        .recurrent_state = Some(GraphRecurrentStateMetadata {
+                        resource_id: format!("mamba2.layer0.{slot}"),
+                        layer: 0,
+                        slot: slot.into(),
+                        behavior,
+                        compatibility_key: "nemotron-mamba2-v1".into(),
+                    });
+                }
+                bindings.remove(&TensorEdgeId::new(input));
+            }
+            graph.validate(&initial_operator_catalog()).unwrap();
+            let mut plan = prepare_first_native_plan_for_graph(
+                runtime,
+                &graph,
+                &instance,
+                revision,
+                count as u64,
+                PreparedExecutionPlanGeneration::new(1),
+                &provider,
+            )
+            .unwrap();
+            execute_first_native_graph_materializing(
+                runtime,
+                &fixture,
+                &instance,
+                cache,
+                &graph,
+                &mut plan,
+                bindings,
+                None,
+                Some(0),
+                &mut Vec::new(),
+                MaterializedEdges::All,
+                None,
+                None,
+            )
+            .map(|(_, outputs, _, _)| {
+                ["output.activation", "output.conv", "output.ssm"]
+                    .map(|name| outputs[&TensorEdgeId::new(name)].clone())
+            })
+        };
+    let commit = |runtime: &mut Runtime, cache: &KvCacheId| {
+        KvUpdateTransaction {
+            provider_binding: provider.clone(),
+            executor: executor.clone(),
+            promoted: Vec::new(),
+        }
+        .commit(runtime, cache)
+        .unwrap();
+    };
+
+    let first = step(&mut runtime, &cache, 0, 2, false).unwrap();
+    let second = step(&mut runtime, &cache, 2, 2, false).unwrap();
+    let prefix = [first[0].data.as_slice(), second[0].data.as_slice()].concat();
+    close(&prefix, &reference.prefix_output, "runtime chunked prefill");
+    close(
+        &second[1].data,
+        &reference.prefix_conv_state,
+        "runtime conv state",
+    );
+    close(
+        &second[2].data,
+        &reference.prefix_ssm_state,
+        "runtime SSM state",
+    );
+    commit(&mut runtime, &cache);
+    assert_eq!(
+        runtime.kv_cache(&cache).unwrap().recurrent_resources.len(),
+        2
+    );
+    let isolated = step(&mut runtime, &other_cache, 0, 2, false).unwrap();
+    close(&isolated[0].data, &first[0].data, "isolated session");
+
+    let decoded = step(&mut runtime, &cache, 4, 1, false).unwrap();
+    close(
+        &decoded[0].data,
+        &reference.steps[0].output,
+        "runtime decode",
+    );
+    super::super::recurrent_state::discard_recurrent_state(&mut runtime, &executor, &cache);
+    let retry = step(&mut runtime, &cache, 4, 1, false).unwrap();
+    close(&retry[0].data, &reference.steps[0].output, "retry output");
+    close(
+        &retry[1].data,
+        &reference.steps[0].conv_state,
+        "retry conv state",
+    );
+    close(
+        &retry[2].data,
+        &reference.steps[0].ssm_state,
+        "retry SSM state",
+    );
+    commit(&mut runtime, &cache);
+    assert!(step(&mut runtime, &cache, 5, 1, true).is_err());
+    for (index, expected) in reference.steps.iter().enumerate().skip(1) {
+        let output = step(&mut runtime, &cache, 4 + index, 1, false).unwrap();
+        close(&output[0].data, &expected.output, "runtime cached output");
+        close(
+            &output[1].data,
+            &expected.conv_state,
+            "runtime cached conv state",
+        );
+        close(
+            &output[2].data,
+            &expected.ssm_state,
+            "runtime cached SSM state",
+        );
+        commit(&mut runtime, &cache);
+    }
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+    let reset = step(&mut runtime, &cache, 0, 4, false).unwrap();
+    close(&reset[0].data, &reference.prefix_output, "reset output");
+    close(
+        &reset[1].data,
+        &reference.prefix_conv_state,
+        "reset conv state",
+    );
+    close(
+        &reset[2].data,
+        &reference.prefix_ssm_state,
+        "reset SSM state",
+    );
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &other_cache);
+}
+
+#[test]
 fn mamba2_rejects_malformed_inputs_without_mutating_state() {
     let reference: Reference = serde_json::from_str(include_str!(
         "../../../fixtures/nemotron-layer-reference.json"

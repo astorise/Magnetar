@@ -701,6 +701,7 @@ impl E2eRuntimeModelExecutionEngine {
             kv_stores,
             step.resource_namespace,
             false,
+            None,
         );
         let end_clock = runtime.phase_ledger().clock();
         let captured = match executed {

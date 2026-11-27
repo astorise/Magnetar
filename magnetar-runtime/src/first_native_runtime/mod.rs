@@ -86,8 +86,12 @@ mod kv_pool;
 mod kv_state;
 mod prefill_buckets;
 mod prefill_chunks;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+mod prefill_observation;
 mod prepared_plans;
 mod production;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+mod production_encoder;
 mod recurrent_state;
 mod row_gather;
 mod segments;
@@ -107,6 +111,8 @@ use kv_state::*;
 use magnetar_provider_api::KvStorePrecision;
 pub use prepared_plans::*;
 pub use production::*;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub use production_encoder::*;
 pub use segments::*;
 pub use weights::*;
 

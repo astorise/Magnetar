@@ -1,15 +1,26 @@
 //! Synthetic ModernBERT -> Laya-head comparison with pinned PyTorch classes.
-//! This test does not use checkpoint weights or the Magnetar runtime graph.
+//! The numerical tests read synthetic Safetensors, not published checkpoint
+//! weights. They compare both a reference encoder and the Component graph
+//! executor, followed by the reference decision head, to the upstream oracle.
 
 use magnetar_component_laya::{
     Answer, Calibrator, QuestionType,
-    head::{DecisionHead, LayerNorm as HeadNorm, Linear as HeadLinear, TransformerLayer},
+    head::{CheckpointTensor, DecisionHead, checkpoint_tensor_shapes},
 };
 use magnetar_component_modernbert::{
-    AttentionKind,
-    encoder_reference::{Encoder, EncoderLayer, LayerNorm as EncoderNorm, Linear as EncoderLinear},
+    checkpoint::{
+        CheckpointNamespace, CheckpointProfile, DecodedTensor, StorageDType, TensorDescriptor,
+    },
+    encoder_reference::Encoder,
 };
-use magnetar_runtime::{DecisionPrediction, DecisionResult, DecisionScore};
+use magnetar_format_safetensors::{TensorToSerialize, serialize};
+use magnetar_loader_huggingface::discover_raw_safetensors;
+use magnetar_runtime::{
+    DecisionPrediction, DecisionResult, DecisionScore, HostTensor, ModelArtifactSource, ModelDType,
+    ModelDigest, ProductionArtifactPayloadSource, ProductionModelSource, ProductionPayloadRange,
+    host_tensors_from_artifact_bytes,
+};
+use std::collections::BTreeMap;
 
 fn pattern(name: &str, count: usize) -> Vec<f32> {
     let seed = name
@@ -30,104 +41,329 @@ fn pattern(name: &str, count: usize) -> Vec<f32> {
         .collect()
 }
 
-fn encoder_linear(name: &str, input: usize, output: usize) -> EncoderLinear {
-    EncoderLinear {
-        weight: pattern(&format!("{name}.weight"), input * output),
-        bias: None,
-    }
-}
-
-fn encoder_norm(name: &str, hidden: usize) -> EncoderNorm {
-    EncoderNorm {
-        weight: pattern(&format!("{name}.weight"), hidden),
-        bias: None,
-    }
-}
-
-fn encoder() -> Encoder {
-    let hidden = 8;
-    let intermediate = 12;
-    let prefix = "encoder.encoder";
-    let layers = (0..3)
-        .map(|index| {
-            let prefix = format!("{prefix}.layers.{index}");
-            let local = index == 1;
-            EncoderLayer {
-                attention: if local {
-                    AttentionKind::Local
-                } else {
-                    AttentionKind::Global
-                },
-                rope_theta: if local { 10_000.0 } else { 160_000.0 },
-                attention_norm: (index != 0)
-                    .then(|| encoder_norm(&format!("{prefix}.attn_norm"), hidden)),
-                qkv: encoder_linear(&format!("{prefix}.attn.Wqkv"), hidden, 3 * hidden),
-                attention_output: encoder_linear(&format!("{prefix}.attn.Wo"), hidden, hidden),
-                mlp_norm: encoder_norm(&format!("{prefix}.mlp_norm"), hidden),
-                mlp_in: encoder_linear(&format!("{prefix}.mlp.Wi"), hidden, 2 * intermediate),
-                mlp_out: encoder_linear(&format!("{prefix}.mlp.Wo"), intermediate, hidden),
-            }
+fn models_from_synthetic_safetensors() -> (
+    Encoder,
+    DecisionHead,
+    CheckpointProfile,
+    BTreeMap<String, HostTensor>,
+) {
+    let config = serde_json::json!({
+        "model_type": "modernbert", "hidden_size": 8, "intermediate_size": 12,
+        "vocab_size": 24, "num_attention_heads": 2, "num_hidden_layers": 3,
+        "max_position_embeddings": 64, "norm_eps": 1e-5,
+        "norm_bias": false, "attention_bias": false, "mlp_bias": false,
+        "hidden_activation": "gelu", "local_attention": 4,
+        "layer_types": ["full_attention", "sliding_attention", "full_attention"]
+    });
+    let profile = CheckpointProfile::from_huggingface_config(
+        &serde_json::to_vec(&config).unwrap(),
+        CheckpointNamespace::Encoder,
+    )
+    .unwrap();
+    // The Python oracle's wrapper adds another `encoder.` level to parameter
+    // names when generating its synthetic values; it is not part of the
+    // actual Laya checkpoint namespace.
+    let mut weights: Vec<_> = profile
+        .weights()
+        .iter()
+        .map(|spec| {
+            let values = pattern(
+                &format!("encoder.{}", spec.checkpoint_name),
+                spec.checkpoint_shape.iter().product(),
+            );
+            (
+                spec.checkpoint_name.clone(),
+                spec.checkpoint_shape.clone(),
+                values,
+            )
         })
         .collect();
-    Encoder {
-        vocab_size: 24,
-        hidden,
-        intermediate,
-        heads: 2,
-        max_positions: 64,
-        local_radius: 2,
-        epsilon: 1e-5,
-        token_embedding: pattern(
-            &format!("{prefix}.embeddings.tok_embeddings.weight"),
-            24 * hidden,
-        ),
-        embedding_norm: encoder_norm(&format!("{prefix}.embeddings.norm"), hidden),
-        layers,
-        final_norm: encoder_norm(&format!("{prefix}.final_norm"), hidden),
-    }
-}
-
-fn head_linear(name: &str, input: usize, output: usize) -> HeadLinear {
-    HeadLinear {
-        weight: pattern(&format!("{name}.weight"), input * output),
-        bias: pattern(&format!("{name}.bias"), output),
-    }
-}
-
-fn head_norm(name: &str, hidden: usize) -> HeadNorm {
-    HeadNorm {
-        weight: pattern(&format!("{name}.weight"), hidden),
-        bias: pattern(&format!("{name}.bias"), hidden),
-    }
-}
-
-fn head() -> DecisionHead {
-    let d = 8;
-    let layers = (0..2)
-        .map(|index| {
-            let prefix = format!("head.layers.{index}");
-            TransformerLayer {
-                norm1: head_norm(&format!("{prefix}.norm1"), d),
-                norm2: head_norm(&format!("{prefix}.norm2"), d),
-                qkv: HeadLinear {
-                    weight: pattern(&format!("{prefix}.self_attn.in_proj_weight"), 3 * d * d),
-                    bias: pattern(&format!("{prefix}.self_attn.in_proj_bias"), 3 * d),
-                },
-                attention_output: head_linear(&format!("{prefix}.self_attn.out_proj"), d, d),
-                feed_forward_in: head_linear(&format!("{prefix}.linear1"), d, 4 * d),
-                feed_forward_out: head_linear(&format!("{prefix}.linear2"), 4 * d, d),
-            }
+    weights.extend(
+        checkpoint_tensor_shapes(8, 2, 2)
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| {
+                let values = pattern(&name, shape.iter().product());
+                (name, shape, values)
+            }),
+    );
+    let bytes: Vec<Vec<u8>> = weights
+        .iter()
+        .map(|(_, _, values)| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
         })
         .collect();
-    DecisionHead {
-        hidden: d,
-        type_embedding: pattern("type_emb.weight", 3 * d),
-        layers,
-        scorer_norm: head_norm("scorer.0", d),
-        scorer_in: head_linear("scorer.1", d, d),
-        scorer_out: head_linear("scorer.3", d, 1),
-        action_in: head_linear("act_head.0", d + 4, 256),
-        action_out: head_linear("act_head.2", 256, 2),
+    let descriptors: Vec<_> = weights
+        .iter()
+        .zip(&bytes)
+        .map(|((name, shape, _), bytes)| TensorToSerialize {
+            name,
+            dtype: ModelDType::F32,
+            shape: shape.iter().map(|&size| size as u64).collect(),
+            data: bytes,
+        })
+        .collect();
+    let file = serialize(&descriptors, &BTreeMap::new()).unwrap();
+    let expected_digest = ModelDigest::sha256(&file);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("model.safetensors"), file).unwrap();
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(directory.path().to_path_buf()),
+        directory.path().to_path_buf(),
+    );
+    let raw = discover_raw_safetensors(&source).unwrap();
+    assert_eq!(raw.single_file_digest.as_ref(), Some(&expected_digest));
+    let inventory = raw
+        .tensors
+        .iter()
+        .map(|tensor| {
+            (
+                tensor.name.clone(),
+                TensorDescriptor {
+                    shape: tensor.shape.iter().map(|&size| size as usize).collect(),
+                    dtype: match tensor.storage_dtype {
+                        ModelDType::F16 => StorageDType::F16,
+                        ModelDType::Bf16 => StorageDType::BF16,
+                        ModelDType::F32 => StorageDType::F32,
+                        _ => StorageDType::Unsupported,
+                    },
+                },
+            )
+        })
+        .collect();
+    profile.validate_inventory(&inventory).unwrap();
+    let mut encoder_tensors = BTreeMap::new();
+    let mut head_tensors = BTreeMap::new();
+    for metadata in raw.tensors {
+        let range = ProductionPayloadRange {
+            identity: metadata.name.clone(),
+            offset: metadata.offset_bytes.unwrap(),
+            length: metadata.size_bytes.unwrap(),
+            digest: metadata.digest.clone(),
+        };
+        let bytes = raw.payloads.read_payload(&range).unwrap();
+        let mut bounded = metadata.clone();
+        bounded.offset_bytes = Some(0);
+        bounded.shard = None;
+        let tensor = host_tensors_from_artifact_bytes(&[bounded], &bytes, 0)
+            .unwrap()
+            .remove(&metadata.name)
+            .unwrap();
+        let shape = tensor.shape.iter().map(|&size| size as usize).collect();
+        if metadata.name.starts_with("encoder.") {
+            encoder_tensors.insert(
+                metadata.name,
+                DecodedTensor {
+                    shape,
+                    values: tensor.data,
+                },
+            );
+        } else {
+            head_tensors.insert(
+                metadata.name,
+                CheckpointTensor {
+                    shape,
+                    values: tensor.data,
+                },
+            );
+        }
+    }
+    let graph_weights = profile
+        .weights()
+        .iter()
+        .map(|spec| {
+            let values = spec
+                .graph_values(&encoder_tensors[&spec.checkpoint_name])
+                .unwrap();
+            let shape = spec
+                .graph_shape
+                .iter()
+                .map(|&size| size as u64)
+                .collect::<Vec<_>>();
+            (
+                spec.graph_name.clone(),
+                HostTensor::new(shape, values).unwrap(),
+            )
+        })
+        .collect();
+    (
+        profile.clone().into_reference(encoder_tensors).unwrap(),
+        DecisionHead::from_checkpoint_tensors(8, 2, 2, head_tensors).unwrap(),
+        profile,
+        graph_weights,
+    )
+}
+
+pub(crate) fn encoder_graph_request(
+    profile: &CheckpointProfile,
+    sequence_length: u64,
+) -> (
+    magnetar_runtime::ComponentDigest,
+    magnetar_runtime::FirstNativeEncoderGraphRequest,
+) {
+    use magnetar_runtime::{
+        ComponentDigest, ComponentTrustStore, EncoderGraphConfig, EncoderLayerConfig,
+        FirstNativeEncoderGraphRequest, ModelArchitectureConfig, ModelComponentId,
+        ModelComponentIdentity, ModelComponentImplementationKind, ModelComponentVersion,
+        register_inference_component_artifact,
+    };
+
+    let settings = profile.graph_settings();
+    let bytes = include_bytes!(
+        "../../../magnetar-runtime/fixtures/components/modernbert-encoder.component.wasm"
+    )
+    .to_vec();
+    let digest = ComponentDigest::sha256(&bytes);
+    let manifest = include_str!(
+        "../../../magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    )
+    .replace(
+        "sha256:321b42b83773544e1ba553cc7196d3d742cd9ef1e2af3f04da72b66e402a730f",
+        &digest.value,
+    )
+    .replace("magnetar.qwen.real", "magnetar.modernbert.laya-profile")
+    .replace("qwen-model-component", "modernbert-model-component")
+    .replace("    - qwen2\r\n", "    - modernbert\r\n")
+    .replace("    - qwen2\n", "    - modernbert\n")
+    .replace("1.14.0", "1.12.0");
+    let trust = ComponentTrustStore::default().trust_digest(&digest.value);
+    register_inference_component_artifact(bytes, manifest.into_bytes(), &trust).unwrap();
+
+    let architecture = ModelArchitectureConfig {
+        hidden_size: settings.hidden_size as u64,
+        intermediate_size: settings.intermediate_size as u64,
+        num_hidden_layers: settings.layers.len() as u32,
+        num_attention_heads: settings.attention_heads as u32,
+        num_key_value_heads: settings.attention_heads as u32,
+        head_dim: (settings.hidden_size / settings.attention_heads) as u64,
+        vocab_size: settings.vocabulary_size as u64,
+        rms_norm_eps: settings.norm_epsilon as f32,
+        rope_theta: settings.layers[0].rope_theta,
+        hidden_activation: Some("gelu".into()),
+        attention_bias: settings.attention_bias,
+        ..Default::default()
+    };
+    let encoder = EncoderGraphConfig {
+        norm_epsilon: settings.norm_epsilon,
+        max_positions: settings.max_positions as u64,
+        norm_bias: settings.norm_bias,
+        attention_bias: settings.attention_bias,
+        mlp_bias: settings.mlp_bias,
+        layers: settings
+            .layers
+            .iter()
+            .map(|layer| EncoderLayerConfig {
+                local_radius: layer.local_radius.map(|radius| radius.try_into().unwrap()),
+                rope_theta: layer.rope_theta,
+                attention_normalization: layer.attention_normalization,
+            })
+            .collect(),
+    };
+    let weight_shapes = profile
+        .weights()
+        .iter()
+        .map(|weight| {
+            (
+                weight.graph_name.clone(),
+                weight
+                    .graph_shape
+                    .iter()
+                    .map(|&dimension| dimension as u64)
+                    .collect(),
+            )
+        })
+        .collect();
+    let request = FirstNativeEncoderGraphRequest {
+        architecture,
+        encoder,
+        weight_shapes,
+        identity: ModelComponentIdentity::new(
+            ModelComponentId::new("modernbert-laya-profile").unwrap(),
+            ModelComponentVersion::new(1, 0, 0),
+            ModelComponentImplementationKind::WebAssemblyComponent,
+        )
+        .trusted()
+        .with_architecture_family("modernbert"),
+        sequence_length,
+    };
+    (digest, request)
+}
+
+#[test]
+fn laya_checkpoint_profile_builds_a_real_modernbert_component_graph() {
+    use magnetar_runtime::{
+        build_first_native_encoder_graph_from_named_component, initial_operator_catalog,
+    };
+
+    let profile = CheckpointProfile::from_huggingface_config(
+        include_bytes!("../../../components/modernbert/tests/fixtures/laya-encoder.config.json"),
+        CheckpointNamespace::Encoder,
+    )
+    .unwrap();
+    let settings = profile.graph_settings();
+    let (digest, request) = encoder_graph_request(&profile, 5);
+    let graph = build_first_native_encoder_graph_from_named_component(&digest, &request).unwrap();
+    graph.validate(&initial_operator_catalog()).unwrap();
+    assert_eq!(graph.phase, magnetar_runtime::ExecutionGraphPhase::Encode);
+    assert!(graph.nodes.len() > settings.layers.len());
+
+    let mut malformed = request;
+    malformed
+        .weight_shapes
+        .get_mut("layers.0.attn.Wqkv.weight")
+        .unwrap()
+        .swap(0, 1);
+    assert!(build_first_native_encoder_graph_from_named_component(&digest, &malformed).is_err());
+}
+
+#[test]
+fn raw_half_precision_checkpoint_payloads_decode_to_f32() {
+    let f16 = [0x00, 0x3c, 0x00, 0xc0];
+    let bf16 = [0x80, 0x3f, 0x00, 0xc0];
+    let file = serialize(
+        &[
+            TensorToSerialize {
+                name: "encoder.embeddings.norm.weight",
+                dtype: ModelDType::F16,
+                shape: vec![2],
+                data: &f16,
+            },
+            TensorToSerialize {
+                name: "head.layers.0.norm1.weight",
+                dtype: ModelDType::Bf16,
+                shape: vec![2],
+                data: &bf16,
+            },
+        ],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("model.safetensors"), file).unwrap();
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(directory.path().to_path_buf()),
+        directory.path().to_path_buf(),
+    );
+    let raw = discover_raw_safetensors(&source).unwrap();
+    for metadata in raw.tensors {
+        let range = ProductionPayloadRange {
+            identity: metadata.name.clone(),
+            offset: metadata.offset_bytes.unwrap(),
+            length: metadata.size_bytes.unwrap(),
+            digest: metadata.digest.clone(),
+        };
+        let bytes = raw.payloads.read_payload(&range).unwrap();
+        let mut bounded = metadata.clone();
+        bounded.offset_bytes = Some(0);
+        let tensor = host_tensors_from_artifact_bytes(&[bounded], &bytes, 0)
+            .unwrap()
+            .remove(&metadata.name)
+            .unwrap();
+        assert_eq!(tensor.shape, [2]);
+        assert_eq!(tensor.data, [1.0, -2.0]);
     }
 }
 
@@ -159,6 +395,139 @@ fn close(actual: &[f32], expected: &[f32], what: &str) {
     }
 }
 
+#[derive(Clone)]
+struct EncoderPayloads(BTreeMap<String, Vec<u8>>);
+
+impl ProductionArtifactPayloadSource for EncoderPayloads {
+    fn read_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Vec<u8>, magnetar_runtime::ProductionIngestionError> {
+        let missing = || magnetar_runtime::ProductionIngestionError::PayloadUnavailable {
+            identity: range.identity.clone(),
+        };
+        let bytes = self.0.get(&range.identity).ok_or_else(missing)?;
+        if range.offset != 0 || range.length != bytes.len() as u64 {
+            return Err(
+                magnetar_runtime::ProductionIngestionError::PayloadOutOfBounds {
+                    identity: range.identity.clone(),
+                },
+            );
+        }
+        if range
+            .digest
+            .as_ref()
+            .is_some_and(|digest| *digest != ModelDigest::sha256(bytes))
+        {
+            return Err(
+                magnetar_runtime::ProductionIngestionError::IntegrityMismatch {
+                    identity: range.identity.clone(),
+                },
+            );
+        }
+        Ok(bytes.clone())
+    }
+}
+
+#[test]
+fn resident_encoder_loads_authenticated_weights_and_matches_laya_reference() {
+    use magnetar_runtime::{
+        ArtifactFormat, ModelArchitecture, ModelArtifactId, ModelArtifactKind, ModelName,
+        ModelRevision, ModelTensorMetadata, ModelTrustStore, ProductionLoadedEncoder,
+    };
+    let (encoder, head, profile, weights) = models_from_synthetic_safetensors();
+    let (component, request) = encoder_graph_request(&profile, 1);
+    let mut manifest = magnetar_runtime::e2e_fixture().unwrap().manifest;
+    manifest.id = ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new("synthetic-modernbert").unwrap(),
+        ModelRevision::new("r1").unwrap(),
+        ModelDigest::sha256(b"synthetic modernbert artifact"),
+    );
+    manifest.architecture = ModelArchitecture::new("modernbert", "synthetic-modernbert");
+    manifest.architecture_config = Some(request.architecture.clone());
+    manifest.artifact_format = ArtifactFormat::HuggingFace;
+    let mut payloads = BTreeMap::new();
+    manifest.tensors = weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let bytes = tensor.content_bytes();
+            let metadata = ModelTensorMetadata {
+                name: name.clone(),
+                shape: tensor.shape,
+                storage_dtype: ModelDType::F32,
+                layout: None,
+                shard: None,
+                offset_bytes: Some(0),
+                size_bytes: Some(bytes.len() as u64),
+                quantization: None,
+                expected_compute_dtype: None,
+                digest: Some(ModelDigest::sha256(&bytes)),
+            };
+            payloads.insert(name, bytes);
+            metadata
+        })
+        .collect();
+    let payloads = EncoderPayloads(payloads);
+    let provider = std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new());
+    let load = |payloads: &EncoderPayloads, trust| {
+        ProductionLoadedEncoder::load(
+            manifest.clone(),
+            payloads,
+            trust,
+            provider.clone(),
+            component.clone(),
+            request.encoder.clone(),
+        )
+    };
+    assert!(load(&payloads, ModelTrustStore::default()).is_err());
+    let mut corrupted = payloads.clone();
+    corrupted.0.values_mut().next().unwrap()[0] ^= 1;
+    let trusted = || ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone());
+    assert!(load(&corrupted, trusted()).is_err());
+    let mut loaded = load(&payloads, trusted()).unwrap();
+    assert!(loaded.encode(&[], &[]).is_err());
+    assert!(loaded.encode(&[1, 2], &[true]).is_err());
+    assert!(loaded.encode(&[1, 2], &[false, false]).is_err());
+    assert!(loaded.encode(&[24], &[true]).is_err());
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/laya-reference.json")).unwrap();
+    for case in cases {
+        let ids = integers(&case, "ids")
+            .into_iter()
+            .map(|id| id as u32)
+            .collect::<Vec<_>>();
+        let mask = integers(&case, "mask")
+            .into_iter()
+            .map(|id| id != 0)
+            .collect::<Vec<_>>();
+        let markers = integers(&case, "markers");
+        let qtype = match case["qtype"].as_u64().unwrap() {
+            0 => QuestionType::Choice,
+            1 => QuestionType::Score,
+            2 => QuestionType::Noul,
+            _ => panic!("unknown question type"),
+        };
+        let hidden = loaded.encode(&ids, &mask).unwrap();
+        let expected_hidden = encoder.forward(&ids, &mask, None).unwrap();
+        close(&hidden.data, &expected_hidden, "resident encoder hidden");
+        let output = head
+            .forward(&hidden.data, ids.len(), &mask, &markers, qtype)
+            .unwrap();
+        close(
+            &output.option_logits,
+            &numbers(&case, "logits"),
+            "resident option logits",
+        );
+        close(
+            &output.action_logits,
+            &numbers(&case, "action_logits"),
+            "resident action logits",
+        );
+    }
+    loaded.unload().unwrap();
+}
+
 #[test]
 fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
     let cases: Vec<serde_json::Value> =
@@ -167,8 +536,7 @@ fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
         "../../../components/laya/tests/fixtures/rl_agent_config.json"
     ))
     .unwrap();
-    let encoder = encoder();
-    let head = head();
+    let (encoder, head, profile, graph_weights) = models_from_synthetic_safetensors();
     for case in cases {
         let ids = integers(&case, "ids")
             .into_iter()
@@ -186,8 +554,52 @@ fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
             _ => panic!("unknown question type"),
         };
         let hidden = encoder.forward(&ids, &mask, None).unwrap();
+        let (digest, request) = encoder_graph_request(&profile, ids.len() as u64);
+        let graph = magnetar_runtime::build_first_native_encoder_graph_from_named_component(
+            &digest, &request,
+        )
+        .unwrap();
+        let mut bindings: BTreeMap<_, _> = graph_weights
+            .iter()
+            .map(|(name, tensor)| {
+                (
+                    magnetar_runtime::TensorEdgeId::new(format!("weight.{name}")),
+                    tensor.clone(),
+                )
+            })
+            .collect();
+        bindings.insert(
+            magnetar_runtime::TensorEdgeId::new("input.token_ids"),
+            HostTensor::new(
+                [ids.len() as u64],
+                ids.iter().map(|&id| id as f32).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        bindings.insert(
+            magnetar_runtime::TensorEdgeId::new("input.attention_mask"),
+            HostTensor::new(
+                [mask.len() as u64],
+                mask.iter()
+                    .map(|&valid| if valid { 1.0 } else { 0.0 })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let outcome = magnetar_runtime::run_first_native_graph_with_provider_and_bindings(
+            std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+            &magnetar_runtime::e2e_fixture().unwrap(),
+            &graph,
+            &magnetar_runtime::KvCacheId::new("laya-encoder-conformance").unwrap(),
+            bindings,
+            &["hidden_states"],
+        )
+        .unwrap();
+        let graph_hidden =
+            &outcome.bindings[&magnetar_runtime::TensorEdgeId::new("hidden_states")].data;
+        close(graph_hidden, &hidden, "encoder hidden states");
         let result = head
-            .forward(&hidden, ids.len(), &mask, &markers, qtype)
+            .forward(graph_hidden, ids.len(), &mask, &markers, qtype)
             .unwrap();
         close(
             &result.option_logits,

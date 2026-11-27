@@ -8,12 +8,12 @@
 components/deepseek https://github.com/astorise/Magnetar-component-DeepSeek 1289817ab445ec11988b13e9a4a0a9174e7381c2
 components/gemma https://github.com/astorise/Magnetar-component-Gemma a0143b184a5443f9a9f132d677a3f58aa51ae77b
 components/glm https://github.com/astorise/Magnetar-component-GLM 4772b2e7167fab77c4eb39f03368c313c2c5226a
-components/kev https://github.com/astorise/Magnetar-component-Kev 5dff88e306922da17dc73e4c48ba466d7d97dd36
+components/kev https://github.com/astorise/Magnetar-component-Kev a5053d706f628b25393f67752dc78bffab04afeb
 components/kimi https://github.com/astorise/Magnetar-component-Kimi 4e9f18edf647488e607207c5b0b9d5b8fdee61e0
 components/laya https://github.com/astorise/Magnetar-component-Laya ad1a9350bc056d84e9e81f633953e70ad44814a9
 components/llama https://github.com/astorise/Magnetar-component-Llama 10a68c30d26393e177b535cb03735b9c38141f02
 components/mistral https://github.com/astorise/Magnetar-component-Mistral f1c22dc8d0c7f37fc75d2b30aeab0ff20fd6ed35
-components/modernbert https://github.com/astorise/Magnetar-component-ModernBERT 4710bfff6f7443a2472c60a4939199ad5fc39b2a
+components/modernbert https://github.com/astorise/Magnetar-component-ModernBERT f68b6970b19e7261028bc52aec3f53a0091f6a02
 components/nemotron https://github.com/astorise/Magnetar-component-Nemotron 160f0aa5db98744f04a95e084f6582aad0c63877
 components/olala https://github.com/astorise/Magnetar-component-Olala eed6c0b5dede462d4ea9f2bba0a8343c6d88efd5
 components/olmo https://github.com/astorise/Magnetar-component-OLMo 74f3ffdb02b63b76b9545a5f69f7f61901591c57
@@ -22,8 +22,8 @@ components/smollm https://github.com/astorise/Magnetar-component-SmolLM af99a5cb
 formats/gguf https://github.com/astorise/Magnetar-format-GGUF 9d21d727072aae17c78e06c7f37af33da005ae3f
 formats/safetensors https://github.com/astorise/Magnetar-format-safetensors 29f489db2cbff784a3e3f12ac2986e368af5aed5
 loaders/gguf https://github.com/astorise/Magnetar-loader-GGUF 1938a2e0d5f86bede8231ed1ffa9de7a2862fe10
-loaders/huggingface https://github.com/astorise/Magnetar-loader-HuggingFace 69825a4b0cb9dbe9c21098622dd11b3f8e12887b
-providers/cpu https://github.com/astorise/Magnetar-provider-CPU 36204a8434beff99d6e714374875520927c3f181
+loaders/huggingface https://github.com/astorise/Magnetar-loader-HuggingFace c860c85702af9c346074f17a584d700f6affd9b5
+providers/cpu https://github.com/astorise/Magnetar-provider-CPU e00cfe11f0882a4cfaeba259c114fe17f3acf8cf
 providers/cuda https://github.com/astorise/Magnetar-provider-CUDA 902f998408a795bdb22d307cbbdf3a76d94a678a
 providers/metal https://github.com/astorise/Magnetar-provider-Metal 7101706038ad40ca7f3006509dce9c8c9ec1cf1d
 providers/openvino https://github.com/astorise/Magnetar-provider-OpenVINO 42b919d5583b51a6cef3ee605d867938ee0d0adb

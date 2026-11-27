@@ -925,6 +925,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-component-kev"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "magnetar-component-laya"
 version = "0.1.0"
 dependencies = [
@@ -1009,6 +1016,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
+ "magnetar-component-kev",
+ "magnetar-component-laya",
+ "magnetar-component-modernbert",
+ "magnetar-format-safetensors",
  "magnetar-loader-gguf",
  "magnetar-loader-huggingface",
  "magnetar-provider-cpu",
@@ -1049,11 +1060,14 @@ dependencies = [
 name = "magnetar-integration-production-loading"
 version = "0.1.0"
 dependencies = [
+ "magnetar-component-kev",
  "magnetar-component-laya",
  "magnetar-component-modernbert",
  "magnetar-component-nemotron",
  "magnetar-component-olala",
  "magnetar-format-gguf",
+ "magnetar-format-safetensors",
+ "magnetar-inference-component",
  "magnetar-inference-qualification",
  "magnetar-integration-resident-provider",
  "magnetar-loader-gguf",
