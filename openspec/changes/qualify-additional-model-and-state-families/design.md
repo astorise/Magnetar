@@ -500,6 +500,8 @@ link, but their graphs are refused if they have not read a declared hybrid
 configuration. Each session must keep convolution and SSM state separate from
 attention KV history. The mixer and MoE operators have independent CPU/PyTorch
 comparisons; this contract alone does not qualify a complete hybrid decoder.
+KV capacity estimates for this layout reserve rows only for attention blocks;
+Mamba-2, dense MLP and expert blocks do not allocate attention history.
 
 ### Authority and isolation
 

@@ -564,6 +564,19 @@ impl FirstNativeModelConfig {
                 }
             }
         }
+        // In an ordered Mamba-2 hybrid, only attention blocks keep KV
+        // history. Mixer state is accounted separately as recurrent state;
+        // dense and expert blocks have no sequence history of their own.
+        if let Some(hybrid) = &self.decoder_extensions.mamba2_hybrid {
+            for (layer, width) in widths.iter_mut().enumerate() {
+                if !matches!(
+                    hybrid.layers.get(layer),
+                    Some(crate::HybridDecoderBlock::Attention)
+                ) {
+                    *width = None;
+                }
+            }
+        }
         // The index stores follow the decoder layers.
         if let Some(selection) = self.decoder_extensions.token_selection {
             widths.extend(
