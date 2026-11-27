@@ -440,6 +440,22 @@ fn nemotron_component_builds_mixed_prefill_and_decode_graphs() {
     assert!(super::super::prefill_chunks::prefill_continues_history(
         &chunk_graphs.prefill
     ));
+    assert!(
+        super::super::prefill_chunks::recurrent_prefill_continues_history(&chunk_graphs.prefill)
+    );
+    let mut noncausal = chunk_graphs.prefill.clone();
+    noncausal
+        .nodes
+        .values_mut()
+        .find(|node| node.operator.name() == "attention")
+        .unwrap()
+        .attributes
+        .insert("causal".into(), OperatorAttributeValue::Boolean(false));
+    assert!(!super::super::prefill_chunks::recurrent_prefill_continues_history(&noncausal));
+    let mut unknown = chunk_graphs.prefill.clone();
+    unknown.nodes.values_mut().next().unwrap().operator =
+        OperatorId::magnetar("unknown", 1, OperatorFamily::Tensor);
+    assert!(!super::super::prefill_chunks::recurrent_prefill_continues_history(&unknown));
     let mut chunk_plan = prepare_first_native_plan_for_graph(
         &execution_runtime,
         &chunk_graphs.prefill,
@@ -505,6 +521,105 @@ fn nemotron_component_builds_mixed_prefill_and_decode_graphs() {
         &chunk_cache,
     );
     execution_runtime.release_kv_cache(&chunk_cache).unwrap();
+
+    // Exercise the same Component and weights through production loading and
+    // generation, including the non-divisible prompt's no-padding fallback.
+    let (mut production, _) = super::super::tests::production_shaped_canonical_fixture();
+    production.config = first_native_model_config_from_architecture_config(
+        &config,
+        32,
+        production.manifest.architecture.family.clone(),
+    );
+    production.manifest.architecture_config = Some(config.clone());
+    let template = production.manifest.tensors[0].clone();
+    let mut offset = 0;
+    let mut bytes_by_name = BTreeMap::new();
+    production.manifest.tensors = reference
+        .weights
+        .iter()
+        .map(|(name, value)| {
+            let bytes: Vec<u8> = value.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut tensor = template.clone();
+            tensor.name = name.clone();
+            tensor.shape = value.shape.clone();
+            tensor.offset_bytes = Some(offset);
+            tensor.size_bytes = Some(bytes.len() as u64);
+            tensor.digest = Some(ModelDigest::sha256(&bytes));
+            offset += bytes.len() as u64;
+            bytes_by_name.insert(name.clone(), bytes);
+            tensor
+        })
+        .collect();
+    let mut tokenizer = production.tokenizer.metadata().clone();
+    tokenizer.vocabulary_size = 24;
+    tokenizer.token_id_range = TokenIdRange::new(0, 23);
+    tokenizer
+        .special_tokens
+        .retain(|token| token.kind == SpecialTokenKind::Eos);
+    tokenizer.added_token_count = 1;
+    production.tokenizer = FixtureTokenizer::new(tokenizer);
+    let payload = super::super::tests::ProductionIntegrationPayloadSource { bytes_by_name };
+    let trust =
+        ModelTrustStore::default().trust_digest(production.manifest.id.digest.value.clone());
+    let mut model = ProductionLoadedModel::load_with_component(
+        production,
+        &payload,
+        trust,
+        Arc::new(ReferenceCpuProvider::new()),
+        Some(digest.clone()),
+    )
+    .unwrap();
+    model.set_prefill_buckets(Vec::new());
+    let generate = |model: &mut ProductionLoadedModel, ids: &[u32]| {
+        let mut logits = Vec::new();
+        let result = model
+            .generate_streaming_with_logits(
+                ProductionGenerationRequest {
+                    prompt: PromptInput::TokenIds(ids.to_vec()),
+                    parameters: GenerationParameters::greedy(),
+                    stop_conditions: StopConditions::default(),
+                    max_new_tokens: Some(4),
+                    max_generation_millis: None,
+                },
+                None,
+                &mut |_| std::ops::ControlFlow::Continue(()),
+                &mut |step| logits.push(step.to_vec()),
+            )
+            .unwrap();
+        (result.result.output.generated_token_ids, logits)
+    };
+    model.set_prefill_chunk(0);
+    let unchunked_full = generate(&mut model, &reference.ids);
+    let unchunked_short = generate(&mut model, &reference.ids[..7]);
+    close(
+        &unchunked_full.1[0],
+        &reference.full.data[7 * 24..8 * 24],
+        "production logits",
+    );
+    model.set_prefill_chunk(4);
+    let (probe_graphs, _, _) = build(&config, weights.clone(), 4).unwrap();
+    let probe = model.graph_cache.prepare(&model.runtime, probe_graphs, 4);
+    assert!(
+        super::super::prefill_chunks::recurrent_prefill_continues_history(&probe.prefill),
+        "the optimized prefill must preserve the qualified continuation profile"
+    );
+    let chunked_full = generate(&mut model, &reference.ids);
+    assert_eq!(chunked_full.0, unchunked_full.0);
+    for (actual, expected) in chunked_full.1.iter().zip(&unchunked_full.1) {
+        close(actual, expected, "production chunked generation");
+    }
+    assert_eq!(chunked_full.1.len(), unchunked_full.1.len());
+    assert_eq!(model.prefill_chunk(), 4);
+    assert_eq!(model.graph_cache.prompt_lengths(), vec![4]);
+    let unaligned = generate(&mut model, &reference.ids[..7]);
+    assert_eq!(unaligned.0, unchunked_short.0);
+    for (actual, expected) in unaligned.1.iter().zip(&unchunked_short.1) {
+        close(actual, expected, "production unaligned generation");
+    }
+    assert_eq!(unaligned.1.len(), unchunked_short.1.len());
+    assert_eq!(model.prefill_chunk(), 0);
+    assert_eq!(model.graph_cache.prompt_lengths(), vec![7]);
+
     let mut invalid = config.clone();
     invalid.rope_layers.as_mut().unwrap()[1] = true;
     assert!(build(&invalid, weights.clone(), 4).is_err());

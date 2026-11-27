@@ -230,6 +230,15 @@ cannot remove a state edge. A real Wasmtime Component tests both graph phases;
 older Components continue linking through their original versions. The current
 first-native executor can stage and commit declared recurrent resources; this
 does not by itself qualify an Olala or Nemotron model Component.
+
+A conservative Mamba-2 prefill profile may continue through full-sized chunks
+in production: every attention node reads causal KV history, both recurrent
+states bind directly to each mixer, and the remaining graph uses the qualified
+token-wise operators. The optimized graph may fuse a projection with its
+residual. The real Component graph's two chunks, generated logits and decode
+steps match the pinned synthetic PyTorch reference and a one-pass execution.
+Unknown operators, other recurrent bindings, noncausal attention and a final
+partial chunk retain the single-pass fallback; padding must not advance state.
 Before a decoder graph pair is returned, the Runtime also checks that prefill
 and decode declare the same state identities, layers, slots, compatibility
 keys and tensor descriptors; mismatched phases, schemas or out-of-range layers
