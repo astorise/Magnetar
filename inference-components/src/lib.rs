@@ -25,6 +25,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(feature = "kev")]
+pub mod kev;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceComponentPlacement {
     ReferenceCpu,
@@ -281,6 +284,8 @@ pub struct LoadedInferenceComponent {
     chat_formatter: Option<Arc<HuggingFaceChatTemplateFormatter>>,
     provider: ComponentProviderAdvertisement,
     loaded_model: Mutex<magnetar_runtime::ProductionLoadedModel>,
+    #[cfg(feature = "kev")]
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
 }
 
 pub fn local_bundle_manifest_digest(root: impl Into<PathBuf>) -> Result<String> {
@@ -512,7 +517,7 @@ impl LoadedInferenceComponent {
         let fixture = magnetar_runtime::production_model_fixture(
             ingested.manifest.clone(),
             tokenizer_metadata,
-            real_tokenizer,
+            real_tokenizer.clone(),
         )
         .with_context(|| {
             format!("Magnetar failed to build production fixture for Component `{name}`")
@@ -545,6 +550,8 @@ impl LoadedInferenceComponent {
             chat_formatter,
             provider,
             loaded_model: Mutex::new(loaded_model),
+            #[cfg(feature = "kev")]
+            tokenizer: real_tokenizer,
         })
     }
 

@@ -10,9 +10,12 @@ publish = false
 [features]
 default = []
 cuda = ["dep:magnetar-provider-cuda"]
+kev = ["dep:magnetar-component-kev", "dep:magnetar-format-safetensors"]
 
 [dependencies]
 anyhow = "1"
+magnetar-component-kev = { path = "../components/kev", optional = true }
+magnetar-format-safetensors = { path = "../formats/safetensors", optional = true }
 magnetar-loader-gguf = { path = "../loaders/gguf" }
 magnetar-loader-huggingface = { path = "../loaders/huggingface" }
 magnetar-provider-cpu = { path = "../providers/cpu" }
