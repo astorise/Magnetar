@@ -82,6 +82,7 @@ mod engine;
 mod executor;
 mod fixture;
 mod graph_execution;
+mod kv_history_inputs;
 mod kv_pool;
 mod kv_state;
 mod prefill_buckets;

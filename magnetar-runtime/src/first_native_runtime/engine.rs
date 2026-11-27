@@ -545,6 +545,13 @@ pub(super) struct RecordedDecodeStep {
 /// (through `key_count`) knows to read just the history
 /// (`append-kv-history-in-place`).
 pub(super) fn kv_edges_feed_only_attention(graph: &ExecutionGraph) -> bool {
+    if graph.edges.values().any(|edge| {
+        edge.kv_cache
+            .as_ref()
+            .is_some_and(|metadata| metadata.behavior == GraphKvCacheBehavior::HistoryInput)
+    }) {
+        return false;
+    }
     let kv_edges: BTreeSet<&TensorEdgeId> = graph
         .edges
         .iter()
@@ -1086,6 +1093,11 @@ pub struct FirstNativeLayerKvState {
     /// the layer's stores and this many leading rows are valid. `None` for
     /// copy-based history, whose tensors are exactly the history.
     pub(super) rows: Option<u64>,
+    /// Schemas for explicitly bound history tensors, when used. The two
+    /// entries are the K and V identities and compatibility keys.
+    pub(super) history_schema: Option<[(String, String); 2]>,
+    /// Cache owning this explicitly bound history, including pending values.
+    pub(super) history_owner: Option<KvCacheId>,
 }
 
 impl E2eRuntimeModelExecutionEngine {

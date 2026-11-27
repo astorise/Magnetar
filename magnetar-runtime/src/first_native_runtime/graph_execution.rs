@@ -1870,6 +1870,17 @@ pub(super) fn execute_first_native_graph_nodes(
         &mut initial_bindings,
         &mut resident_bindings,
     )?;
+    let history_schemas = super::kv_history_inputs::bind_history_inputs(
+        runtime,
+        executor,
+        kv_cache_id,
+        graph,
+        profile.kv_layer_count,
+        kv_history,
+        absolute_position_override,
+        &mut initial_bindings,
+        &mut resident_bindings,
+    )?;
     // Tables read by row (`support-qwen38-flash-next` task 4.4): each
     // reading node's rows, named by this step's tokens, are hinted to their
     // mappings now, every layer's at once, and read when the node runs.
@@ -2274,6 +2285,7 @@ pub(super) fn execute_first_native_graph_nodes(
                         rows: Some(rows),
                         k,
                         v,
+                        ..
                     }) => Some((
                         kv_stores.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                             reason: format!(
@@ -2793,6 +2805,10 @@ pub(super) fn execute_first_native_graph_nodes(
                 k,
                 v,
                 rows: layer_rows[layer],
+                history_schema: history_schemas.get(&layer).cloned(),
+                history_owner: history_schemas
+                    .contains_key(&layer)
+                    .then(|| kv_cache_id.clone()),
             },
         );
     }

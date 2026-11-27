@@ -254,6 +254,9 @@ pub struct GraphAdapterMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphKvCacheBehavior {
     Input,
+    /// Runtime-bound, copy-based history supplied as an ordinary tensor.
+    /// Unlike `Input`, this does not ask a Kernel to manage a KV cache.
+    HistoryInput,
     Output,
     Append,
 }
@@ -264,6 +267,15 @@ pub struct GraphKvCacheMetadata {
     pub behavior: GraphKvCacheBehavior,
     pub paged: bool,
     pub compatibility_key: String,
+}
+
+/// One Runtime-bound history input and its complete-history output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphKvHistoryBinding {
+    pub cache_id: String,
+    pub compatibility_key: String,
+    pub input_edge: TensorEdgeId,
+    pub output_edge: TensorEdgeId,
 }
 
 /// Whether an edge reads the prior committed state or produces its successor.
@@ -375,6 +387,14 @@ impl ExecutionGraph {
         let producers = derive_edge_producers(self)?;
         let consumers = derive_edge_consumers(self);
         validate_recurrent_edges(self, &producers, &consumers)
+    }
+
+    /// Validate and extract copy-based history inputs and outputs. This does
+    /// not replace whole-graph validation.
+    pub fn kv_history_bindings(&self) -> Result<Vec<GraphKvHistoryBinding>, GraphError> {
+        let producers = derive_edge_producers(self)?;
+        let consumers = derive_edge_consumers(self);
+        validate_history_edges(self, &producers, &consumers)
     }
 }
 
@@ -617,6 +637,7 @@ pub fn validate_execution_graph(
         }
     }
     validate_recurrent_edges(graph, &derived_producers, &derived_consumers)?;
+    validate_history_edges(graph, &derived_producers, &derived_consumers)?;
     // Reject a cycle (or a node input with no resolvable producer among
     // remaining unscheduled nodes) as part of validation itself, not only
     // when a caller happens to also plan the graph.
@@ -799,6 +820,94 @@ fn validate_recurrent_edges<'a>(
             output_edge: output.id.clone(),
         });
     }
+    Ok(bindings)
+}
+
+fn validate_history_edges(
+    graph: &ExecutionGraph,
+    producers: &BTreeMap<&TensorEdgeId, &ExecutionNodeId>,
+    consumers: &BTreeMap<&TensorEdgeId, BTreeSet<&ExecutionNodeId>>,
+) -> Result<Vec<GraphKvHistoryBinding>, GraphError> {
+    let mut seen = BTreeSet::new();
+    let mut bindings = Vec::new();
+    for input in graph.edges.values().filter(|edge| {
+        edge.kv_cache
+            .as_ref()
+            .is_some_and(|metadata| metadata.behavior == GraphKvCacheBehavior::HistoryInput)
+    }) {
+        let metadata = input.kv_cache.as_ref().unwrap();
+        let invalid =
+            || GraphError::LifecycleInvalid(format!("invalid KV history '{}'", metadata.cache_id));
+        if metadata.cache_id.is_empty()
+            || metadata.compatibility_key.is_empty()
+            || metadata.paged
+            || !seen.insert(&metadata.cache_id)
+            || producers.contains_key(&input.id)
+            || !consumers.contains_key(&input.id)
+        {
+            return Err(invalid());
+        }
+        if graph
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint != &metadata.compatibility_key)
+        {
+            return Err(invalid());
+        }
+        let mut outputs = graph.edges.values().filter(|edge| {
+            edge.kv_cache.as_ref().is_some_and(|candidate| {
+                candidate.cache_id == metadata.cache_id
+                    && candidate.behavior == GraphKvCacheBehavior::Output
+            })
+        });
+        let output = outputs.next().ok_or_else(invalid)?;
+        let output_meta = output.kv_cache.as_ref().unwrap();
+        if outputs.next().is_some()
+            || !producers.contains_key(&output.id)
+            || output_meta.paged
+            || output_meta.compatibility_key != metadata.compatibility_key
+        {
+            return Err(invalid());
+        }
+        let valid_edge =
+            |edge: &TensorEdge| {
+                let shape = &edge.descriptor.shape;
+                shape.dimensions.len() >= 2
+                    && shape.symbolic.is_none()
+                    && !shape.dimensions.contains(&0)
+                    && shape.element_count().is_ok_and(|count| count <= 67_108_864)
+                    && edge.descriptor.dtype == DTypeDescriptor::portable(ComputeDType::Float32)
+                    && layout_kind(&edge.descriptor.layout) == TensorLayoutKind::Contiguous
+                    && edge.descriptor.view.is_none()
+                    && edge
+                        .descriptor
+                        .aliasing_intent
+                        .is_none_or(|alias| alias == crate::TensorAliasingKind::NoAlias)
+                    && edge.descriptor.storage_dtype.as_ref().is_none_or(|dtype| {
+                        *dtype == DTypeDescriptor::portable(ComputeDType::Float32)
+                    })
+                    && edge.descriptor.compute_dtype.as_ref().is_none_or(|dtype| {
+                        *dtype == DTypeDescriptor::portable(ComputeDType::Float32)
+                    })
+                    && edge.recurrent_state.is_none()
+                    && edge.prefix_cache.is_none()
+                    && edge.aliasing == TensorAliasing::None
+            };
+        if !valid_edge(input)
+            || !valid_edge(output)
+            || input.descriptor.shape.dimensions[1..] != output.descriptor.shape.dimensions[1..]
+            || input.descriptor.layout != output.descriptor.layout
+        {
+            return Err(invalid());
+        }
+        bindings.push(GraphKvHistoryBinding {
+            cache_id: metadata.cache_id.clone(),
+            compatibility_key: metadata.compatibility_key.clone(),
+            input_edge: input.id.clone(),
+            output_edge: output.id.clone(),
+        });
+    }
+    bindings.sort_by(|a, b| a.cache_id.cmp(&b.cache_id));
     Ok(bindings)
 }
 

@@ -490,6 +490,217 @@ fn projected_attention_keeps_raw_state_separate_from_kv_history() {
     super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &other_cache);
 }
 
+/// Both the fixed raw-token state and the growing K/V history belong to the
+/// Runtime. The hand-built graph is experimental; no Component API exposes
+/// these history inputs yet.
+#[test]
+fn projected_attention_uses_runtime_managed_history_tensors() {
+    let c = reference();
+    let fixture = e2e_fixture().unwrap();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let executor = resolve_kernel_execution_provider(&runtime, &provider).unwrap();
+    let new_cache = |runtime: &mut Runtime, name: &str| {
+        runtime
+            .create_kv_cache(KvCache::new(
+                KvCacheId::new(name).unwrap(),
+                KvCacheScope::Session,
+                KvCacheCompatibility::new(
+                    GenerationModelReference::ModelInstance(instance.clone()),
+                    TokenizerId::new("tokenizer").unwrap(),
+                ),
+                KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float32),
+            ))
+            .unwrap()
+    };
+    let cache = new_cache(&mut runtime, "projected-managed-session");
+    let other = new_cache(&mut runtime, "projected-managed-other");
+    let step = |runtime: &mut Runtime,
+                cache: &KvCacheId,
+                case: &Case,
+                history: Option<&LayerKvMap>,
+                supply_history: bool| {
+        let mut tensors = inputs(&c, case.start, case.end, None);
+        for tensor in &mut tensors[3..5] {
+            *tensor = HostTensor::new(
+                [
+                    case.start.max(1) as u64,
+                    c.kv_heads as u64,
+                    c.head_dim as u64,
+                ],
+                vec![0.0; case.start.max(1) * c.kv_heads * c.head_dim],
+            )
+            .unwrap();
+        }
+        let (mut graph, mut bindings) = make_graph(&c, case, &tensors);
+        for (slot, input, output) in [
+            ("raw_key", "input.1", "output.raw-key"),
+            ("raw_value", "input.2", "output.raw-value"),
+        ] {
+            for (edge, behavior) in [
+                (input, GraphRecurrentStateBehavior::Input),
+                (output, GraphRecurrentStateBehavior::Output),
+            ] {
+                graph
+                    .edges
+                    .get_mut(&TensorEdgeId::new(edge))
+                    .unwrap()
+                    .recurrent_state = Some(GraphRecurrentStateMetadata {
+                    resource_id: format!("managed.layer0.{slot}"),
+                    layer: 0,
+                    slot: slot.into(),
+                    behavior,
+                    compatibility_key: "projected-raw-v1".into(),
+                });
+            }
+            bindings.remove(&TensorEdgeId::new(input));
+        }
+        for (role, input, output) in [
+            ("k", "input.3", "output.keys"),
+            ("v", "input.4", "output.values"),
+        ] {
+            for (edge, behavior) in [
+                (input, GraphKvCacheBehavior::HistoryInput),
+                (output, GraphKvCacheBehavior::Output),
+            ] {
+                graph
+                    .edges
+                    .get_mut(&TensorEdgeId::new(edge))
+                    .unwrap()
+                    .kv_cache = Some(GraphKvCacheMetadata {
+                    cache_id: format!("managed.layer0.{role}"),
+                    behavior,
+                    paged: false,
+                    compatibility_key: "projected-history-v1".into(),
+                });
+            }
+            if !supply_history {
+                bindings.remove(&TensorEdgeId::new(input));
+            }
+        }
+        graph.validate(&initial_operator_catalog()).unwrap();
+        assert_eq!(graph.kv_history_bindings().unwrap().len(), 2);
+        assert!(!kv_edges_feed_only_attention(&graph));
+        if case.start == 0 {
+            let mut mismatched = graph.clone();
+            mismatched
+                .edges
+                .get_mut(&TensorEdgeId::new("output.keys"))
+                .unwrap()
+                .kv_cache
+                .as_mut()
+                .unwrap()
+                .compatibility_key = "wrong".into();
+            assert!(mismatched.validate(&initial_operator_catalog()).is_err());
+            let mut unpaired = graph.clone();
+            unpaired
+                .edges
+                .get_mut(&TensorEdgeId::new("output.keys"))
+                .unwrap()
+                .kv_cache = None;
+            assert!(unpaired.kv_history_bindings().is_err());
+        }
+        let mut plan = prepare_first_native_plan_for_graph(
+            runtime,
+            &graph,
+            &instance,
+            revision,
+            (case.end - case.start) as u64,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        execute_first_native_graph_materializing(
+            runtime,
+            &fixture,
+            &instance,
+            cache,
+            &graph,
+            &mut plan,
+            bindings,
+            history,
+            Some(case.start as u64),
+            &mut Vec::new(),
+            MaterializedEdges::All,
+            None,
+            Some(KvStoreSpec::owned(c.full.end as u64)),
+        )
+        .map(|(_, outputs, pending, _)| {
+            let tensors = [
+                "output.attention",
+                "output.raw-key",
+                "output.raw-value",
+                "output.keys",
+                "output.values",
+            ]
+            .map(|name| outputs[&TensorEdgeId::new(name)].clone());
+            (tensors, pending)
+        })
+    };
+    let commit = |runtime: &mut Runtime, cache: &KvCacheId, pending: &LayerKvMap| {
+        let mut transaction = KvUpdateTransaction {
+            provider_binding: provider.clone(),
+            executor: executor.clone(),
+            promoted: Vec::new(),
+        };
+        for (&layer, state) in pending {
+            transaction
+                .promote_layer(runtime, cache, layer, state)
+                .unwrap();
+        }
+        transaction.commit(runtime, cache).unwrap()
+    };
+
+    let (first, pending) = step(&mut runtime, &cache, &c.chunks[0], None, false).unwrap();
+    compare(&first, &c.chunks[0], &c);
+    assert!(step(&mut runtime, &cache, &c.chunks[0], None, false).is_err());
+    assert!(step(&mut runtime, &other, &c.chunks[1], Some(&pending), false).is_err());
+    assert!(step(&mut runtime, &cache, &c.chunks[1], None, false).is_err());
+    assert!(step(&mut runtime, &cache, &c.chunks[1], Some(&pending), true).is_err());
+    let mut incompatible = pending.clone();
+    incompatible
+        .get_mut(&0)
+        .unwrap()
+        .history_schema
+        .as_mut()
+        .unwrap()[0]
+        .1 = "wrong".into();
+    assert!(
+        step(
+            &mut runtime,
+            &cache,
+            &c.chunks[1],
+            Some(&incompatible),
+            false
+        )
+        .is_err()
+    );
+    let (second, pending) =
+        step(&mut runtime, &cache, &c.chunks[1], Some(&pending), false).unwrap();
+    compare(&second, &c.chunks[1], &c);
+    let mut committed = commit(&mut runtime, &cache, &pending);
+    let (isolated, _) = step(&mut runtime, &other, &c.chunks[0], None, false).unwrap();
+    compare(&isolated, &c.chunks[0], &c);
+    runtime.release_kv_cache(&other).unwrap();
+    assert!(step(&mut runtime, &other, &c.chunks[0], None, false).is_err());
+    let (decoded, _) = step(&mut runtime, &cache, &c.chunks[2], Some(&committed), false).unwrap();
+    compare(&decoded, &c.chunks[2], &c);
+    super::super::recurrent_state::discard_recurrent_state(&mut runtime, &executor, &cache);
+    let (retry, pending) =
+        step(&mut runtime, &cache, &c.chunks[2], Some(&committed), false).unwrap();
+    compare(&retry, &c.chunks[2], &c);
+    committed = commit(&mut runtime, &cache, &pending);
+    let (last, _) = step(&mut runtime, &cache, &c.chunks[3], Some(&committed), false).unwrap();
+    compare(&last, &c.chunks[3], &c);
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &cache);
+    super::super::recurrent_state::release_recurrent_state(&mut runtime, &executor, &other);
+}
+
 #[test]
 fn projected_differential_attention_rejects_bad_state_and_positions() {
     let c = reference();

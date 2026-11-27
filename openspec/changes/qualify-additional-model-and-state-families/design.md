@@ -209,14 +209,31 @@ must be contiguous from that length. A document reset is a new call with zero
 past and position zero, which suppresses any supplied prior raw state. Packed
 multi-document attention, RoPE, value embeddings, XSA and biased/CosNet
 projections are outside this profile and must not silently use it. The graph
-executor can bind raw previous K/V to Runtime-managed recurrent slots; the
-current Olala test still supplies the separate attention history explicitly.
+executor can bind raw previous K/V to Runtime-managed recurrent slots. The
+original Olala test supplies attention history explicitly; a separate
+hand-built graph now tests Runtime-owned copy-based history as described below.
 The Olala profile can reorder decoded f32 weights into this operator's
 layout. An opt-in integration test decodes the pinned checkpoint's first
 differential-attention layer and compares its f32 projections and explicit
 states with the upstream PyTorch class on synthetic hidden states, retaining
 the class's bfloat16 attention-boundary rounding. This is not a qualification
 of native BF16 projections or end-to-end hybrid inference.
+
+The experimental attention-history increment is a Runtime-owned **tensor** input,
+distinct from a Kernel-managed cache handle. A graph declares one input and
+one complete-history output for each logical KV identity; the first call gets
+a single ignored zero row, while later calls bind the exact committed or
+pending history with a matching position, shape and compatibility key. The
+Runtime stages each complete output and commits or discards it with the raw
+recurrent state. This initial copy-based form must reject padded/in-place
+stores and caller-supplied history bindings. It does not advertise device-side
+KV access to a Kernel. A future additive graph-builder Capability must expose
+these bindings before a Component can use them; existing imports stay unchanged.
+The hand-built projected-attention graph compares prefill, continuation,
+cached decode, retry and separate sessions with the pinned PyTorch fixture.
+Variable decode lengths still need Component graph/plan handling, and the
+portable attention's element bound limits the supported window. Neither this
+test nor the internal graph form qualifies full Olala generation.
 
 Hybrid recurrent state uses an additive graph Capability version, not KV
 aliases. `graph-builder@1.11.0` adds `recurrent-resource(layer, slot, shape)`,

@@ -11,6 +11,8 @@ pub(super) struct PromotedKvLayer {
     /// Valid rows of an in-place KV store (`append-kv-history-in-place`);
     /// `None` for a copy-based generation.
     pub(super) rows: Option<u64>,
+    pub(super) history_schema: Option<[(String, String); 2]>,
+    pub(super) history_owner: Option<KvCacheId>,
 }
 
 /// The KV commit lifecycle, named and typed explicitly (Correctif 11 / task
@@ -93,6 +95,8 @@ impl KvUpdateTransaction {
                 binding,
                 previous,
                 rows: Some(rows),
+                history_schema: pending.history_schema.clone(),
+                history_owner: pending.history_owner.clone(),
             });
             return Ok(());
         }
@@ -109,6 +113,8 @@ impl KvUpdateTransaction {
             binding,
             previous,
             rows: None,
+            history_schema: pending.history_schema.clone(),
+            history_owner: pending.history_owner.clone(),
         });
         Ok(())
     }
@@ -176,6 +182,8 @@ impl KvUpdateTransaction {
                     k: promoted_layer.binding.k,
                     v: promoted_layer.binding.v,
                     rows: promoted_layer.rows,
+                    history_schema: promoted_layer.history_schema,
+                    history_owner: promoted_layer.history_owner,
                 },
             );
         }
