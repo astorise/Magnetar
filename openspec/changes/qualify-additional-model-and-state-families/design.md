@@ -350,6 +350,13 @@ F32 A-log/D vectors. The source configuration's `time_step_min` and
 unbounded. This is a shape and conversion plan for the f32 operator, not
 checkpoint loading, BF16 numerical qualification or recurrent execution.
 
+A separate synthetic CPU graph compares the pinned NVIDIA `NemotronHMOE`,
+`NemotronHTopkRouter` and `NemotronHMLP` PyTorch classes with sigmoid routing,
+correction bias, top-1 and top-2 normalization, ReLU-squared routed experts,
+the shared expert and a logits projection. The fixture uses the pinned Nano
+profile's one selected group and scaling semantics. It does not establish a
+mixed Mamba/attention/MoE Component or cover other group-masking profiles.
+
 ### Experimental masked encoder attention
 
 ModernBERT's attention is bidirectional; its local window is symmetric and
