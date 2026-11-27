@@ -2174,6 +2174,24 @@ const ATTENTION_NODE_ATTRIBUTES: [&str; 9] = [
     "token_selection",
 ];
 
+/// Default attention dimensions when a graph node does not override them.
+#[derive(Clone, Copy)]
+pub(super) struct AttentionGeometry {
+    pub(super) heads: u64,
+    pub(super) kv_heads: u64,
+    pub(super) head_dimension: u64,
+}
+
+impl From<&ModelComponentArchitectureMetadata> for AttentionGeometry {
+    fn from(architecture: &ModelComponentArchitectureMetadata) -> Self {
+        Self {
+            heads: architecture.attention_head_count,
+            kv_heads: architecture.kv_head_count,
+            head_dimension: architecture.head_dimension,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_qwen_attention(
     ctx: &mut FirstNativeDispatchContext<'_>,
@@ -2191,7 +2209,7 @@ pub(super) fn dispatch_qwen_attention(
         operation_id,
         [q, k, v],
         AttentionExtraInputs::None,
-        architecture,
+        &AttentionGeometry::from(architecture),
         node_attributes,
         output_target,
         key_count,
@@ -2207,7 +2225,7 @@ pub(super) fn dispatch_attention_with_latent_weights(
     operation_id: &str,
     [q, k, v]: [NodeValue; 3],
     extra_inputs: AttentionExtraInputs,
-    architecture: &ModelComponentArchitectureMetadata,
+    architecture: &AttentionGeometry,
     node_attributes: &BTreeMap<String, OperatorAttributeValue>,
     output_target: Option<OutputTarget>,
     key_count: Option<u64>,
@@ -2224,11 +2242,11 @@ pub(super) fn dispatch_attention_with_latent_weights(
     }
     attributes.insert(
         "head_count".into(),
-        OperatorAttributeValue::Integer(architecture.attention_head_count as i64),
+        OperatorAttributeValue::Integer(architecture.heads as i64),
     );
     attributes.insert(
         "kv_head_count".into(),
-        OperatorAttributeValue::Integer(architecture.kv_head_count as i64),
+        OperatorAttributeValue::Integer(architecture.kv_heads as i64),
     );
     attributes.insert(
         "head_dimension".into(),

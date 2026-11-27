@@ -395,6 +395,139 @@ fn close(actual: &[f32], expected: &[f32], what: &str) {
     }
 }
 
+#[derive(Clone)]
+struct EncoderPayloads(BTreeMap<String, Vec<u8>>);
+
+impl ProductionArtifactPayloadSource for EncoderPayloads {
+    fn read_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Vec<u8>, magnetar_runtime::ProductionIngestionError> {
+        let missing = || magnetar_runtime::ProductionIngestionError::PayloadUnavailable {
+            identity: range.identity.clone(),
+        };
+        let bytes = self.0.get(&range.identity).ok_or_else(missing)?;
+        if range.offset != 0 || range.length != bytes.len() as u64 {
+            return Err(
+                magnetar_runtime::ProductionIngestionError::PayloadOutOfBounds {
+                    identity: range.identity.clone(),
+                },
+            );
+        }
+        if range
+            .digest
+            .as_ref()
+            .is_some_and(|digest| *digest != ModelDigest::sha256(bytes))
+        {
+            return Err(
+                magnetar_runtime::ProductionIngestionError::IntegrityMismatch {
+                    identity: range.identity.clone(),
+                },
+            );
+        }
+        Ok(bytes.clone())
+    }
+}
+
+#[test]
+fn resident_encoder_loads_authenticated_weights_and_matches_laya_reference() {
+    use magnetar_runtime::{
+        ArtifactFormat, ModelArchitecture, ModelArtifactId, ModelArtifactKind, ModelName,
+        ModelRevision, ModelTensorMetadata, ModelTrustStore, ProductionLoadedEncoder,
+    };
+    let (encoder, head, profile, weights) = models_from_synthetic_safetensors();
+    let (component, request) = encoder_graph_request(&profile, 1);
+    let mut manifest = magnetar_runtime::e2e_fixture().unwrap().manifest;
+    manifest.id = ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new("synthetic-modernbert").unwrap(),
+        ModelRevision::new("r1").unwrap(),
+        ModelDigest::sha256(b"synthetic modernbert artifact"),
+    );
+    manifest.architecture = ModelArchitecture::new("modernbert", "synthetic-modernbert");
+    manifest.architecture_config = Some(request.architecture.clone());
+    manifest.artifact_format = ArtifactFormat::HuggingFace;
+    let mut payloads = BTreeMap::new();
+    manifest.tensors = weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let bytes = tensor.content_bytes();
+            let metadata = ModelTensorMetadata {
+                name: name.clone(),
+                shape: tensor.shape,
+                storage_dtype: ModelDType::F32,
+                layout: None,
+                shard: None,
+                offset_bytes: Some(0),
+                size_bytes: Some(bytes.len() as u64),
+                quantization: None,
+                expected_compute_dtype: None,
+                digest: Some(ModelDigest::sha256(&bytes)),
+            };
+            payloads.insert(name, bytes);
+            metadata
+        })
+        .collect();
+    let payloads = EncoderPayloads(payloads);
+    let provider = std::sync::Arc::new(magnetar_runtime::ReferenceCpuProvider::new());
+    let load = |payloads: &EncoderPayloads, trust| {
+        ProductionLoadedEncoder::load(
+            manifest.clone(),
+            payloads,
+            trust,
+            provider.clone(),
+            component.clone(),
+            request.encoder.clone(),
+        )
+    };
+    assert!(load(&payloads, ModelTrustStore::default()).is_err());
+    let mut corrupted = payloads.clone();
+    corrupted.0.values_mut().next().unwrap()[0] ^= 1;
+    let trusted = || ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone());
+    assert!(load(&corrupted, trusted()).is_err());
+    let mut loaded = load(&payloads, trusted()).unwrap();
+    assert!(loaded.encode(&[], &[]).is_err());
+    assert!(loaded.encode(&[1, 2], &[true]).is_err());
+    assert!(loaded.encode(&[1, 2], &[false, false]).is_err());
+    assert!(loaded.encode(&[24], &[true]).is_err());
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/laya-reference.json")).unwrap();
+    for case in cases {
+        let ids = integers(&case, "ids")
+            .into_iter()
+            .map(|id| id as u32)
+            .collect::<Vec<_>>();
+        let mask = integers(&case, "mask")
+            .into_iter()
+            .map(|id| id != 0)
+            .collect::<Vec<_>>();
+        let markers = integers(&case, "markers");
+        let qtype = match case["qtype"].as_u64().unwrap() {
+            0 => QuestionType::Choice,
+            1 => QuestionType::Score,
+            2 => QuestionType::Noul,
+            _ => panic!("unknown question type"),
+        };
+        let hidden = loaded.encode(&ids, &mask).unwrap();
+        let expected_hidden = encoder.forward(&ids, &mask, None).unwrap();
+        close(&hidden.data, &expected_hidden, "resident encoder hidden");
+        let output = head
+            .forward(&hidden.data, ids.len(), &mask, &markers, qtype)
+            .unwrap();
+        close(
+            &output.option_logits,
+            &numbers(&case, "logits"),
+            "resident option logits",
+        );
+        close(
+            &output.action_logits,
+            &numbers(&case, "action_logits"),
+            "resident action logits",
+        );
+    }
+    loaded.unload().unwrap();
+}
+
 #[test]
 fn laya_encoder_and_head_match_pinned_upstream_probabilities() {
     let cases: Vec<serde_json::Value> =

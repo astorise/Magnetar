@@ -4,12 +4,12 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct Case {
-    bias: bool,
-    ids: Vec<u32>,
-    mask: Vec<u8>,
+pub(in crate::first_native_runtime) struct Case {
+    pub(in crate::first_native_runtime) bias: bool,
+    pub(in crate::first_native_runtime) ids: Vec<u32>,
+    pub(in crate::first_native_runtime) mask: Vec<u8>,
     positions: Vec<u32>,
-    output: Vec<f32>,
+    pub(in crate::first_native_runtime) output: Vec<f32>,
 }
 
 fn pattern(name: &str, count: usize) -> Vec<f32> {
@@ -183,7 +183,9 @@ impl Builder {
     }
 }
 
-fn graph(case: &Case) -> (ExecutionGraph, BTreeMap<TensorEdgeId, HostTensor>) {
+pub(in crate::first_native_runtime) fn graph(
+    case: &Case,
+) -> (ExecutionGraph, BTreeMap<TensorEdgeId, HostTensor>) {
     let mut builder = Builder {
         graph: ExecutionGraph::new(
             ExecutionGraphId::new("modernbert-encoder"),

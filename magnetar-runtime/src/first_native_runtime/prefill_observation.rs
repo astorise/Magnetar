@@ -10,6 +10,31 @@ static OBSERVATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 mod tests;
 
+pub(super) fn release_private_resource_checked(
+    runtime: &mut Runtime,
+    executor: &Arc<dyn ProviderExecutionApi>,
+    resource: &TensorResourceId,
+) -> Result<(), InferenceApiError> {
+    executor
+        .release_admitted_tensor(runtime.memory_mut(), resource)
+        .map_err(|error| InferenceApiError::ProviderTensorReleaseFailed {
+            reason: format!("could not release private resource '{resource}': {error}"),
+        })?;
+    if let Some(allocation) = runtime
+        .memory_mut()
+        .remove_tensor_residency(resource)
+        .and_then(|residency| residency.allocation)
+        && runtime.memory().is_live_allocation(allocation)
+    {
+        runtime.memory_mut().release(allocation).map_err(|error| {
+            InferenceApiError::ProviderTensorReleaseFailed {
+                reason: format!("could not release private allocation: {error}"),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 impl ProductionLoadedModel {
     /// Execute an independent, uncached prefill and return one Component graph
     /// edge shaped `[tokens, hidden_size]`. The caller selects an edge whose
@@ -196,31 +221,10 @@ impl ProductionLoadedModel {
             }
         }
         for resource in resources {
-            let released = executor
-                .release_admitted_tensor(self.runtime.memory_mut(), &resource)
-                .map_err(|error| InferenceApiError::ProviderTensorReleaseFailed {
-                    reason: format!("could not release observed resource '{resource}': {error}"),
-                });
-            match released {
-                Ok(_) => {
-                    if let Some(allocation) = self
-                        .runtime
-                        .memory_mut()
-                        .remove_tensor_residency(&resource)
-                        .and_then(|residency| residency.allocation)
-                        && self.runtime.memory().is_live_allocation(allocation)
-                        && let Err(error) = self.runtime.memory_mut().release(allocation)
-                    {
-                        cleanup_error.get_or_insert_with(|| {
-                            InferenceApiError::ProviderTensorReleaseFailed {
-                                reason: format!("could not release observed allocation: {error}"),
-                            }
-                        });
-                    }
-                }
-                Err(error) => {
-                    cleanup_error.get_or_insert(error);
-                }
+            if let Err(error) =
+                release_private_resource_checked(&mut self.runtime, &executor, &resource)
+            {
+                cleanup_error.get_or_insert(error);
             }
         }
         let cleanup = self

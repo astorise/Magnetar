@@ -221,25 +221,45 @@ pub(super) fn node_attribute_u64(
 // declared checksum, and no production build has a second, unattested
 // graph source to fall back to.
 
-/// Dispatches one graph node's Operator through the published prepared plan,
-/// reading structural parameters (epsilon, RoPE base/dimension/mode,
-/// attention head geometry) from the node's own graph attributes rather than
-/// fixture configuration, so the graph is the authoritative recipe. The one
-/// deliberate exception is RoPE's absolute position: the same published
-/// decode plan/graph is reused across every decode step (so its baked-in
-/// `position_offset` attribute reflects only the first step), so the caller
-/// supplies the true per-step position via `absolute_position_override`
-/// instead.
+/// Only the execution geometry needed by the generic graph dispatcher.
+/// Encoder graphs can provide this without pretending to be decoder models.
+#[derive(Clone)]
+pub(super) struct NativeGraphExecutionProfile {
+    pub(super) hidden_size: u64,
+    pub(super) attention: super::dispatch::AttentionGeometry,
+    pub(super) rope: FirstNativeRopeConfig,
+    pub(super) kv_layer_count: usize,
+    pub(super) decoder_layer_count: usize,
+    pub(super) kv_head_dimensions: Vec<Option<(u64, u64)>>,
+    pub(super) has_latent_attention: bool,
+}
+
+impl From<&E2eFixture> for NativeGraphExecutionProfile {
+    fn from(fixture: &E2eFixture) -> Self {
+        Self {
+            hidden_size: fixture.config.architecture.hidden_size,
+            attention: super::dispatch::AttentionGeometry::from(&fixture.config.architecture),
+            rope: fixture.config.rope.clone(),
+            kv_layer_count: fixture.config.kv_layer_count(),
+            decoder_layer_count: fixture.config.architecture.layer_count as usize,
+            kv_head_dimensions: fixture.config.kv_head_dimensions(),
+            has_latent_attention: fixture.config.latent_attention.is_some(),
+        }
+    }
+}
+
+/// Dispatches one graph node's Operator through the published prepared plan.
+/// The graph declares the operator's structural attributes; the caller
+/// supplies an absolute position when a decode graph is reused.
 pub(super) fn dispatch_first_native_graph_node(
     ctx: &mut FirstNativeDispatchContext<'_>,
-    fixture: &E2eFixture,
+    profile: &NativeGraphExecutionProfile,
     node: &ExecutionNode,
     mut inputs: Vec<NodeValue>,
     absolute_position_override: Option<u64>,
     kv_cache_id: &KvCacheId,
 ) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     let node_id = node.id.as_str();
-    let architecture = &fixture.config.architecture;
     // Resolved once, before dispatch: this node's output edge's own final
     // resource identity, and the placement/owner it should be pre-admitted
     // under (`unify-provider-output-admission-and-residency`'s Decision 3).
@@ -300,11 +320,7 @@ pub(super) fn dispatch_first_native_graph_node(
             let sequence_length = ids.shape().first().copied().unwrap_or(0);
             // The table's own row width: the hidden size for token
             // embeddings, another width for e.g. per-layer input tables.
-            let width = table
-                .shape()
-                .get(1)
-                .copied()
-                .unwrap_or(architecture.hidden_size);
+            let width = table.shape().get(1).copied().unwrap_or(profile.hidden_size);
             let output_descriptor = TensorDescriptor::new(
                 ShapeDescriptor::new([sequence_length, width]),
                 DTypeDescriptor::portable(ComputeDType::Float32),
@@ -499,11 +515,11 @@ pub(super) fn dispatch_first_native_graph_node(
             };
             let rope_config = FirstNativeRopeConfig {
                 base,
-                scale: fixture.config.rope.scale,
+                scale: profile.rope.scale,
                 dimension: head_dimension,
-                position_mode: fixture.config.rope.position_mode,
-                dynamic_scaling_supported: fixture.config.rope.dynamic_scaling_supported,
-                frequency_scaling: fixture.config.rope.frequency_scaling,
+                position_mode: profile.rope.position_mode,
+                dynamic_scaling_supported: profile.rope.dynamic_scaling_supported,
+                frequency_scaling: profile.rope.frequency_scaling,
             };
             // `output_target` is not passed when RoPE's output edge carries
             // KV-cache semantics (`rope_k`): `execute_first_native_graph_nodes`
@@ -1108,7 +1124,7 @@ pub(super) fn dispatch_first_native_graph_node(
                 node_id,
                 [q, k, v],
                 extra,
-                architecture,
+                &profile.attention,
                 &node.attributes,
                 Some(output_target),
                 key_count,
@@ -1676,6 +1692,47 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     cleanup_on_failure: bool,
     private_kv_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+    execute_first_native_graph_with_profile(
+        runtime,
+        &NativeGraphExecutionProfile::from(fixture),
+        model_instance,
+        kv_cache_id,
+        graph,
+        prepared_plan,
+        initial_bindings,
+        resident_bindings,
+        kv_history,
+        absolute_position_override,
+        node_events,
+        materialized,
+        memo,
+        kv_stores,
+        resource_namespace,
+        cleanup_on_failure,
+        private_kv_namespace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_first_native_graph_with_profile(
+    runtime: &mut Runtime,
+    profile: &NativeGraphExecutionProfile,
+    model_instance: &ModelInstanceId,
+    kv_cache_id: &KvCacheId,
+    graph: &ExecutionGraph,
+    prepared_plan: &mut PreparedExecutionPlan,
+    initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    resident_bindings: BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
+    kv_history: Option<&LayerKvMap>,
+    absolute_position_override: Option<u64>,
+    node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
+    memo: Option<&GraphExecutionMemo>,
+    kv_stores: Option<KvStoreSpec>,
+    resource_namespace: Option<&str>,
+    cleanup_on_failure: bool,
+    private_kv_namespace: Option<&str>,
+) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
     let order = match memo {
@@ -1740,7 +1797,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     let result = execute_first_native_graph_nodes(
         order,
         runtime,
-        fixture,
+        profile,
         &weight_bindings,
         &row_tables,
         kv_cache_id,
@@ -1781,7 +1838,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
 pub(super) fn execute_first_native_graph_nodes(
     order: &[ExecutionNodeId],
     runtime: &mut Runtime,
-    fixture: &E2eFixture,
+    profile: &NativeGraphExecutionProfile,
     weight_bindings: &BTreeMap<String, TensorResourceId>,
     row_tables: &BTreeMap<String, RowTableHandle>,
     kv_cache_id: &KvCacheId,
@@ -1846,8 +1903,8 @@ pub(super) fn execute_first_native_graph_nodes(
         node_events,
     };
     // KV stores: the decoder layers, then one index store per indexed layer.
-    let layer_count = fixture.config.kv_layer_count();
-    let decoder_layer_count = fixture.config.architecture.layer_count as usize;
+    let layer_count = profile.kv_layer_count;
+    let decoder_layer_count = profile.decoder_layer_count;
     // Resource-based intermediates (Correctif 5): `bindings` never itself
     // holds tensor bytes. Every graph edge's live value lives exclusively in
     // the registered Provider's storage, keyed by `TensorResourceId`; this
@@ -2140,7 +2197,7 @@ pub(super) fn execute_first_native_graph_nodes(
         let dispatch_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let (dispatch_result, output_values) = dispatch_first_native_graph_node(
             &mut dispatch_ctx,
-            fixture,
+            profile,
             node,
             inputs,
             absolute_position_override,
@@ -2283,9 +2340,8 @@ pub(super) fn execute_first_native_graph_nodes(
                         // its stored size and created by the Provider in
                         // that precision (`turboquant-kv-history`).
                         let precision = spec.precisions.for_role(role);
-                        let head_dimension = fixture
-                            .config
-                            .kv_head_dimensions()
+                        let head_dimension = profile
+                            .kv_head_dimensions
                             .get(layer)
                             .copied()
                             .flatten()
@@ -2724,9 +2780,7 @@ pub(super) fn execute_first_native_graph_nodes(
         // which keeps keys alone.
         let v = match layer_v[layer].take() {
             Some(v) => v,
-            None if fixture.config.latent_attention.is_some() || layer >= decoder_layer_count => {
-                k.clone()
-            }
+            None if profile.has_latent_attention || layer >= decoder_layer_count => k.clone(),
             None => {
                 return Err(InferenceApiError::KvCacheUnavailable {
                     reason: format!("first-native graph produced no V state for layer {layer}"),
@@ -2943,7 +2997,7 @@ mod mamba3_mixer_tests;
 #[cfg(test)]
 mod mamba3_tests;
 #[cfg(test)]
-mod modernbert_graph_tests;
+pub(super) mod modernbert_graph_tests;
 #[cfg(test)]
 mod projected_differential_attention_tests;
 #[cfg(test)]
